@@ -1,4 +1,4 @@
-# ClaudeUsage
+# ClaudeMeter
 
 A lightweight macOS menu bar app that shows your Claude.ai usage at a glance — session limits, weekly limits, and progress bars in a compact popover.
 
@@ -25,22 +25,22 @@ Authenticates automatically by importing your session from the Claude Desktop ap
 ## Build & Run
 
 ```bash
-swiftc ClaudeUsage.swift \
+swiftc ClaudeMeter.swift \
   -framework Cocoa \
   -framework WebKit \
   -framework Security \
   -lsqlite3 \
   -parse-as-library \
-  -o ClaudeUsage
+  -o ClaudeMeter
 
-./ClaudeUsage
+./ClaudeMeter
 ```
 
 On first launch, macOS will show a Keychain access dialog — click **Always Allow**.
 
 ### Xcode
 
-Open `ClaudeUsage.xcodeproj` and hit **⌘R**. This produces a proper `.app` bundle suitable for Login Items.
+Open `ClaudeMeter.xcodeproj` and hit **⌘R**. This produces a proper `.app` bundle suitable for Login Items.
 
 ## Usage
 
@@ -54,7 +54,7 @@ Open `ClaudeUsage.xcodeproj` and hit **⌘R**. This produces a proper `.app` bun
 
 ## How It Works
 
-The app is a single Swift file (`ClaudeUsage.swift`) with no dependencies beyond system frameworks.
+The app is a single Swift file (`ClaudeMeter.swift`) with no dependencies beyond system frameworks.
 
 1. **Cookie import** — Reads Claude Desktop's Chromium cookie database (`~/Library/Application Support/Claude/Cookies`), decrypts cookies via the macOS Keychain, and injects them into a WKWebView
 2. **Usage page** — Loads `claude.ai/settings/usage` in the WKWebView
@@ -67,13 +67,13 @@ The app is a single Swift file (`ClaudeUsage.swift`) with no dependencies beyond
 
 **"Could not import session"** — Make sure Claude Desktop is installed and signed in.
 
-**Blank or wrong content** — Anthropic may have changed their page markup. Adjust the `usageCSS` selectors in `ClaudeUsage.swift`.
+**Blank or wrong content** — Anthropic may have changed their page markup. Adjust the `usageCSS` selectors in `ClaudeMeter.swift`.
 
 **Fresh start:**
 ```bash
-rm -rf ~/Library/WebKit/com.local.ClaudeUsage/
-rm -rf ~/Library/Caches/com.local.ClaudeUsage/
-rm -f  ~/Library/HTTPStorages/com.local.ClaudeUsage.binarycookies
+rm -rf ~/Library/WebKit/com.local.ClaudeMeter/
+rm -rf ~/Library/Caches/com.local.ClaudeMeter/
+rm -f  ~/Library/HTTPStorages/com.local.ClaudeMeter.binarycookies
 ```
 
 ## License

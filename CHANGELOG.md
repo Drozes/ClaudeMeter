@@ -1,10 +1,10 @@
-# ClaudeUsage — Architecture & Decisions
+# ClaudeMeter — Architecture & Decisions
 
 Quick reference for AI assistants continuing work on this project.
 
 ## Architecture
 
-**Single file:** `ClaudeUsage.swift` — entire app, no dependencies beyond system frameworks.
+**Single file:** `ClaudeMeter.swift` — entire app, no dependencies beyond system frameworks.
 
 ### Auth — Claude Desktop cookie import (primary)
 

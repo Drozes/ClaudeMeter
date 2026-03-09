@@ -5,7 +5,7 @@ import SQLite3
 import CommonCrypto
 
 @main
-struct ClaudeUsageApp {
+struct ClaudeMeterApp {
     static func main() {
         let app = NSApplication.shared
         let delegate = AppDelegate()
@@ -404,7 +404,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         menu.addItem(NSMenuItem(title: "Import from Claude Desktop", action: #selector(importFromDesktop), keyEquivalent: "i"))
         menu.addItem(NSMenuItem(title: "Sign In\u{2026}", action: #selector(openLogin), keyEquivalent: "l"))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit ClaudeUsage", action: #selector(quit), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "Quit ClaudeMeter", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = nil
         contextMenu = menu
     }
