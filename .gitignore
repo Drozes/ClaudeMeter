@@ -1,0 +1,23 @@
+# Build output
+ClaudeUsage
+*.o
+build/
+DerivedData/
+
+# Xcode
+*.xcuserdata
+*.xcworkspace
+xcuserdata/
+*.xcscmblueprint
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Claude Code
+.claude/
+
+# Temp files
+*.swp
+*~
