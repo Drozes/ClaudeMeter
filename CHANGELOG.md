@@ -2,6 +2,26 @@
 
 Quick reference for AI assistants continuing work on this project.
 
+## Release History
+
+### v1.2
+
+- **Auto-polling** — configurable refresh interval (6s / 20s / 30s / 60s) keeps data fresh while popover is open
+- **Status dot states** — grey (stale), yellow/believed-fresh (recently updated, verifying), green (confirmed fresh)
+- **Loading spinner** — tiny spinning ring around the status dot during active fetches
+- **Menu bar badge** — "Show Usage in Menu Bar" toggle displays current session usage percentage next to the icon
+- **Refresh Interval submenu** — right-click context menu to pick polling frequency; persisted via UserDefaults
+- **NSPopoverDelegate** — polling stops automatically when popover closes
+
+### v1.1
+
+- Self-update system and move-to-Applications prompt
+- CI release workflow
+
+### v1.0
+
+- Initial release: cookie import, usage display, soft reload, status dot
+
 ## Architecture
 
 **Single file:** `ClaudeMeter.swift` — entire app, no dependencies beyond system frameworks.
@@ -34,11 +54,29 @@ Quick reference for AI assistants continuing work on this project.
 
 - **Soft reload** (popover toggle): clicks the site's own refresh button via JS — no page navigation
 - **Graceful reload** (menu Reload): fades content to 40% opacity, reloads, fades back in
-- Status dot: grey while loading, green with glow when data confirmed fresh
+- **Silent refresh** (polling timer): clicks refresh button without flashing dot grey; used for background polling
+- Status dot states: grey (stale) → yellow/believed-fresh (recently updated, verifying) → green (confirmed fresh)
+- Loading spinner (CSS `::after` pseudo-element) appears around dot during fetches
+- `lastRefreshDate` tracked in Swift to decide between grey vs yellow on popover re-open
+
+### Auto-polling
+
+- `statusFreshnessInterval` (default 6s) controls poll frequency; configurable via context menu
+- `Timer.scheduledTimer` fires `silentRefresh()` while popover is open
+- Polling starts on popover open, stops on `popoverDidClose` (NSPopoverDelegate)
+- JS-side freshness timeout = interval + 3s buffer (safety net if polling stops)
+
+### Menu bar badge
+
+- Scrapes "Current session" percentage from page DOM via XPath (`scrapeSessionPercentageJS`)
+- Displayed as `NSStatusItem.button.title` next to the gauge icon
+- Uses `monospacedDigitSystemFont` to prevent width jitter
+- Updates on every refresh path: `didFinish`, `softReload`, `silentRefresh`
+- Toggle persisted via `UserDefaults` (`showMenuBarBadge` key)
 
 ### Menu (right-click)
 
-- Reload, Import from Claude Desktop, Sign In..., Quit
+- Reload, Import from Claude Desktop, Sign In..., Refresh Interval (submenu), Show Usage in Menu Bar, Check for Updates..., Quit
 
 ## Key Decisions & Findings
 
@@ -54,3 +92,8 @@ Quick reference for AI assistants continuing work on this project.
 | UA spoofing to Safari | Google's OAuth block is server-side UA detection. Spoofing bypasses it. |
 | Real popup windows for OAuth | Returning nil from `createWebViewWith` and loading inline breaks OAuth's `window.opener`/`postMessage` flow. |
 | ASWebAuthenticationSession rejected | Its cookie store goes to Safari, not WKWebView. No transfer mechanism exists. |
+| Silent refresh for polling | Omits grey flash (keeps dot green) during automatic refreshes — only user-initiated reloads show the loading state transition. |
+| Yellow "believed-fresh" state | If `lastRefreshDate` is within the freshness interval when popover opens, shows yellow instead of grey since data is likely current. |
+| XPath for DOM scraping | Anchors on stable text content ("Current session", "% used") rather than Tailwind class names which change frequently. |
+| Freshness timeout = interval + 3s | Buffer accounts for the ~1.5s delay between clicking the refresh button and data arriving. |
+| `variableLength` status item | Switched from `squareLength` to support showing percentage text alongside the gauge icon. `monospacedDigitSystemFont` prevents layout jitter. |

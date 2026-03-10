@@ -7,9 +7,11 @@ Authenticates automatically by importing your session from the Claude Desktop ap
 ## Features
 
 - **One-click usage** — click the menu bar icon to see current session and weekly usage
+- **Menu bar badge** — optionally show your session usage percentage right in the menu bar
+- **Auto-refresh** — configurable polling interval (6s / 20s / 30s / 60s) keeps data fresh while the popover is open
+- **Status indicator** — green dot (fresh), yellow dot (believed fresh, verifying), grey dot (stale), with a spinning loader during fetches
 - **Auto-auth** — imports cookies from Claude Desktop on launch, no manual login needed
 - **Soft reload** — re-opening the popover refreshes data in-place without a full page load
-- **Status indicator** — green dot confirms data is fresh; grey means loading
 - **Fallback login** — right-click → "Sign In..." for email/magic-link if Claude Desktop isn't available
 
 ## Peak In
@@ -60,6 +62,8 @@ Or open `ClaudeMeter.xcodeproj` in Xcode and hit **⌘R** for a proper `.app` bu
 |---|---|
 | View usage | Left-click the menu bar icon |
 | Refresh data | Close and re-open the popover, or right-click → Reload |
+| Show usage badge | Right-click → Show Usage in Menu Bar |
+| Change refresh interval | Right-click → Refresh Interval → pick 6s / 20s / 30s / 60s |
 | Re-import cookies | Right-click → Import from Claude Desktop |
 | Manual login | Right-click → Sign In... |
 | Check for updates | Right-click → Check for Updates… |
@@ -73,6 +77,8 @@ The app is a single Swift file (`ClaudeMeter.swift`) with no dependencies beyond
 2. **Usage page** — Loads `claude.ai/settings/usage` in the WKWebView
 3. **CSS injection** — Hides all site chrome (sidebar, nav, headers, overlays), leaving only the usage meters
 4. **Soft reload** — On re-open, clicks the site's own refresh button via JavaScript instead of doing a full page load
+5. **Auto-polling** — While the popover is open, a timer triggers silent refreshes at the configured interval to keep data current
+6. **Badge scraping** — Extracts the session usage percentage from the page DOM via XPath and displays it in the menu bar
 
 ## Troubleshooting
 
