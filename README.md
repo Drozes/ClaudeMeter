@@ -14,7 +14,11 @@ Authenticates automatically by importing your session from the Claude Desktop ap
 
 ## Screenshot
 
-<!-- TODO: Add screenshot -->
+
+https://github.com/user-attachments/assets/f9084ea5-e919-47ce-9cc6-770a09a38f7f
+
+
+
 
 ## Requirements
 
