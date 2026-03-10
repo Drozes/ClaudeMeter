@@ -1,0 +1,30 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with swiftc
+        run: |
+          swiftc ClaudeMeter.swift \
+            -framework Cocoa \
+            -framework WebKit \
+            -framework Security \
+            -lsqlite3 \
+            -parse-as-library \
+            -o ClaudeMeter
+
+      - name: Build with xcodebuild
+        run: |
+          xcodebuild -project ClaudeMeter.xcodeproj \
+            -scheme ClaudeMeter \
+            -configuration Release \
+            build

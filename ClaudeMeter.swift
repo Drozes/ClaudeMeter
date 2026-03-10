@@ -191,6 +191,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                     }
                 });
                 observer.observe(document.body, { childList: true, subtree: true });
+                window.__claudeStatusTimeout = null;
+                window.__setStatusFresh = function() {
+                    var dot = document.querySelector('#claude-status-dot');
+                    if (dot) {
+                        dot.className = 'fresh';
+                        if (window.__claudeStatusTimeout) clearTimeout(window.__claudeStatusTimeout);
+                        window.__claudeStatusTimeout = setTimeout(function() {
+                            dot.className = '';
+                        }, 6000);
+                    }
+                };
             """,
             injectionTime: .atDocumentEnd,
             forMainFrameOnly: true
@@ -343,8 +354,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             webView.evaluateJavaScript("""
                 document.body.style.transition='opacity 0.2s';
                 document.body.style.opacity='1';
-                var dot = document.querySelector('#claude-status-dot');
-                if (dot) dot.className = 'fresh';
+                if (window.__setStatusFresh) window.__setStatusFresh();
             """, completionHandler: nil)
             popover.contentSize = url.contains("/settings/usage")
                 ? NSSize(width: 400, height: 380)
@@ -447,7 +457,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                     b.closest('[class*="text-xs"]')) {
                     b.click();
                     setTimeout(function() {
-                        if (dot) dot.className = 'fresh';
+                        if (window.__setStatusFresh) window.__setStatusFresh();
                     }, 1500);
                     return 'clicked';
                 }
@@ -496,13 +506,22 @@ enum ClaudeDesktopCookies {
 
     static func extract() -> [HTTPCookie]? {
         // 1. Get encryption key from Keychain
-        guard let password = keychainPassword(),
-              let aesKey = deriveKey(password: password) else { return nil }
+        guard let password = keychainPassword() else {
+            NSLog("ClaudeMeter: Failed to read encryption key from Keychain (service: %@)", keychainService)
+            return nil
+        }
+        guard let aesKey = deriveKey(password: password) else {
+            NSLog("ClaudeMeter: Failed to derive AES key from Keychain password")
+            return nil
+        }
 
         // 2. Copy the DB (Claude Desktop may have it locked)
         let tmpPath = NSTemporaryDirectory() + "claude_cookies_\(ProcessInfo.processInfo.processIdentifier).db"
         try? FileManager.default.removeItem(atPath: tmpPath)
-        guard (try? FileManager.default.copyItem(atPath: dbPath, toPath: tmpPath)) != nil else { return nil }
+        guard (try? FileManager.default.copyItem(atPath: dbPath, toPath: tmpPath)) != nil else {
+            NSLog("ClaudeMeter: Cookie database not found at %@", dbPath)
+            return nil
+        }
         defer { try? FileManager.default.removeItem(atPath: tmpPath) }
 
         // 3. Read and decrypt cookies
@@ -572,6 +591,8 @@ enum ClaudeDesktopCookies {
     }
 
     // MARK: - Key Derivation (PBKDF2)
+    // 1003 iterations and "saltysalt" are Chromium's hardcoded values for macOS cookie encryption.
+    // These cannot be changed — they must match what Chrome/Electron wrote.
 
     private static func deriveKey(password: String) -> [UInt8]? {
         let salt = Array("saltysalt".utf8)

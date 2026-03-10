@@ -18,7 +18,6 @@ Authenticates automatically by importing your session from the Claude Desktop ap
 
 
 
-
 ## Requirements
 
 - macOS 13+ (Ventura or later)

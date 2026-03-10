@@ -7,20 +7,20 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		A1B2C3D400000001 /* ClaudeUsage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D400000002 /* ClaudeUsage.swift */; };
+		A1B2C3D400000001 /* ClaudeMeter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D400000002 /* ClaudeMeter.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		A1B2C3D400000002 /* ClaudeUsage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClaudeUsage.swift; sourceTree = "<group>"; };
+		A1B2C3D400000002 /* ClaudeMeter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClaudeMeter.swift; sourceTree = "<group>"; };
 		A1B2C3D400000003 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		A1B2C3D400000004 /* ClaudeUsage.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ClaudeUsage.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A1B2C3D400000004 /* ClaudeMeter.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ClaudeMeter.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
 		A1B2C3D400000010 /* main group */ = {
 			isa = PBXGroup;
 			children = (
-				A1B2C3D400000002 /* ClaudeUsage.swift */,
+				A1B2C3D400000002 /* ClaudeMeter.swift */,
 				A1B2C3D400000003 /* Info.plist */,
 				A1B2C3D400000011 /* Products */,
 			);
@@ -29,7 +29,7 @@
 		A1B2C3D400000011 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				A1B2C3D400000004 /* ClaudeUsage.app */,
+				A1B2C3D400000004 /* ClaudeMeter.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -37,9 +37,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		A1B2C3D400000020 /* ClaudeUsage */ = {
+		A1B2C3D400000020 /* ClaudeMeter */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = A1B2C3D400000040 /* Build configuration list for PBXNativeTarget "ClaudeUsage" */;
+			buildConfigurationList = A1B2C3D400000040 /* Build configuration list for PBXNativeTarget "ClaudeMeter" */;
 			buildPhases = (
 				A1B2C3D400000030 /* Sources */,
 				A1B2C3D400000031 /* Frameworks */,
@@ -48,9 +48,9 @@
 			);
 			dependencies = (
 			);
-			name = ClaudeUsage;
-			productName = ClaudeUsage;
-			productReference = A1B2C3D400000004 /* ClaudeUsage.app */;
+			name = ClaudeMeter;
+			productName = ClaudeMeter;
+			productReference = A1B2C3D400000004 /* ClaudeMeter.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -62,7 +62,7 @@
 				BuildIndependentTargetsInParallel = 1;
 				LastUpgradeCheck = 1640;
 			};
-			buildConfigurationList = A1B2C3D400000041 /* Build configuration list for PBXProject "ClaudeUsage" */;
+			buildConfigurationList = A1B2C3D400000041 /* Build configuration list for PBXProject "ClaudeMeter" */;
 			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -75,7 +75,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				A1B2C3D400000020 /* ClaudeUsage */,
+				A1B2C3D400000020 /* ClaudeMeter */,
 			);
 		};
 /* End PBXProject section */
@@ -85,7 +85,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A1B2C3D400000001 /* ClaudeUsage.swift in Sources */,
+				A1B2C3D400000001 /* ClaudeMeter.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -156,7 +156,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.local.ClaudeUsage;
+				PRODUCT_BUNDLE_IDENTIFIER = com.local.ClaudeMeter;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
 			};
@@ -174,7 +174,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.local.ClaudeUsage;
+				PRODUCT_BUNDLE_IDENTIFIER = com.local.ClaudeMeter;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
 			};
@@ -183,7 +183,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		A1B2C3D400000041 /* Build configuration list for PBXProject "ClaudeUsage" */ = {
+		A1B2C3D400000041 /* Build configuration list for PBXProject "ClaudeMeter" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				A1B2C3D400000060 /* Debug */,
@@ -192,7 +192,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		A1B2C3D400000040 /* Build configuration list for PBXNativeTarget "ClaudeUsage" */ = {
+		A1B2C3D400000040 /* Build configuration list for PBXNativeTarget "ClaudeMeter" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				A1B2C3D400000062 /* Debug */,
