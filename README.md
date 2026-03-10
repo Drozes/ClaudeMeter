@@ -22,9 +22,20 @@ Authenticates automatically by importing your session from the Claude Desktop ap
 
 - macOS 13+ (Ventura or later)
 - Claude Desktop installed and signed in
-- Xcode Command Line Tools (for building)
 
-## Build & Run
+## Install
+
+1. Download **ClaudeMeter.zip** from the [latest release](https://github.com/Drozes/ClaudeMeter/releases/latest)
+2. Unzip and double-click **ClaudeMeter.app**
+3. On first launch, the app will offer to move itself to your Applications folder
+
+macOS will show a Keychain access dialog on first run — click **Always Allow**.
+
+To update later, right-click the menu bar icon → **Check for Updates…**
+
+### Build from Source
+
+If you prefer to build it yourself:
 
 ```bash
 swiftc ClaudeMeter.swift \
@@ -38,11 +49,7 @@ swiftc ClaudeMeter.swift \
 ./ClaudeMeter
 ```
 
-On first launch, macOS will show a Keychain access dialog — click **Always Allow**.
-
-### Xcode
-
-Open `ClaudeMeter.xcodeproj` and hit **⌘R**. This produces a proper `.app` bundle suitable for Login Items.
+Or open `ClaudeMeter.xcodeproj` in Xcode and hit **⌘R** for a proper `.app` bundle.
 
 ## Usage
 
@@ -52,6 +59,7 @@ Open `ClaudeMeter.xcodeproj` and hit **⌘R**. This produces a proper `.app` bun
 | Refresh data | Close and re-open the popover, or right-click → Reload |
 | Re-import cookies | Right-click → Import from Claude Desktop |
 | Manual login | Right-click → Sign In... |
+| Check for updates | Right-click → Check for Updates… |
 | Quit | Right-click → Quit |
 
 ## How It Works
