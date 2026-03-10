@@ -14,11 +14,59 @@ struct ClaudeMeterApp {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate, NSPopoverDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
     var webView: WKWebView!
     var contextMenu: NSMenu!
+
+    // How often (seconds) to poll for fresh data while the popover is open.
+    // The status dot stays green as long as data was refreshed within this window.
+    static let refreshIntervalKey = "refreshInterval"
+    static let refreshIntervalOptions: [(label: String, seconds: TimeInterval)] = [
+        ("6 seconds", 6), ("20 seconds", 20), ("30 seconds", 30), ("60 seconds", 60)
+    ]
+    var statusFreshnessInterval: TimeInterval = {
+        let saved = UserDefaults.standard.double(forKey: AppDelegate.refreshIntervalKey)
+        return saved > 0 ? saved : 6.0
+    }()
+    var refreshTimer: Timer?
+    var lastRefreshDate: Date?
+
+    // Menu bar badge
+    static let showBadgeKey = "showMenuBarBadge"
+    var showMenuBarBadge: Bool = UserDefaults.standard.bool(forKey: AppDelegate.showBadgeKey) {
+        didSet {
+            UserDefaults.standard.set(showMenuBarBadge, forKey: Self.showBadgeKey)
+            applyBadgeVisibility()
+        }
+    }
+
+    /// JS to scrape the "Current session" usage percentage from the page.
+    static let scrapeSessionPercentageJS = """
+    (function() {
+        try {
+            var snap = document.evaluate(
+                "//text()[contains(., 'Current session')]",
+                document.body, null,
+                XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null
+            );
+            if (snap.snapshotLength > 0) {
+                var node = snap.snapshotItem(0);
+                var el = node.parentElement;
+                for (var i = 0; i < 6 && el; i++) {
+                    var t = el.textContent;
+                    if (t.indexOf('Current session') !== -1 && /\\d+%\\s*used/.test(t)) {
+                        var m = t.match(/(\\d+)%\\s*used/);
+                        if (m) return parseInt(m[1], 10);
+                    }
+                    el = el.parentElement;
+                }
+            }
+        } catch(e) {}
+        return null;
+    })()
+    """
 
     // Fallback login window (email/magic-link in WKWebView)
     var loginWindow: NSWindow?
@@ -137,12 +185,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             border-radius: 50%;
             background: #666;
             z-index: 99999;
-            transition: background 0.3s ease;
+            transition: background 0.3s ease, opacity 0.3s ease, box-shadow 0.3s ease;
             box-shadow: 0 0 3px rgba(0,0,0,0.4);
+        }
+        #claude-status-dot.believed-fresh {
+            background: #d4a843;
+            opacity: 0.6;
+            box-shadow: 0 0 4px rgba(212,168,67,0.4);
         }
         #claude-status-dot.fresh {
             background: #34d399;
+            opacity: 1;
             box-shadow: 0 0 6px rgba(52,211,153,0.5);
+        }
+        #claude-status-dot.loading::after {
+            content: '';
+            position: absolute;
+            top: -3px;
+            left: -3px;
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            border: 1.5px solid transparent;
+            border-top-color: #888;
+            animation: dot-spin 0.8s linear infinite;
+        }
+        #claude-status-dot.believed-fresh.loading::after {
+            border-top-color: #d4a843;
+        }
+        #claude-status-dot.fresh.loading::after {
+            border-top-color: #34d399;
+        }
+        @keyframes dot-spin {
+            to { transform: rotate(360deg); }
         }
     """
 
@@ -151,13 +226,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "gauge.medium", accessibilityDescription: "Claude Usage")
+            button.imagePosition = .imageLeading
+            button.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
             button.action = #selector(togglePopover)
             button.target = self
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
+        applyBadgeVisibility()
 
         setupMenu()
         setupPopover()
@@ -197,14 +275,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                 });
                 observer.observe(document.body, { childList: true, subtree: true });
                 window.__claudeStatusTimeout = null;
+                window.__statusFreshnessMs = \(Int(statusFreshnessInterval * 1000 + 3000));
                 window.__setStatusFresh = function() {
                     var dot = document.querySelector('#claude-status-dot');
                     if (dot) {
-                        dot.className = 'fresh';
+                        dot.classList.add('fresh');
+                        dot.classList.remove('loading', 'believed-fresh');
                         if (window.__claudeStatusTimeout) clearTimeout(window.__claudeStatusTimeout);
                         window.__claudeStatusTimeout = setTimeout(function() {
-                            dot.className = '';
-                        }, 6000);
+                            dot.classList.remove('fresh');
+                        }, window.__statusFreshnessMs);
                     }
                 };
             """,
@@ -236,6 +316,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         popover.contentSize = NSSize(width: 400, height: 380)
         popover.behavior = .transient
         popover.contentViewController = vc
+        popover.delegate = self
     }
 
     // MARK: - Claude Desktop Cookie Import
@@ -356,6 +437,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
 
         if webView === self.webView {
             // Fade back in after reload and mark status dot green
+            lastRefreshDate = Date()
             webView.evaluateJavaScript("""
                 document.body.style.transition='opacity 0.2s';
                 document.body.style.opacity='1';
@@ -364,6 +446,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             popover.contentSize = url.contains("/settings/usage")
                 ? NSSize(width: 400, height: 380)
                 : NSSize(width: 420, height: 600)
+            updateMenuBarBadge()
         }
     }
 
@@ -419,11 +502,58 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         menu.addItem(NSMenuItem(title: "Import from Claude Desktop", action: #selector(importFromDesktop), keyEquivalent: "i"))
         menu.addItem(NSMenuItem(title: "Sign In\u{2026}", action: #selector(openLogin), keyEquivalent: "l"))
         menu.addItem(NSMenuItem.separator())
+
+        let intervalItem = NSMenuItem(title: "Refresh Interval", action: nil, keyEquivalent: "")
+        let intervalSubmenu = NSMenu()
+        for option in Self.refreshIntervalOptions {
+            let item = NSMenuItem(title: option.label, action: #selector(setRefreshInterval(_:)), keyEquivalent: "")
+            item.tag = Int(option.seconds)
+            item.target = self
+            if option.seconds == statusFreshnessInterval {
+                item.state = .on
+            }
+            intervalSubmenu.addItem(item)
+        }
+        intervalItem.submenu = intervalSubmenu
+        menu.addItem(intervalItem)
+
+        let badgeItem = NSMenuItem(title: "Show Usage in Menu Bar", action: #selector(toggleBadge(_:)), keyEquivalent: "b")
+        badgeItem.target = self
+        badgeItem.state = showMenuBarBadge ? .on : .off
+        menu.addItem(badgeItem)
+
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Check for Updates\u{2026}", action: #selector(checkForUpdates), keyEquivalent: "u"))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit ClaudeMeter", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = nil
         contextMenu = menu
+    }
+
+    @objc func toggleBadge(_ sender: NSMenuItem) {
+        showMenuBarBadge.toggle()
+        sender.state = showMenuBarBadge ? .on : .off
+    }
+
+    @objc func setRefreshInterval(_ sender: NSMenuItem) {
+        let seconds = TimeInterval(sender.tag)
+        statusFreshnessInterval = seconds
+        UserDefaults.standard.set(seconds, forKey: Self.refreshIntervalKey)
+
+        // Update checkmarks
+        if let submenu = sender.menu {
+            for item in submenu.items { item.state = .off }
+        }
+        sender.state = .on
+
+        // Update the JS-side freshness timeout
+        let freshnessMs = Int(seconds * 1000 + 3000)
+        webView.evaluateJavaScript("window.__statusFreshnessMs = \(freshnessMs);", completionHandler: nil)
+
+        // Restart polling if active
+        if refreshTimer != nil {
+            startPolling()
+        }
     }
 
     @objc func togglePopover() {
@@ -443,6 +573,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             softReload()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
+            startPolling()
         }
     }
 
@@ -453,11 +584,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             gracefulReload()
             return
         }
-        // Set dot grey while refreshing, click the site's refresh button, then set dot green
+        let believedFresh = lastRefreshDate.map { -$0.timeIntervalSinceNow < statusFreshnessInterval } ?? false
+        let dotClass = believedFresh ? "believed-fresh loading" : "loading"
+        // Set dot to believed-fresh (yellow) or grey + loading spinner, then refresh
         let js = """
         (function() {
             var dot = document.querySelector('#claude-status-dot');
-            if (dot) dot.className = '';
+            if (dot) { dot.className = '\(dotClass)'; }
             var btns = document.querySelectorAll('button');
             for (var b of btns) {
                 if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
@@ -473,7 +606,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         })()
         """
         webView.evaluateJavaScript(js) { [weak self] result, _ in
-            if (result as? String) != "clicked" {
+            if (result as? String) == "clicked" {
+                // Data arrives ~1.5s after click; mark refresh time and update badge
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    self?.lastRefreshDate = Date()
+                    self?.updateMenuBarBadge()
+                }
+            } else {
                 self?.gracefulReload()
             }
         }
@@ -485,7 +624,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             document.body.style.transition='opacity 0.15s';
             document.body.style.opacity='0.4';
             var dot = document.querySelector('#claude-status-dot');
-            if (dot) dot.className = '';
+            if (dot) { dot.classList.remove('fresh'); dot.classList.add('loading'); }
         """, completionHandler: nil)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             self?.webView.load(URLRequest(url: Self.usageURL))
@@ -496,6 +635,93 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     @objc func openLogin() { showLoginWindow() }
     @objc func checkForUpdates() { AppUpdater.checkForUpdates() }
     @objc func quit() { NSApp.terminate(nil) }
+
+    // MARK: - Polling
+
+    func startPolling() {
+        refreshTimer?.invalidate()
+        NSLog("[ClaudeMeter] startPolling: interval=\(statusFreshnessInterval)s")
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: statusFreshnessInterval, repeats: true) { [weak self] _ in
+            NSLog("[ClaudeMeter] timer fired, calling silentRefresh")
+            self?.silentRefresh()
+        }
+    }
+
+    func stopPolling() {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+    }
+
+    /// Silent refresh: keeps the dot green and clicks the site's refresh button.
+    /// The dot is set fresh immediately (we're actively polling), then we also
+    /// attempt to refresh the underlying data via the site's own button.
+    func silentRefresh() {
+        guard popover.isShown,
+              let url = webView.url?.absoluteString, url.contains("/settings/usage") else { return }
+        let js = """
+        (function() {
+            var dot = document.querySelector('#claude-status-dot');
+            if (dot) dot.classList.add('loading');
+            var btns = document.querySelectorAll('button');
+            for (var b of btns) {
+                if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
+                    b.closest('[class*="text-xs"]')) {
+                    b.click();
+                    setTimeout(function() {
+                        if (window.__setStatusFresh) window.__setStatusFresh();
+                    }, 1500);
+                    return 'clicked';
+                }
+            }
+            if (window.__setStatusFresh) window.__setStatusFresh();
+            return 'not_found';
+        })()
+        """
+        webView.evaluateJavaScript(js) { [weak self] result, error in
+            if let error = error {
+                NSLog("[ClaudeMeter] silentRefresh JS error: \(error.localizedDescription)")
+            } else {
+                NSLog("[ClaudeMeter] silentRefresh result: \(result ?? "nil")")
+                if (result as? String) == "clicked" {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        self?.lastRefreshDate = Date()
+                        self?.updateMenuBarBadge()
+                    }
+                } else {
+                    // Button not found but we called __setStatusFresh
+                    self?.lastRefreshDate = Date()
+                    self?.updateMenuBarBadge()
+                }
+            }
+        }
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        NSLog("[ClaudeMeter] popoverDidClose, stopping polling")
+        stopPolling()
+    }
+
+    // MARK: - Menu Bar Badge
+
+    func applyBadgeVisibility() {
+        guard let button = statusItem.button else { return }
+        if showMenuBarBadge {
+            button.imagePosition = .imageLeading
+            // Scrape now if we have data
+            updateMenuBarBadge()
+        } else {
+            button.title = ""
+            button.imagePosition = .imageOnly
+        }
+    }
+
+    func updateMenuBarBadge() {
+        guard showMenuBarBadge, webView != nil else { return }
+        webView.evaluateJavaScript(Self.scrapeSessionPercentageJS) { [weak self] result, _ in
+            guard let self = self, let percentage = result as? Int else { return }
+            self.statusItem.button?.title = "\(percentage)%"
+        }
+    }
 
     private func isLoginURL(_ url: String) -> Bool {
         url.contains("/login") || url.contains("/signin") || url.contains("accounts.google.com")
