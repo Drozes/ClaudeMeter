@@ -26,8 +26,11 @@ Authenticates automatically by importing your session from the Claude Desktop ap
 ## Install
 
 1. Download **ClaudeMeter.zip** from the [latest release](https://github.com/Drozes/ClaudeMeter/releases/latest)
-2. Unzip and double-click **ClaudeMeter.app**
-3. On first launch, the app will offer to move itself to your Applications folder
+2. Unzip the archive
+3. **Right-click** ClaudeMeter.app → **Open** (required on first launch since the app isn't notarized)
+4. On first launch, the app will offer to move itself to your Applications folder
+
+> **Note:** Double-clicking will show "Apple could not verify" — this is normal for community-distributed apps. Right-click → Open bypasses this. You only need to do this once.
 
 macOS will show a Keychain access dialog on first run — click **Always Allow**.
 
@@ -72,6 +75,8 @@ The app is a single Swift file (`ClaudeMeter.swift`) with no dependencies beyond
 4. **Soft reload** — On re-open, clicks the site's own refresh button via JavaScript instead of doing a full page load
 
 ## Troubleshooting
+
+**"Apple could not verify"** — Right-click the app → Open. Alternatively, go to System Settings → Privacy & Security, scroll down, and click "Open Anyway".
 
 **Keychain dialog keeps appearing** — Click "Always Allow" instead of "Allow".
 

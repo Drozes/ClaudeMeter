@@ -8,12 +8,14 @@
 
 /* Begin PBXBuildFile section */
 		A1B2C3D400000001 /* ClaudeMeter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D400000002 /* ClaudeMeter.swift */; };
+		A1B2C3D400000005 /* AppIcon.icns in Resources */ = {isa = PBXBuildFile; fileRef = A1B2C3D400000006 /* AppIcon.icns */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		A1B2C3D400000002 /* ClaudeMeter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClaudeMeter.swift; sourceTree = "<group>"; };
 		A1B2C3D400000003 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A1B2C3D400000004 /* ClaudeMeter.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ClaudeMeter.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A1B2C3D400000006 /* AppIcon.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = AppIcon.icns; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -22,6 +24,7 @@
 			children = (
 				A1B2C3D400000002 /* ClaudeMeter.swift */,
 				A1B2C3D400000003 /* Info.plist */,
+				A1B2C3D400000006 /* AppIcon.icns */,
 				A1B2C3D400000011 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -43,6 +46,7 @@
 			buildPhases = (
 				A1B2C3D400000030 /* Sources */,
 				A1B2C3D400000031 /* Frameworks */,
+				A1B2C3D400000032 /* Resources */,
 			);
 			buildRules = (
 			);
@@ -100,6 +104,17 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A1B2C3D400000032 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1B2C3D400000005 /* AppIcon.icns in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
 		A1B2C3D400000060 /* Debug */ = {
