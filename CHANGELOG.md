@@ -4,6 +4,14 @@ Quick reference for AI assistants continuing work on this project.
 
 ## Release History
 
+### v1.3
+
+- **Badge Refresh Interval submenu** — configurable background polling for menu bar badge (30s / 1m / 2m / 5m / 10m), default 2 minutes
+- **Background badge updates** — badge auto-updates in background even when popover is closed
+- **Battery efficiency** — improved timer tolerance for better energy impact
+- **Code signature verification** — auto-updates now verify code signatures before applying
+- Various robustness and stability improvements
+
 ### v1.2
 
 - **Auto-polling** — configurable refresh interval (6s / 20s / 30s / 60s) keeps data fresh while popover is open
@@ -76,7 +84,7 @@ Quick reference for AI assistants continuing work on this project.
 
 ### Menu (right-click)
 
-- Reload, Import from Claude Desktop, Sign In..., Refresh Interval (submenu), Show Usage in Menu Bar, Check for Updates..., Quit
+- Reload, Import from Claude Desktop, Sign In..., Refresh Interval (submenu), Show Usage in Menu Bar, Badge Refresh Interval (submenu), Check for Updates..., Quit
 
 ## Key Decisions & Findings
 

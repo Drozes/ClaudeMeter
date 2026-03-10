@@ -34,6 +34,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     var lastRefreshDate: Date?
 
     // Menu bar badge
+    static let badgeIntervalKey = "badgeRefreshInterval"
+    static let badgeIntervalOptions: [(label: String, seconds: TimeInterval)] = [
+        ("30 seconds", 30), ("1 minute", 60), ("2 minutes", 120), ("5 minutes", 300), ("10 minutes", 600)
+    ]
+    var badgeRefreshInterval: TimeInterval = {
+        let saved = UserDefaults.standard.double(forKey: AppDelegate.badgeIntervalKey)
+        return saved > 0 ? saved : 120.0
+    }()
+    var badgeTimer: Timer?
+    var badgeRefreshCount: Int = 0
+    var badgeIntervalMenuItem: NSMenuItem?
+
     static let showBadgeKey = "showMenuBarBadge"
     var showMenuBarBadge: Bool = UserDefaults.standard.bool(forKey: AppDelegate.showBadgeKey) {
         didSet {
@@ -235,10 +247,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             button.target = self
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
-        applyBadgeVisibility()
 
         setupMenu()
         setupPopover()
+        applyBadgeVisibility()
 
         // Prompt to move to /Applications if not already there
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
@@ -517,10 +529,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         intervalItem.submenu = intervalSubmenu
         menu.addItem(intervalItem)
 
+        menu.addItem(NSMenuItem.separator())
+
         let badgeItem = NSMenuItem(title: "Show Usage in Menu Bar", action: #selector(toggleBadge(_:)), keyEquivalent: "b")
         badgeItem.target = self
         badgeItem.state = showMenuBarBadge ? .on : .off
         menu.addItem(badgeItem)
+
+        let badgeIntervalItem = NSMenuItem(title: "Badge Refresh Interval", action: nil, keyEquivalent: "")
+        let badgeIntervalSubmenu = NSMenu()
+        for option in Self.badgeIntervalOptions {
+            let item = NSMenuItem(title: option.label, action: #selector(setBadgeInterval(_:)), keyEquivalent: "")
+            item.tag = Int(option.seconds)
+            item.target = self
+            if option.seconds == badgeRefreshInterval {
+                item.state = .on
+            }
+            badgeIntervalSubmenu.addItem(item)
+        }
+        badgeIntervalItem.submenu = badgeIntervalSubmenu
+        badgeIntervalItem.isEnabled = showMenuBarBadge
+        badgeIntervalMenuItem = badgeIntervalItem
+        menu.addItem(badgeIntervalItem)
 
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Check for Updates\u{2026}", action: #selector(checkForUpdates), keyEquivalent: "u"))
@@ -533,6 +563,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     @objc func toggleBadge(_ sender: NSMenuItem) {
         showMenuBarBadge.toggle()
         sender.state = showMenuBarBadge ? .on : .off
+        badgeIntervalMenuItem?.isEnabled = showMenuBarBadge
+    }
+
+    @objc func setBadgeInterval(_ sender: NSMenuItem) {
+        let seconds = TimeInterval(sender.tag)
+        badgeRefreshInterval = seconds
+        UserDefaults.standard.set(seconds, forKey: Self.badgeIntervalKey)
+
+        if let submenu = sender.menu {
+            for item in submenu.items { item.state = .off }
+        }
+        sender.state = .on
+
+        // Restart badge polling if active
+        if badgeTimer != nil {
+            startBadgePolling()
+        }
     }
 
     @objc func setRefreshInterval(_ sender: NSMenuItem) {
@@ -570,6 +617,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         if popover.isShown {
             popover.performClose(nil)
         } else {
+            stopBadgePolling()
             softReload()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
@@ -645,6 +693,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             NSLog("[ClaudeMeter] timer fired, calling silentRefresh")
             self?.silentRefresh()
         }
+        refreshTimer?.tolerance = statusFreshnessInterval * 0.1
     }
 
     func stopPolling() {
@@ -652,11 +701,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         refreshTimer = nil
     }
 
+    func startBadgePolling() {
+        badgeTimer?.invalidate()
+        NSLog("[ClaudeMeter] startBadgePolling: interval=\(badgeRefreshInterval)s")
+        badgeTimer = Timer.scheduledTimer(withTimeInterval: badgeRefreshInterval, repeats: true) { [weak self] _ in
+            NSLog("[ClaudeMeter] badge timer fired, calling badgeRefresh")
+            self?.badgeRefresh()
+        }
+        badgeTimer?.tolerance = badgeRefreshInterval * 0.1
+    }
+
+    func stopBadgePolling() {
+        badgeTimer?.invalidate()
+        badgeTimer = nil
+    }
+
     /// Silent refresh: keeps the dot green and clicks the site's refresh button.
     /// The dot is set fresh immediately (we're actively polling), then we also
     /// attempt to refresh the underlying data via the site's own button.
     func silentRefresh() {
-        guard popover.isShown,
+        guard popover?.isShown == true,
               let url = webView.url?.absoluteString, url.contains("/settings/usage") else { return }
         let js = """
         (function() {
@@ -696,30 +760,84 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
     }
 
+    /// Background badge refresh: clicks the site's refresh button and scrapes the percentage.
+    /// Runs on the badge timer when the popover is closed but badge is enabled.
+    func badgeRefresh() {
+        guard showMenuBarBadge, popover?.isShown != true,
+              let url = webView.url?.absoluteString, url.contains("/settings/usage") else { return }
+
+        // Periodic full WebView reload to prevent unbounded memory growth
+        badgeRefreshCount += 1
+        if badgeRefreshCount >= 30 {
+            badgeRefreshCount = 0
+            NSLog("[ClaudeMeter] badgeRefresh: periodic full reload to reclaim WebView memory")
+            webView.load(URLRequest(url: Self.usageURL))
+            return
+        }
+
+        let js = """
+        (function() {
+            var btns = document.querySelectorAll('button');
+            for (var b of btns) {
+                if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
+                    b.closest('[class*="text-xs"]')) {
+                    b.click();
+                    return 'clicked';
+                }
+            }
+            return 'not_found';
+        })()
+        """
+        webView.evaluateJavaScript(js) { [weak self] result, error in
+            if let error = error {
+                NSLog("[ClaudeMeter] badgeRefresh JS error: \(error.localizedDescription)")
+            } else {
+                NSLog("[ClaudeMeter] badgeRefresh result: \(result ?? "nil")")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    self?.updateMenuBarBadge()
+                }
+            }
+        }
+    }
+
     func popoverDidClose(_ notification: Notification) {
         NSLog("[ClaudeMeter] popoverDidClose, stopping polling")
         stopPolling()
+        if showMenuBarBadge {
+            NSLog("[ClaudeMeter] badge enabled, starting badge polling")
+            startBadgePolling()
+        }
     }
 
     // MARK: - Menu Bar Badge
 
     func applyBadgeVisibility() {
         guard let button = statusItem.button else { return }
+        badgeIntervalMenuItem?.isEnabled = showMenuBarBadge
         if showMenuBarBadge {
             button.imagePosition = .imageLeading
-            // Scrape now if we have data
+            button.title = "\u{2014}%"  // placeholder until scrape completes
             updateMenuBarBadge()
+            // Start background badge polling if popover isn't open
+            if popover?.isShown != true {
+                startBadgePolling()
+            }
         } else {
             button.title = ""
             button.imagePosition = .imageOnly
+            stopBadgePolling()
         }
     }
 
     func updateMenuBarBadge() {
         guard showMenuBarBadge, webView != nil else { return }
         webView.evaluateJavaScript(Self.scrapeSessionPercentageJS) { [weak self] result, _ in
-            guard let self = self, let percentage = result as? Int else { return }
-            self.statusItem.button?.title = "\(percentage)%"
+            guard let self = self else { return }
+            if let percentage = result as? Int {
+                self.statusItem.button?.title = "\(percentage)%"
+            } else if self.statusItem.button?.title.isEmpty == true {
+                self.statusItem.button?.title = "\u{2014}%"
+            }
         }
     }
 
@@ -917,6 +1035,25 @@ enum AppUpdater {
                               userInfo: [NSLocalizedDescriptionKey: "No app bundle found in the update archive."])
             }
             let newAppPath = workDir.appendingPathComponent(appName).path
+
+            // Verify code signature before replacing
+            let codesign = Process()
+            codesign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+            codesign.arguments = ["--verify", "--deep", "--strict", newAppPath]
+            let signPipe = Pipe()
+            codesign.standardOutput = signPipe
+            codesign.standardError = signPipe
+            try codesign.run()
+            codesign.waitUntilExit()
+            if codesign.terminationStatus != 0 {
+                let signOutput = String(data: signPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                NSLog("ClaudeMeter: Code signature verification failed: %@", signOutput)
+                showError("Update Failed",
+                          "The downloaded app failed code signature verification and cannot be installed.")
+                try? fm.removeItem(at: workDir)
+                return
+            }
+
             let currentAppPath = Bundle.main.bundlePath
             let pid = ProcessInfo.processInfo.processIdentifier
 
@@ -1024,9 +1161,12 @@ enum ClaudeDesktopCookies {
 
         var cookies: [HTTPCookie] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            let host     = String(cString: sqlite3_column_text(stmt, 0))
-            let name     = String(cString: sqlite3_column_text(stmt, 1))
-            let path     = String(cString: sqlite3_column_text(stmt, 2))
+            guard let hostPtr = sqlite3_column_text(stmt, 0),
+                  let namePtr = sqlite3_column_text(stmt, 1),
+                  let pathPtr = sqlite3_column_text(stmt, 2) else { continue }
+            let host     = String(cString: hostPtr)
+            let name     = String(cString: namePtr)
+            let path     = String(cString: pathPtr)
             let isSecure = sqlite3_column_int(stmt, 5) != 0
             let isHttp   = sqlite3_column_int(stmt, 6) != 0
 
