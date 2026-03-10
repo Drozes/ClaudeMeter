@@ -15,8 +15,8 @@ Authenticates automatically by importing your session from the Claude Desktop ap
 - **Fallback login** — right-click → "Sign In..." for email/magic-link if Claude Desktop isn't available
 
 ## Peak In
- 
-![Screen Recording 2026-03-09 at 9 00 49 PM](https://github.com/user-attachments/assets/cf286856-5352-4258-87bd-55da17294860)
+
+![ClaudeMeterDemoV1](https://github.com/user-attachments/assets/57d94a69-61d9-427c-add5-96fd55bb55db)
 
 
 
