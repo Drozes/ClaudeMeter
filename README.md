@@ -18,9 +18,12 @@ Authenticates automatically by importing your session from the Claude Desktop ap
 
 ## Peek In
 
-<img width="184" height="82" alt="ToolbarIcon" src="https://github.com/user-attachments/assets/9b5ad5b7-9659-4814-b14a-7a95d6d2201e" />
+<img width="234" height="144" alt="meter" src="https://github.com/user-attachments/assets/01bf128b-4337-4a10-bfdc-c443acbaac4f" />
 
-![ClaudeMeterDemoV1](https://github.com/user-attachments/assets/57d94a69-61d9-427c-add5-96fd55bb55db)
+![99 1](https://github.com/user-attachments/assets/92df5754-8c0a-464b-b22e-538ebf7b239f)
+
+<img width="935" height="911" alt="menu" src="https://github.com/user-attachments/assets/f28dc23d-b383-4397-8462-eb965bfb08a0" />
+
 
 
 
