@@ -4,6 +4,12 @@ Quick reference for AI assistants continuing work on this project.
 
 ## Release History
 
+### v1.4
+
+- **Tighter popover layout** — reduced vertical spacing throughout (edge insets, section dividers, meter gaps) to eliminate excess whitespace
+- **Dynamic popover sizing** — popover height now auto-sizes to fit content instead of using a fixed 380px height
+- **Dynamic Safari UA** — user agent string now derives Safari version from the host macOS version instead of being hardcoded
+
 ### v1.3
 
 - **Badge Refresh Interval submenu** — configurable background polling for menu bar badge (30s / 1m / 2m / 5m / 10m), default 2 minutes
@@ -52,11 +58,11 @@ Quick reference for AI assistants continuing work on this project.
 
 ### Display
 
-- Popover (400x380) with CSS injection to hide nav/sidebar/chrome, showing only usage meters
+- Popover (400px wide, auto-height) with CSS injection to hide nav/sidebar/chrome, showing only usage meters
 - Hides: site sidebar, header, "Settings" heading, settings nav tabs, "Extra usage" section, "Learn more" links, "Last updated" row, Intercom widget
 - MutationObserver re-applies CSS after React re-renders
 - Section headings styled as subtle uppercase labels
-- Auto-resizes popover (380px for usage, 600px for other pages)
+- Auto-resizes popover to fit content (clamped 120–500px)
 
 ### Reload behavior
 

@@ -18,6 +18,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     var statusItem: NSStatusItem!
     var popover: NSPopover!
     var webView: WKWebView!
+    var usageView: UsageContentView!
     var contextMenu: NSMenu!
 
     // How often (seconds) to poll for fresh data while the popover is open.
@@ -90,147 +91,84 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     // Track whether we've already tried the desktop import for this launch
     var hasAttemptedDesktopImport = false
 
-    static let safariUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+    static let safariUA: String = {
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        // Safari major version tracks macOS major version + 3 (macOS 14→Safari 17, 15→18, etc.)
+        let safariMajor = max(v.majorVersion + 3, 17)
+        return "Mozilla/5.0 (Macintosh; Intel Mac OS X \(v.majorVersion)_\(v.minorVersion)_\(v.patchVersion)) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/\(safariMajor).0 Safari/605.1.15"
+    }()
     static let usageURL = URL(string: "https://claude.ai/settings/usage")!
     static let loginURL = URL(string: "https://claude.ai/login")!
 
-    static let usageCSS = """
-        /* Hide outer shell: sidebar, header, footer */
-        body > div > div.root > div > div:first-child,
-        header, aside, footer,
-        [data-testid="sidebar"], [data-testid="nav"],
-        [class*="sidebar"], [class*="Sidebar"] {
-            display: none !important;
-        }
-        html, body {
-            background: #1a1a1a !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            overflow-x: hidden !important;
-        }
-        /* Hide the "Settings" heading and settings nav tabs */
-        main > h1 {
-            display: none !important;
-        }
-        main > div > nav {
-            display: none !important;
-        }
-        /* Make the settings content grid single-column (no nav sidebar) */
-        main > div {
-            display: block !important;
-        }
-        main {
-            padding: 10px 14px !important;
-            margin: 0 !important;
-            max-width: 100% !important;
-            width: 100% !important;
-            box-sizing: border-box !important;
-        }
-        /* Hide "Extra usage" section */
-        [data-testid="extra-usage-section"] {
-            display: none !important;
-        }
-        /* Hide "Plan usage limits" heading, "Learn more" link, and "Last updated" row */
-        section > div:first-child:has(h2) h2:first-of-type {
-            display: none !important;
-        }
-        section a[href*="understanding-usage"] {
-            display: none !important;
-        }
-        section > div:last-child:has(button):has(p) {
-            display: none !important;
-        }
-        /* Clean spacing */
-        section {
-            gap: 0.75rem !important;
-            margin-bottom: 0 !important;
-            padding-bottom: 0.75rem !important;
-            border-bottom: none !important;
-        }
-        section h2 {
-            font-size: 0.8rem !important;
-            text-transform: uppercase !important;
-            letter-spacing: 0.05em !important;
-            color: #999 !important;
-            margin-bottom: 0 !important;
-        }
-        section .gap-6 {
-            gap: 0.75rem !important;
-        }
-        section .mb-8 {
-            margin-bottom: 0.5rem !important;
-        }
-        section .pb-8 {
-            padding-bottom: 0.5rem !important;
-        }
-        section .space-y-6 > * + * {
-            margin-top: 0.75rem !important;
-        }
-        /* Progress bar rows */
-        section .gap-y-3 {
-            gap: 0.25rem !important;
-        }
-        section .gap-1\\.5 {
-            gap: 0.1rem !important;
-        }
-        /* Divider line */
-        section .h-px {
-            margin: 0.5rem 0 !important;
-        }
-        /* Hide overlays */
-        [class*="modal"], [class*="Modal"],
-        [class*="banner"], [class*="Banner"],
-        [class*="cookie"], [class*="Cookie"],
-        [class*="toast"], [class*="Toast"],
-        .intercom-lightweight-app,
-        #intercom-frame {
-            display: none !important;
-        }
-        ::-webkit-scrollbar { display: none !important; }
-        /* Status dot */
-        #claude-status-dot {
-            position: fixed;
-            top: 8px;
-            right: 8px;
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            background: #666;
-            z-index: 99999;
-            transition: background 0.3s ease, opacity 0.3s ease, box-shadow 0.3s ease;
-            box-shadow: 0 0 3px rgba(0,0,0,0.4);
-        }
-        #claude-status-dot.believed-fresh {
-            background: #d4a843;
-            opacity: 0.6;
-            box-shadow: 0 0 4px rgba(212,168,67,0.4);
-        }
-        #claude-status-dot.fresh {
-            background: #34d399;
-            opacity: 1;
-            box-shadow: 0 0 6px rgba(52,211,153,0.5);
-        }
-        #claude-status-dot.loading::after {
-            content: '';
-            position: absolute;
-            top: -3px;
-            left: -3px;
-            width: 14px;
-            height: 14px;
-            border-radius: 50%;
-            border: 1.5px solid transparent;
-            border-top-color: #888;
-            animation: dot-spin 0.8s linear infinite;
-        }
-        #claude-status-dot.believed-fresh.loading::after {
-            border-top-color: #d4a843;
-        }
-        #claude-status-dot.fresh.loading::after {
-            border-top-color: #34d399;
-        }
-        @keyframes dot-spin {
-            to { transform: rotate(360deg); }
-        }
+    /// JS to scrape all usage data as structured JSON from the page.
+    /// Uses the same XPath approach as scrapeSessionPercentageJS (proven to work for the badge),
+    /// extended to find ALL percentage meters and their surrounding context.
+    /// Uses textContent (not innerText) for boundary detection since Claude's page
+    /// uses CSS layout that causes innerText to return empty at intermediate levels.
+    static let scrapeUsageJS = """
+    (function(){
+        try {
+            var data = [];
+            var snap = document.evaluate(
+                "//text()[contains(., '% used')]",
+                document.body, null,
+                XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null
+            );
+            function leafTexts(node, max) {
+                var r = [];
+                if (r.length >= (max || 200)) return r;
+                if (node.nodeType === 3) {
+                    var t = node.textContent.trim();
+                    if (t) r.push(t);
+                } else if (node.nodeType === 1) {
+                    for (var c = 0; c < node.childNodes.length && r.length < (max || 200); c++) {
+                        r = r.concat(leafTexts(node.childNodes[c], max));
+                    }
+                }
+                return r;
+            }
+            for (var i = 0; i < snap.snapshotLength; i++) {
+                var node = snap.snapshotItem(i);
+                var m = node.textContent.match(/(\\d+)%\\s*used/);
+                if (!m) continue;
+                var pct = parseInt(m[1], 10);
+                var el = node.parentElement;
+                var card = el;
+                for (var j = 0; j < 10 && el; j++) {
+                    var cnt = (el.textContent.match(/\\d+%\\s*used/g) || []).length;
+                    if (cnt > 1) break;
+                    card = el;
+                    el = el.parentElement;
+                }
+                var texts = leafTexts(card, 50);
+                var label = '';
+                var detail = '';
+                for (var k = 0; k < texts.length; k++) {
+                    var t = texts[k];
+                    if (/\\d+%\\s*used/.test(t)) continue;
+                    if (/\\d+%/.test(t)) continue;
+                    if (/reset/i.test(t) && !detail) { detail = t; continue; }
+                    if (/last updated/i.test(t) || /learn more/i.test(t)) continue;
+                    if (!label && t.length < 50 && t.length > 1) label = t;
+                }
+                var section = '';
+                el = card.parentElement;
+                for (var j = 0; j < 4 && el; j++) {
+                    var sTexts = leafTexts(el, 100);
+                    for (var s = 0; s < sTexts.length; s++) {
+                        if (/limit/i.test(sTexts[s]) && sTexts[s].length < 40 && sTexts[s].length > 3) {
+                            section = sTexts[s];
+                            break;
+                        }
+                    }
+                    if (section) break;
+                    el = el.parentElement;
+                }
+                data.push({section: section, label: label, percentage: pct, detail: detail});
+            }
+            return JSON.stringify(data);
+        } catch(e) { return '[]'; }
+    })()
     """
 
     // MARK: - App Lifecycle
@@ -261,67 +199,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     // MARK: - Popover
 
     func setupPopover() {
-        let cssInjection = WKUserScript(
-            source: """
-                var style = document.createElement('style');
-                style.id = 'claude-usage-style';
-                style.textContent = `\(Self.usageCSS)`;
-                document.head.appendChild(style);
-                if (!document.querySelector('#claude-status-dot')) {
-                    var dot = document.createElement('div');
-                    dot.id = 'claude-status-dot';
-                    document.body.appendChild(dot);
-                }
-                var observer = new MutationObserver(function() {
-                    if (!document.querySelector('#claude-usage-style')) {
-                        var s = document.createElement('style');
-                        s.id = 'claude-usage-style';
-                        s.textContent = `\(Self.usageCSS)`;
-                        document.head.appendChild(s);
-                    }
-                    if (!document.querySelector('#claude-status-dot')) {
-                        var d = document.createElement('div');
-                        d.id = 'claude-status-dot';
-                        document.body.appendChild(d);
-                    }
-                });
-                observer.observe(document.body, { childList: true, subtree: true });
-                window.__claudeStatusTimeout = null;
-                window.__statusFreshnessMs = \(Int(statusFreshnessInterval * 1000 + 3000));
-                window.__setStatusFresh = function() {
-                    var dot = document.querySelector('#claude-status-dot');
-                    if (dot) {
-                        dot.classList.add('fresh');
-                        dot.classList.remove('loading', 'believed-fresh');
-                        if (window.__claudeStatusTimeout) clearTimeout(window.__claudeStatusTimeout);
-                        window.__claudeStatusTimeout = setTimeout(function() {
-                            dot.classList.remove('fresh');
-                        }, window.__statusFreshnessMs);
-                    }
-                };
-            """,
-            injectionTime: .atDocumentEnd,
-            forMainFrameOnly: true
-        )
-
+        // WKWebView is kept off-screen for data scraping only
         let config = WKWebViewConfiguration()
-        config.userContentController.addUserScript(cssInjection)
         config.websiteDataStore = .default()
 
-        webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 400, height: 380), configuration: config)
+        webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.customUserAgent = Self.safariUA
 
-        // Always import fresh cookies from Claude Desktop before loading
+        // Import cookies and start loading
         hasAttemptedDesktopImport = true
         importFromClaudeDesktop { [weak self] success in
             guard let self = self else { return }
             self.webView.load(URLRequest(url: Self.usageURL))
         }
 
+        // Native popover content
+        usageView = UsageContentView(frame: NSRect(x: 0, y: 0, width: 400, height: 380))
+
         let vc = NSViewController()
-        vc.view = webView
+        vc.view = usageView
         vc.view.frame = NSRect(x: 0, y: 0, width: 400, height: 380)
 
         popover = NSPopover()
@@ -329,6 +227,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         popover.behavior = .transient
         popover.contentViewController = vc
         popover.delegate = self
+
+        usageView.onContentSizeChanged = { [weak self] height in
+            guard let self = self else { return }
+            let clamped = min(max(height, 120), 500)
+            self.popover.contentSize = NSSize(width: 400, height: clamped)
+        }
     }
 
     // MARK: - Claude Desktop Cookie Import
@@ -448,16 +352,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
 
         if webView === self.webView {
-            // Fade back in after reload and mark status dot green
             lastRefreshDate = Date()
-            webView.evaluateJavaScript("""
-                document.body.style.transition='opacity 0.2s';
-                document.body.style.opacity='1';
-                if (window.__setStatusFresh) window.__setStatusFresh();
-            """, completionHandler: nil)
-            popover.contentSize = url.contains("/settings/usage")
-                ? NSSize(width: 400, height: 380)
-                : NSSize(width: 420, height: 600)
+            usageView?.setStatusFresh(true)
+            scrapeAndUpdateUI()
             updateMenuBarBadge()
         }
     }
@@ -593,10 +490,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
         sender.state = .on
 
-        // Update the JS-side freshness timeout
-        let freshnessMs = Int(seconds * 1000 + 3000)
-        webView.evaluateJavaScript("window.__statusFreshnessMs = \(freshnessMs);", completionHandler: nil)
-
         // Restart polling if active
         if refreshTimer != nil {
             startPolling()
@@ -626,27 +519,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     }
 
     /// Soft reload: if already on the usage page, click the site's own refresh button.
-    /// Falls back to a graceful full page reload if needed.
+    /// Falls back to a full page reload if needed.
     func softReload() {
         guard let url = webView.url?.absoluteString, url.contains("/settings/usage") else {
             gracefulReload()
             return
         }
-        let believedFresh = lastRefreshDate.map { -$0.timeIntervalSinceNow < statusFreshnessInterval } ?? false
-        let dotClass = believedFresh ? "believed-fresh loading" : "loading"
-        // Set dot to believed-fresh (yellow) or grey + loading spinner, then refresh
+        usageView?.setStatusLoading()
         let js = """
         (function() {
-            var dot = document.querySelector('#claude-status-dot');
-            if (dot) { dot.className = '\(dotClass)'; }
             var btns = document.querySelectorAll('button');
             for (var b of btns) {
                 if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
                     b.closest('[class*="text-xs"]')) {
                     b.click();
-                    setTimeout(function() {
-                        if (window.__setStatusFresh) window.__setStatusFresh();
-                    }, 1500);
                     return 'clicked';
                 }
             }
@@ -655,9 +541,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         """
         webView.evaluateJavaScript(js) { [weak self] result, _ in
             if (result as? String) == "clicked" {
-                // Data arrives ~1.5s after click; mark refresh time and update badge
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                     self?.lastRefreshDate = Date()
+                    self?.scrapeAndUpdateUI()
                     self?.updateMenuBarBadge()
                 }
             } else {
@@ -666,17 +552,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
     }
 
-    /// Full reload with fade transition to avoid white flash.
+    /// Full page reload.
     func gracefulReload() {
-        webView.evaluateJavaScript("""
-            document.body.style.transition='opacity 0.15s';
-            document.body.style.opacity='0.4';
-            var dot = document.querySelector('#claude-status-dot');
-            if (dot) { dot.classList.remove('fresh'); dot.classList.add('loading'); }
-        """, completionHandler: nil)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            self?.webView.load(URLRequest(url: Self.usageURL))
-        }
+        usageView?.setStatusLoading()
+        webView.load(URLRequest(url: Self.usageURL))
     }
 
     @objc func reload() { gracefulReload() }
@@ -716,28 +595,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         badgeTimer = nil
     }
 
-    /// Silent refresh: keeps the dot green and clicks the site's refresh button.
-    /// The dot is set fresh immediately (we're actively polling), then we also
-    /// attempt to refresh the underlying data via the site's own button.
+    /// Silent refresh: clicks the site's refresh button and scrapes updated data.
     func silentRefresh() {
         guard popover?.isShown == true,
               let url = webView.url?.absoluteString, url.contains("/settings/usage") else { return }
         let js = """
         (function() {
-            var dot = document.querySelector('#claude-status-dot');
-            if (dot) dot.classList.add('loading');
             var btns = document.querySelectorAll('button');
             for (var b of btns) {
                 if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
                     b.closest('[class*="text-xs"]')) {
                     b.click();
-                    setTimeout(function() {
-                        if (window.__setStatusFresh) window.__setStatusFresh();
-                    }, 1500);
                     return 'clicked';
                 }
             }
-            if (window.__setStatusFresh) window.__setStatusFresh();
             return 'not_found';
         })()
         """
@@ -746,14 +617,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                 NSLog("[ClaudeMeter] silentRefresh JS error: \(error.localizedDescription)")
             } else {
                 NSLog("[ClaudeMeter] silentRefresh result: \(result ?? "nil")")
-                if (result as? String) == "clicked" {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                        self?.lastRefreshDate = Date()
-                        self?.updateMenuBarBadge()
-                    }
-                } else {
-                    // Button not found but we called __setStatusFresh
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                     self?.lastRefreshDate = Date()
+                    self?.scrapeAndUpdateUI()
                     self?.updateMenuBarBadge()
                 }
             }
@@ -843,6 +709,261 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
 
     private func isLoginURL(_ url: String) -> Bool {
         url.contains("/login") || url.contains("/signin") || url.contains("accounts.google.com")
+    }
+
+    // MARK: - Scrape & Native UI Update
+
+    func scrapeAndUpdateUI() {
+        webView.evaluateJavaScript(Self.scrapeUsageJS) { [weak self] result, error in
+            guard let self = self, let jsonStr = result as? String, !jsonStr.isEmpty else {
+                NSLog("[ClaudeMeter] scrapeAndUpdateUI: no data scraped")
+                return
+            }
+            let sections = Self.parseUsageJSON(jsonStr)
+            NSLog("[ClaudeMeter] scraped \(sections.count) sections")
+            self.usageView?.update(sections: sections)
+            self.usageView?.setStatusFresh(true)
+        }
+    }
+
+    static func parseUsageJSON(_ jsonString: String) -> [UsageSection] {
+        guard let data = jsonString.data(using: .utf8),
+              let items = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+
+        var orderedSections: [String] = []
+        var sectionMeters: [String: [UsageMeter]] = [:]
+
+        for item in items {
+            let section = item["section"] as? String ?? ""
+            let label = item["label"] as? String ?? ""
+            let percentage = item["percentage"] as? Int ?? 0
+            let detail = item["detail"] as? String ?? ""
+
+            let meter = UsageMeter(label: label, percentage: percentage, detail: detail)
+
+            if sectionMeters[section] == nil {
+                orderedSections.append(section)
+                sectionMeters[section] = []
+            }
+            sectionMeters[section]!.append(meter)
+        }
+
+        return orderedSections.compactMap { key in
+            guard let meters = sectionMeters[key] else { return nil }
+            return UsageSection(title: key, meters: meters)
+        }
+    }
+}
+
+// MARK: - Usage Data Model
+
+struct UsageMeter {
+    let label: String
+    let percentage: Int
+    let detail: String
+}
+
+struct UsageSection {
+    let title: String
+    let meters: [UsageMeter]
+}
+
+// MARK: - Native Usage View
+
+class UsageContentView: NSView {
+    private let scrollView = NSScrollView()
+    private let stackView = NSStackView()
+    private let statusDot = NSView()
+    var onContentSizeChanged: ((CGFloat) -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(red: 0x1a/255.0, green: 0x1a/255.0, blue: 0x1a/255.0, alpha: 1).cgColor
+
+        // Scroll view
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.drawsBackground = false
+        scrollView.scrollerStyle = .overlay
+        addSubview(scrollView)
+
+        // Stack view inside scroll view
+        stackView.orientation = .vertical
+        stackView.alignment = .leading
+        stackView.spacing = 2
+        stackView.translatesAutoresizingMaskIntoConstraints = false
+        stackView.edgeInsets = NSEdgeInsets(top: 10, left: 16, bottom: 10, right: 16)
+
+        scrollView.documentView = stackView
+
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            stackView.widthAnchor.constraint(equalTo: scrollView.widthAnchor),
+        ])
+
+        // Status dot
+        statusDot.wantsLayer = true
+        statusDot.layer?.backgroundColor = NSColor.gray.cgColor
+        statusDot.layer?.cornerRadius = 4
+        statusDot.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(statusDot)
+        NSLayoutConstraint.activate([
+            statusDot.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            statusDot.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            statusDot.widthAnchor.constraint(equalToConstant: 8),
+            statusDot.heightAnchor.constraint(equalToConstant: 8),
+        ])
+
+        // Initial loading state
+        let loading = makeLabel("Loading\u{2026}", size: 13, color: NSColor(white: 0.5, alpha: 1))
+        stackView.addArrangedSubview(loading)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func update(sections: [UsageSection]) {
+        stackView.arrangedSubviews.forEach { $0.removeFromSuperview() }
+
+        if sections.isEmpty {
+            let empty = makeLabel("No usage data available", size: 13, color: NSColor(white: 0.5, alpha: 1))
+            stackView.addArrangedSubview(empty)
+            return
+        }
+
+        for (i, section) in sections.enumerated() {
+            if i > 0 {
+                let spacer = NSView()
+                spacer.translatesAutoresizingMaskIntoConstraints = false
+                spacer.heightAnchor.constraint(equalToConstant: 2).isActive = true
+                stackView.addArrangedSubview(spacer)
+
+                let divider = NSView()
+                divider.wantsLayer = true
+                divider.layer?.backgroundColor = NSColor(white: 0.25, alpha: 1).cgColor
+                divider.translatesAutoresizingMaskIntoConstraints = false
+                divider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+                stackView.addArrangedSubview(divider)
+                divider.leadingAnchor.constraint(equalTo: stackView.leadingAnchor, constant: 16).isActive = true
+                divider.trailingAnchor.constraint(equalTo: stackView.trailingAnchor, constant: -16).isActive = true
+                stackView.setCustomSpacing(6, after: divider)
+            }
+
+            // Section title
+            if !section.title.isEmpty {
+                let title = makeLabel(section.title.uppercased(), size: 10, weight: .semibold,
+                                      color: NSColor(white: 0.5, alpha: 1))
+                title.allowsDefaultTighteningForTruncation = true
+                stackView.addArrangedSubview(title)
+                stackView.setCustomSpacing(6, after: title)
+            }
+
+            for meter in section.meters {
+                addMeter(meter)
+            }
+        }
+
+        stackView.layoutSubtreeIfNeeded()
+        let fittingHeight = stackView.fittingSize.height
+        onContentSizeChanged?(fittingHeight)
+    }
+
+    private func addMeter(_ meter: UsageMeter) {
+        let barWidth: CGFloat = 368
+
+        // Label row
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.distribution = .fill
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: barWidth).isActive = true
+
+        let name = makeLabel(meter.label.isEmpty ? "Usage" : meter.label, size: 13, weight: .medium, color: .white)
+        name.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let pct = makeLabel("\(meter.percentage)%", size: 13, weight: .medium,
+                            color: colorForPercentage(meter.percentage))
+        pct.alignment = .right
+        pct.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(name)
+        row.addArrangedSubview(pct)
+        stackView.addArrangedSubview(row)
+        stackView.setCustomSpacing(4, after: row)
+
+        // Progress bar
+        let track = NSView()
+        track.wantsLayer = true
+        track.layer?.backgroundColor = NSColor(white: 0.2, alpha: 1).cgColor
+        track.layer?.cornerRadius = 3
+        track.translatesAutoresizingMaskIntoConstraints = false
+        track.heightAnchor.constraint(equalToConstant: 6).isActive = true
+        track.widthAnchor.constraint(equalToConstant: barWidth).isActive = true
+
+        let fill = NSView()
+        fill.wantsLayer = true
+        fill.layer?.backgroundColor = colorForPercentage(meter.percentage).cgColor
+        fill.layer?.cornerRadius = 3
+        fill.translatesAutoresizingMaskIntoConstraints = false
+        track.addSubview(fill)
+        NSLayoutConstraint.activate([
+            fill.topAnchor.constraint(equalTo: track.topAnchor),
+            fill.bottomAnchor.constraint(equalTo: track.bottomAnchor),
+            fill.leadingAnchor.constraint(equalTo: track.leadingAnchor),
+            fill.widthAnchor.constraint(equalTo: track.widthAnchor,
+                                        multiplier: max(CGFloat(min(meter.percentage, 100)) / 100.0, 0.01)),
+        ])
+
+        stackView.addArrangedSubview(track)
+
+        // Detail
+        if !meter.detail.isEmpty {
+            stackView.setCustomSpacing(2, after: track)
+            let detail = makeLabel(meter.detail, size: 11, color: NSColor(white: 0.45, alpha: 1))
+            stackView.addArrangedSubview(detail)
+            stackView.setCustomSpacing(6, after: detail)
+        } else {
+            stackView.setCustomSpacing(6, after: track)
+        }
+    }
+
+    // MARK: - Status Dot
+
+    func setStatusFresh(_ fresh: Bool) {
+        statusDot.layer?.backgroundColor = fresh
+            ? NSColor(red: 0x34/255.0, green: 0xd3/255.0, blue: 0x99/255.0, alpha: 1).cgColor
+            : NSColor.gray.cgColor
+    }
+
+    func setStatusLoading() {
+        statusDot.layer?.backgroundColor = NSColor(red: 0xd4/255.0, green: 0xa8/255.0, blue: 0x43/255.0, alpha: 1).cgColor
+    }
+
+    // MARK: - Helpers
+
+    private func makeLabel(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular,
+                           color: NSColor = .white) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: size, weight: weight)
+        label.textColor = color
+        label.lineBreakMode = .byTruncatingTail
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }
+
+    private func colorForPercentage(_ pct: Int) -> NSColor {
+        switch pct {
+        case 0..<50: return NSColor(red: 0x34/255.0, green: 0xd3/255.0, blue: 0x99/255.0, alpha: 1)
+        case 50..<80: return NSColor(red: 0xfb/255.0, green: 0xbf/255.0, blue: 0x24/255.0, alpha: 1)
+        case 80..<95: return NSColor(red: 0xf9/255.0, green: 0x73/255.0, blue: 0x16/255.0, alpha: 1)
+        default: return NSColor(red: 0xef/255.0, green: 0x44/255.0, blue: 0x44/255.0, alpha: 1)
+        }
     }
 }
 
