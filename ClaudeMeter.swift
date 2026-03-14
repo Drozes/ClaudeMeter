@@ -360,8 +360,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         if webView === self.webView {
             lastRefreshDate = Date()
             usageView?.setStatusFresh(true)
+            // Scrape immediately for popover, then again after React renders for badge
             scrapeAndUpdateUI()
             updateMenuBarBadge()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                guard let self = self else { return }
+                self.scrapeAndUpdateUI()
+                self.updateMenuBarBadge()
+                // Ensure badge polling is running after initial page load
+                if self.showMenuBarBadge && self.popover?.isShown != true && self.badgeTimer == nil {
+                    self.startBadgePolling()
+                }
+            }
         }
     }
 
@@ -692,7 +702,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         badgeIntervalMenuItem?.isEnabled = showMenuBarBadge
         if showMenuBarBadge {
             button.imagePosition = .imageLeading
-            button.title = "\u{2014}%"  // placeholder until scrape completes
+            // Restore cached value instantly, or show placeholder
+            let cached = UserDefaults.standard.integer(forKey: "lastBadgePercentage")
+            button.title = cached > 0 ? "\(cached)%" : "\u{2014}%"
             updateMenuBarBadge()
             // Start background badge polling if popover isn't open
             if popover?.isShown != true {
@@ -711,6 +723,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             guard let self = self else { return }
             if let percentage = result as? Int {
                 self.statusItem.button?.title = "\(percentage)%"
+                UserDefaults.standard.set(percentage, forKey: "lastBadgePercentage")
             } else if self.statusItem.button?.title.isEmpty == true {
                 self.statusItem.button?.title = "\u{2014}%"
             }
@@ -958,8 +971,8 @@ class UsageContentView: NSView {
                 row.translatesAutoresizingMaskIntoConstraints = false
                 row.widthAnchor.constraint(equalToConstant: barWidth).isActive = true
 
-                let nameBar = makeShimmerBar(width: meter == 0 ? 110 : 80, height: 12)
-                nameBar.setContentHuggingPriority(.defaultLow, for: .horizontal)
+                let nameW: CGFloat = meter == 0 ? 110 : 80
+                let nameBar = makeShimmerBar(width: nameW, height: 12, flexible: true)
                 let pctBar = makeShimmerBar(width: 32, height: 12)
                 pctBar.setContentHuggingPriority(.required, for: .horizontal)
                 row.addArrangedSubview(nameBar)
@@ -984,13 +997,19 @@ class UsageContentView: NSView {
         onContentSizeChanged?(stackView.fittingSize.height)
     }
 
-    private func makeShimmerBar(width: CGFloat, height: CGFloat, cornerRadius: CGFloat = 4) -> NSView {
+    private func makeShimmerBar(width: CGFloat, height: CGFloat, cornerRadius: CGFloat = 4, flexible: Bool = false) -> NSView {
         let view = NSView()
         view.wantsLayer = true
         view.layer?.cornerRadius = cornerRadius
         view.layer?.masksToBounds = true
         view.translatesAutoresizingMaskIntoConstraints = false
-        view.widthAnchor.constraint(equalToConstant: width).isActive = true
+        if flexible {
+            view.widthAnchor.constraint(lessThanOrEqualToConstant: width).isActive = true
+            view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        } else {
+            view.widthAnchor.constraint(equalToConstant: width).isActive = true
+        }
         view.heightAnchor.constraint(equalToConstant: height).isActive = true
 
         let base = NSColor(white: 0.18, alpha: 1)

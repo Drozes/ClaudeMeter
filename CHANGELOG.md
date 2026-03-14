@@ -4,6 +4,12 @@ Quick reference for AI assistants continuing work on this project.
 
 ## Release History
 
+### v1.6
+
+- **Instant badge on launch** — cached last-known usage percentage displays immediately in the menu bar, updated with fresh data once the page loads
+- **Delayed post-load scrape** — second scrape 2s after page load ensures React has rendered before updating badge and popover
+- **Fixed skeleton layout constraints** — shimmer placeholder name bars use flexible widths to avoid Auto Layout warnings
+
 ### v1.5
 
 - **Shimmer skeleton loading** — popover opens with an animated skeleton placeholder that matches the real layout, instead of a blank window
