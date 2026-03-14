@@ -4,6 +4,13 @@ Quick reference for AI assistants continuing work on this project.
 
 ## Release History
 
+### v1.5
+
+- **Shimmer skeleton loading** — popover opens with an animated skeleton placeholder that matches the real layout, instead of a blank window
+- **Minimum skeleton display** — skeleton holds for at least 0.6s so the animation is visible even on fast loads
+- **Smooth content transition** — real data crossfades in with an animated popover height adjustment
+- **Skeleton on every open** — loading animation shows each time the popover opens, not just on first launch
+
 ### v1.4
 
 - **Tighter popover layout** — reduced vertical spacing throughout (edge insets, section dividers, meter gaps) to eliminate excess whitespace

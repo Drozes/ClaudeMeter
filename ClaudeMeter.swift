@@ -215,23 +215,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             self.webView.load(URLRequest(url: Self.usageURL))
         }
 
-        // Native popover content
-        usageView = UsageContentView(frame: NSRect(x: 0, y: 0, width: 400, height: 380))
+        // Native popover content — sized to skeleton, auto-resizes on content load
+        usageView = UsageContentView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        let skeletonH = usageView.skeletonHeight
 
         let vc = NSViewController()
         vc.view = usageView
-        vc.view.frame = NSRect(x: 0, y: 0, width: 400, height: 380)
+        vc.view.frame = NSRect(x: 0, y: 0, width: 400, height: skeletonH)
 
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 400, height: 380)
+        popover.contentSize = NSSize(width: 400, height: skeletonH)
         popover.behavior = .transient
         popover.contentViewController = vc
         popover.delegate = self
+        popover.animates = true
 
         usageView.onContentSizeChanged = { [weak self] height in
             guard let self = self else { return }
             let clamped = min(max(height, 120), 500)
-            self.popover.contentSize = NSSize(width: 400, height: clamped)
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.3
+                ctx.allowsImplicitAnimation = true
+                self.popover.contentSize = NSSize(width: 400, height: clamped)
+            }
         }
     }
 
@@ -511,6 +517,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             popover.performClose(nil)
         } else {
             stopBadgePolling()
+            usageView?.showLoadingSkeleton()
+            if let h = usageView?.skeletonHeight {
+                popover.contentSize = NSSize(width: 400, height: h)
+            }
             softReload()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
@@ -777,6 +787,8 @@ class UsageContentView: NSView {
     private let stackView = NSStackView()
     private let statusDot = NSView()
     var onContentSizeChanged: ((CGFloat) -> Void)?
+    private var skeletonShownAt: Date?
+    private static let minSkeletonDuration: TimeInterval = 0.6
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -821,14 +833,37 @@ class UsageContentView: NSView {
             statusDot.heightAnchor.constraint(equalToConstant: 8),
         ])
 
-        // Initial loading state
-        let loading = makeLabel("Loading\u{2026}", size: 13, color: NSColor(white: 0.5, alpha: 1))
-        stackView.addArrangedSubview(loading)
+        // Initial loading skeleton (callback not wired yet — size set by AppDelegate)
+        showLoadingSkeleton()
+    }
+
+    /// The natural height of the skeleton, used to set the initial popover size.
+    var skeletonHeight: CGFloat {
+        stackView.layoutSubtreeIfNeeded()
+        return stackView.fittingSize.height
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
     func update(sections: [UsageSection]) {
+        // If skeleton is still showing, ensure minimum display time
+        if let shown = skeletonShownAt {
+            let elapsed = Date().timeIntervalSince(shown)
+            let remaining = Self.minSkeletonDuration - elapsed
+            if remaining > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
+                    self?.doUpdate(sections: sections)
+                }
+                return
+            }
+        }
+        doUpdate(sections: sections)
+    }
+
+    private func doUpdate(sections: [UsageSection]) {
+        let wasShowingSkeleton = skeletonShownAt != nil
+        skeletonShownAt = nil
+
         stackView.arrangedSubviews.forEach { $0.removeFromSuperview() }
 
         if sections.isEmpty {
@@ -869,9 +904,115 @@ class UsageContentView: NSView {
             }
         }
 
+        // Crossfade from skeleton to real content
+        if wasShowingSkeleton {
+            scrollView.alphaValue = 0
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.3
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                scrollView.animator().alphaValue = 1
+            }
+        }
+
         stackView.layoutSubtreeIfNeeded()
         let fittingHeight = stackView.fittingSize.height
         onContentSizeChanged?(fittingHeight)
+    }
+
+    // MARK: - Loading Skeleton
+
+    func showLoadingSkeleton() {
+        skeletonShownAt = Date()
+        stackView.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        let barWidth: CGFloat = 368
+
+        // Simulate 2 sections with 2 meters each
+        for section in 0..<2 {
+            if section > 0 {
+                let spacer = NSView()
+                spacer.translatesAutoresizingMaskIntoConstraints = false
+                spacer.heightAnchor.constraint(equalToConstant: 2).isActive = true
+                stackView.addArrangedSubview(spacer)
+
+                let divider = NSView()
+                divider.wantsLayer = true
+                divider.layer?.backgroundColor = NSColor(white: 0.25, alpha: 1).cgColor
+                divider.translatesAutoresizingMaskIntoConstraints = false
+                divider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+                stackView.addArrangedSubview(divider)
+                divider.leadingAnchor.constraint(equalTo: stackView.leadingAnchor, constant: 16).isActive = true
+                divider.trailingAnchor.constraint(equalTo: stackView.trailingAnchor, constant: -16).isActive = true
+                stackView.setCustomSpacing(6, after: divider)
+            }
+
+            // Section title skeleton
+            let titleBar = makeShimmerBar(width: 120, height: 10)
+            stackView.addArrangedSubview(titleBar)
+            stackView.setCustomSpacing(6, after: titleBar)
+
+            for meter in 0..<2 {
+                // Label row skeleton
+                let row = NSStackView()
+                row.orientation = .horizontal
+                row.distribution = .fill
+                row.translatesAutoresizingMaskIntoConstraints = false
+                row.widthAnchor.constraint(equalToConstant: barWidth).isActive = true
+
+                let nameBar = makeShimmerBar(width: meter == 0 ? 110 : 80, height: 12)
+                nameBar.setContentHuggingPriority(.defaultLow, for: .horizontal)
+                let pctBar = makeShimmerBar(width: 32, height: 12)
+                pctBar.setContentHuggingPriority(.required, for: .horizontal)
+                row.addArrangedSubview(nameBar)
+                row.addArrangedSubview(pctBar)
+
+                stackView.addArrangedSubview(row)
+                stackView.setCustomSpacing(4, after: row)
+
+                // Progress bar skeleton
+                let track = makeShimmerBar(width: barWidth, height: 6, cornerRadius: 3)
+                stackView.addArrangedSubview(track)
+                stackView.setCustomSpacing(2, after: track)
+
+                // Detail skeleton
+                let detailBar = makeShimmerBar(width: meter == 0 ? 130 : 90, height: 10)
+                stackView.addArrangedSubview(detailBar)
+                stackView.setCustomSpacing(6, after: detailBar)
+            }
+        }
+
+        stackView.layoutSubtreeIfNeeded()
+        onContentSizeChanged?(stackView.fittingSize.height)
+    }
+
+    private func makeShimmerBar(width: CGFloat, height: CGFloat, cornerRadius: CGFloat = 4) -> NSView {
+        let view = NSView()
+        view.wantsLayer = true
+        view.layer?.cornerRadius = cornerRadius
+        view.layer?.masksToBounds = true
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.widthAnchor.constraint(equalToConstant: width).isActive = true
+        view.heightAnchor.constraint(equalToConstant: height).isActive = true
+
+        let base = NSColor(white: 0.18, alpha: 1)
+        let highlight = NSColor(white: 0.28, alpha: 1)
+
+        let gradient = CAGradientLayer()
+        gradient.colors = [base.cgColor, highlight.cgColor, base.cgColor]
+        gradient.locations = [0, 0.5, 1]
+        gradient.startPoint = CGPoint(x: 0, y: 0.5)
+        gradient.endPoint = CGPoint(x: 1, y: 0.5)
+        gradient.frame = CGRect(x: 0, y: 0, width: width * 3, height: height)
+        view.layer?.addSublayer(gradient)
+
+        let anim = CABasicAnimation(keyPath: "transform.translation.x")
+        anim.fromValue = -width * 2
+        anim.toValue = 0
+        anim.duration = 1.2
+        anim.repeatCount = .infinity
+        anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        gradient.add(anim, forKey: "shimmer")
+
+        return view
     }
 
     private func addMeter(_ meter: UsageMeter) {
