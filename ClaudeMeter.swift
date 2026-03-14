@@ -44,6 +44,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         return saved > 0 ? saved : 120.0
     }()
     var badgeTimer: Timer?
+
+    // Update checking
+    var updateCheckTimer: Timer?
+    var updateAvailableVersion: String?
+    var checkForUpdatesMenuItem: NSMenuItem?
+    var versionMenuItem: NSMenuItem?
+    var updateBadgeDot: NSView?
     var badgeRefreshCount: Int = 0
     var badgeIntervalMenuItem: NSMenuItem?
 
@@ -194,6 +201,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             AppUpdater.promptMoveToApplicationsIfNeeded()
         }
+
+        // Silent update check after 30s, then every 4 hours
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            self?.silentUpdateCheck()
+        }
+        startUpdateCheckTimer()
     }
 
     // MARK: - Popover
@@ -233,6 +246,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         usageView.onContentSizeChanged = { [weak self] height in
             guard let self = self else { return }
             let clamped = min(max(height, 120), 500)
+            let current = self.popover.contentSize.height
+            // Only animate if height changed meaningfully — sub-pixel layout
+            // rounding differences would otherwise cause the popover to flicker.
+            guard abs(clamped - current) > 2 else { return }
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.3
                 ctx.allowsImplicitAnimation = true
@@ -466,7 +483,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         menu.addItem(badgeIntervalItem)
 
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Check for Updates\u{2026}", action: #selector(checkForUpdates), keyEquivalent: "u"))
+        let updateItem = NSMenuItem(title: "Check for Updates\u{2026}", action: #selector(checkForUpdates), keyEquivalent: "u")
+        checkForUpdatesMenuItem = updateItem
+        menu.addItem(updateItem)
+        menu.addItem(NSMenuItem.separator())
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        let verItem = NSMenuItem(title: "v\(version) (\(build))", action: nil, keyEquivalent: "")
+        verItem.isEnabled = false
+        versionMenuItem = verItem
+        menu.addItem(verItem)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit ClaudeMeter", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = nil
@@ -527,9 +553,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             popover.performClose(nil)
         } else {
             stopBadgePolling()
-            usageView?.showLoadingSkeleton()
-            if let h = usageView?.skeletonHeight {
-                popover.contentSize = NSSize(width: 400, height: h)
+            // Only show skeleton on first open; subsequent opens display
+            // the last known data immediately while refreshing in the background.
+            if usageView?.hasContent != true {
+                usageView?.showLoadingSkeleton()
+                if let h = usageView?.skeletonHeight {
+                    popover.contentSize = NSSize(width: 400, height: h)
+                }
+            } else {
+                usageView?.setStatusLoading()
             }
             softReload()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -582,6 +614,61 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     @objc func openLogin() { showLoginWindow() }
     @objc func checkForUpdates() { AppUpdater.checkForUpdates() }
     @objc func quit() { NSApp.terminate(nil) }
+
+    // MARK: - Update Check Polling
+
+    func startUpdateCheckTimer() {
+        updateCheckTimer?.invalidate()
+        updateCheckTimer = Timer.scheduledTimer(withTimeInterval: 4 * 3600, repeats: true) { [weak self] _ in
+            self?.silentUpdateCheck()
+        }
+        updateCheckTimer?.tolerance = 300
+    }
+
+    func silentUpdateCheck() {
+        AppUpdater.checkAvailableUpdate { [weak self] version in
+            guard let self = self else { return }
+            if let version = version {
+                self.markUpdateAvailable(version)
+            }
+        }
+    }
+
+    func markUpdateAvailable(_ version: String) {
+        guard updateAvailableVersion != version else { return }
+        updateAvailableVersion = version
+
+        // Update menu items
+        checkForUpdatesMenuItem?.title = "Update Available \u{2013} v\(version)"
+        let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        versionMenuItem?.title = "v\(current) (\(build)) \u{2192} v\(version)"
+
+        // Add notification dot to menu bar icon
+        showUpdateBadge(true)
+    }
+
+    func showUpdateBadge(_ show: Bool) {
+        guard let button = statusItem.button else { return }
+        updateBadgeDot?.removeFromSuperview()
+        updateBadgeDot = nil
+        guard show else { return }
+
+        let dot = NSView()
+        dot.wantsLayer = true
+        // Subtle warm amber — noticeable but not alarming
+        dot.layer?.backgroundColor = NSColor(red: 0xd4/255.0, green: 0xa8/255.0, blue: 0x43/255.0, alpha: 0.85).cgColor
+        dot.layer?.cornerRadius = 2.5
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        button.addSubview(dot)
+        NSLayoutConstraint.activate([
+            dot.widthAnchor.constraint(equalToConstant: 5),
+            dot.heightAnchor.constraint(equalToConstant: 5),
+            dot.topAnchor.constraint(equalTo: button.topAnchor, constant: 2),
+            dot.leadingAnchor.constraint(equalTo: button.leadingAnchor, constant: 14),
+        ])
+        updateBadgeDot = dot
+    }
 
     // MARK: - Polling
 
@@ -690,7 +777,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         NSLog("[ClaudeMeter] popoverDidClose, stopping polling")
         stopPolling()
         if showMenuBarBadge {
-            NSLog("[ClaudeMeter] badge enabled, starting badge polling")
+            NSLog("[ClaudeMeter] badge enabled, updating badge and starting polling")
+            updateMenuBarBadge()   // Immediate update with latest scraped data
             startBadgePolling()
         }
     }
@@ -719,6 +807,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
 
     func updateMenuBarBadge() {
         guard showMenuBarBadge, webView != nil else { return }
+        // Don't change badge while the popover is shown — resizing the status
+        // item shifts the popover anchor and causes visible flicker.
+        guard popover?.isShown != true else { return }
         webView.evaluateJavaScript(Self.scrapeSessionPercentageJS) { [weak self] result, _ in
             guard let self = self else { return }
             if let percentage = result as? Int {
@@ -782,13 +873,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
 
 // MARK: - Usage Data Model
 
-struct UsageMeter {
+struct UsageMeter: Equatable {
     let label: String
     let percentage: Int
     let detail: String
 }
 
-struct UsageSection {
+struct UsageSection: Equatable {
     let title: String
     let meters: [UsageMeter]
 }
@@ -802,6 +893,10 @@ class UsageContentView: NSView {
     var onContentSizeChanged: ((CGFloat) -> Void)?
     private var skeletonShownAt: Date?
     private static let minSkeletonDuration: TimeInterval = 0.6
+    private var lastSections: [UsageSection] = []
+
+    /// True when the view has real usage data (not skeleton or empty).
+    var hasContent: Bool { !lastSections.isEmpty }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -876,6 +971,13 @@ class UsageContentView: NSView {
     private func doUpdate(sections: [UsageSection]) {
         let wasShowingSkeleton = skeletonShownAt != nil
         skeletonShownAt = nil
+
+        // Skip full rebuild if the data hasn't changed (unless transitioning
+        // from skeleton) — avoids layout churn that causes popover flicker.
+        if !wasShowingSkeleton && sections == lastSections {
+            return
+        }
+        lastSections = sections
 
         stackView.arrangedSubviews.forEach { $0.removeFromSuperview() }
 
@@ -1026,7 +1128,7 @@ class UsageContentView: NSView {
         let anim = CABasicAnimation(keyPath: "transform.translation.x")
         anim.fromValue = -width * 2
         anim.toValue = 0
-        anim.duration = 1.2
+        anim.duration = 2.0
         anim.repeatCount = .infinity
         anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         gradient.add(anim, forKey: "shimmer")
@@ -1097,12 +1199,12 @@ class UsageContentView: NSView {
 
     func setStatusFresh(_ fresh: Bool) {
         statusDot.layer?.backgroundColor = fresh
-            ? NSColor(red: 0x34/255.0, green: 0xd3/255.0, blue: 0x99/255.0, alpha: 1).cgColor
+            ? NSColor(red: 0x2b/255.0, green: 0xa8/255.0, blue: 0x82/255.0, alpha: 1).cgColor
             : NSColor.gray.cgColor
     }
 
     func setStatusLoading() {
-        statusDot.layer?.backgroundColor = NSColor(red: 0xd4/255.0, green: 0xa8/255.0, blue: 0x43/255.0, alpha: 1).cgColor
+        statusDot.layer?.backgroundColor = NSColor(red: 0xc0/255.0, green: 0x96/255.0, blue: 0x3a/255.0, alpha: 1).cgColor
     }
 
     // MARK: - Helpers
@@ -1119,10 +1221,10 @@ class UsageContentView: NSView {
 
     private func colorForPercentage(_ pct: Int) -> NSColor {
         switch pct {
-        case 0..<50: return NSColor(red: 0x34/255.0, green: 0xd3/255.0, blue: 0x99/255.0, alpha: 1)
-        case 50..<80: return NSColor(red: 0xfb/255.0, green: 0xbf/255.0, blue: 0x24/255.0, alpha: 1)
-        case 80..<95: return NSColor(red: 0xf9/255.0, green: 0x73/255.0, blue: 0x16/255.0, alpha: 1)
-        default: return NSColor(red: 0xef/255.0, green: 0x44/255.0, blue: 0x44/255.0, alpha: 1)
+        case 0..<50: return NSColor(red: 0x2b/255.0, green: 0xa8/255.0, blue: 0x82/255.0, alpha: 1)  // deep emerald
+        case 50..<80: return NSColor(red: 0xc9/255.0, green: 0x9a/255.0, blue: 0x2e/255.0, alpha: 1)  // muted gold
+        case 80..<95: return NSColor(red: 0xc0/255.0, green: 0x5e/255.0, blue: 0x1a/255.0, alpha: 1)  // deep amber
+        default: return NSColor(red: 0xb8/255.0, green: 0x3a/255.0, blue: 0x3a/255.0, alpha: 1)       // muted crimson
         }
     }
 }
@@ -1363,6 +1465,27 @@ enum AppUpdater {
             showError("Update Failed", error.localizedDescription)
             try? fm.removeItem(at: workDir)
         }
+    }
+
+    // MARK: - Silent Update Check (returns version string if newer, nil otherwise)
+
+    static func checkAvailableUpdate(completion: @escaping (String?) -> Void) {
+        let url = URL(string: "https://api.github.com/repos/\(githubRepo)/releases/latest")!
+        var request = URLRequest(url: url)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+
+        URLSession.shared.dataTask(with: request) { data, _, error in
+            DispatchQueue.main.async {
+                guard let data = data, error == nil,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let tagName = json["tag_name"] as? String else {
+                    completion(nil)
+                    return
+                }
+                let remote = tagName.hasPrefix("v") ? String(tagName.dropFirst()) : tagName
+                completion(isNewer(remote, than: currentVersion) ? remote : nil)
+            }
+        }.resume()
     }
 
     // MARK: - Version Comparison
