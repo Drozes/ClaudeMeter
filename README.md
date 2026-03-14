@@ -18,12 +18,6 @@ Authenticates automatically by importing your session from the Claude Desktop ap
 
 ## Peek In
 
-<img width="844" height="874" alt="full" src="https://github.com/user-attachments/assets/9ce238d1-7374-4a01-8fed-3cba3ad31ff3" />
-
-<img width="935" height="911" alt="menu" src="https://github.com/user-attachments/assets/f28dc23d-b383-4397-8462-eb965bfb08a0" />
-
-![99 1](https://github.com/user-attachments/assets/92df5754-8c0a-464b-b22e-538ebf7b239f)
-
 
 ## Requirements
 
