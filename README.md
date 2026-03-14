@@ -18,6 +18,7 @@ Authenticates automatically by importing your session from the Claude Desktop ap
 
 ## Peek In
 
+<img width="634" alt="ClaudeMeter popover" src="screenshot.png" />
 
 ## Requirements
 
