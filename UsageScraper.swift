@@ -23,6 +23,19 @@ enum UsageScraper {
                     el = el.parentElement;
                 }
             }
+            // Fallback: try CSS selectors for progressbar or aria-label elements
+            var fallbackEls = document.querySelectorAll('[role="progressbar"], [aria-label*="usage"], [aria-label*="session"], [data-testid*="usage"], [data-testid*="session"]');
+            for (var f = 0; f < fallbackEls.length; f++) {
+                var fe = fallbackEls[f];
+                var val = fe.getAttribute('aria-valuenow');
+                if (val) return parseInt(val, 10);
+                var txt = fe.textContent || '';
+                var fm = txt.match(/(\\d+)%\\s*used/);
+                if (fm) return parseInt(fm[1], 10);
+                var lbl = fe.getAttribute('aria-label') || '';
+                var lm = lbl.match(/(\\d+)%/);
+                if (lm) return parseInt(lm[1], 10);
+            }
         } catch(e) {
             console.error('[ClaudeMeter] scrapeSessionPercentageJS error:', e);
         }
@@ -92,10 +105,57 @@ enum UsageScraper {
                 }
                 data.push({section: section, label: label, percentage: pct, detail: detail});
             }
+            // Fallback: if XPath found nothing, try CSS selectors
+            if (data.length === 0) {
+                var fallbackEls = document.querySelectorAll('[role="progressbar"], [aria-label*="usage"], [aria-label*="used"], [data-testid*="usage"]');
+                for (var f = 0; f < fallbackEls.length; f++) {
+                    var fe = fallbackEls[f];
+                    var pctVal = null;
+                    var val = fe.getAttribute('aria-valuenow');
+                    if (val) { pctVal = parseInt(val, 10); }
+                    if (pctVal === null) {
+                        var txt = fe.textContent || '';
+                        var fm = txt.match(/(\d+)%\s*used/);
+                        if (fm) pctVal = parseInt(fm[1], 10);
+                    }
+                    if (pctVal === null) {
+                        var lbl = fe.getAttribute('aria-label') || '';
+                        var lm = lbl.match(/(\d+)%/);
+                        if (lm) pctVal = parseInt(lm[1], 10);
+                    }
+                    if (pctVal !== null) {
+                        var fLabel = fe.getAttribute('aria-label') || fe.getAttribute('data-testid') || '';
+                        data.push({section: '', label: fLabel, percentage: pctVal, detail: ''});
+                    }
+                }
+            }
             return JSON.stringify(data);
         } catch(e) {
             console.error('[ClaudeMeter] scrapeUsageJS error:', e);
             return '[]';
+        }
+    })()
+    """
+
+    /// JS to check if the usage page structure is recognizable.
+    /// Returns a JSON string: {healthy: bool, reason: string}.
+    static let scrapeHealthCheckJS = """
+    (function(){
+        try {
+            var checks = [];
+            var hasUsedText = document.body && /\\d+%\\s*used/.test(document.body.textContent);
+            checks.push(hasUsedText ? 'found_percent_used' : 'missing_percent_used');
+            var hasProgressBar = document.querySelectorAll('[role="progressbar"]').length > 0;
+            checks.push(hasProgressBar ? 'found_progressbar' : 'missing_progressbar');
+            var hasAriaUsage = document.querySelectorAll('[aria-label*="usage"], [aria-label*="session"], [data-testid*="usage"]').length > 0;
+            checks.push(hasAriaUsage ? 'found_aria_usage' : 'missing_aria_usage');
+            var hasSettings = document.body && /settings/i.test(document.body.textContent);
+            checks.push(hasSettings ? 'found_settings' : 'missing_settings');
+            var healthy = hasUsedText || hasProgressBar || hasAriaUsage;
+            var reason = healthy ? 'Page structure recognized (' + checks.join(', ') + ')' : 'Page structure unrecognized (' + checks.join(', ') + ')';
+            return JSON.stringify({healthy: healthy, reason: reason});
+        } catch(e) {
+            return JSON.stringify({healthy: false, reason: 'Health check error: ' + e.message});
         }
     })()
     """

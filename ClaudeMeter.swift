@@ -625,7 +625,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
 
         // Periodic full WebView reload to prevent unbounded memory growth
         badgeRefreshCount += 1
-        if badgeRefreshCount >= 30 {
+        if badgeRefreshCount >= 20 {
             badgeRefreshCount = 0
             NSLog("[ClaudeMeter] badgeRefresh: periodic full reload to reclaim WebView memory")
             webView.load(URLRequest(url: Self.usageURL))
@@ -639,9 +639,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                 NSLog("[ClaudeMeter] badgeRefresh result: \(result ?? "nil")")
                 DispatchQueue.main.asyncAfter(deadline: .now() + Timing.silentRefreshWait) {
                     self?.updateMenuBarBadge()
+                    self?.cleanupWebViewDOM()
                 }
             }
         }
+    }
+
+    /// Remove heavy DOM elements after badge scraping to reduce memory growth.
+    func cleanupWebViewDOM() {
+        let cleanupJS = "document.querySelectorAll('img, video, iframe, canvas, [data-testid=\"sidebar\"]').forEach(function(el){ el.remove(); });"
+        webView.evaluateJavaScript(cleanupJS, completionHandler: nil)
     }
 
     func popoverDidClose(_ notification: Notification) {
@@ -711,9 +718,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             let sections = UsageScraper.parseUsageJSON(jsonStr)
             if UsageScraper.validateScrapeResult(sections) {
                 NSLog("[ClaudeMeter] scraped \(sections.count) sections")
+            } else {
+                self.usageView?.setStatusFresh(false)
             }
             self.usageView?.update(sections: sections)
-            self.usageView?.setStatusFresh(true)
+            self.usageView?.setStatusFresh(!sections.isEmpty)
         }
     }
 }
