@@ -261,6 +261,7 @@ enum AppUpdater {
 
     // MARK: - Version Comparison
 
+    // Visible for testing
     static func isNewer(_ remote: String, than local: String) -> Bool {
         let r = remote.split(separator: ".").compactMap { Int($0) }
         let l = local.split(separator: ".").compactMap { Int($0) }

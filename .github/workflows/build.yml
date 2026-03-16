@@ -14,13 +14,28 @@ jobs:
 
       - name: Build with swiftc
         run: |
-          swiftc *.swift \
+          swiftc ClaudeMeter.swift Constants.swift UsageModels.swift \
+            UsageScraper.swift UsageContentView.swift AppUpdater.swift \
+            ClaudeDesktopCookies.swift \
             -framework Cocoa \
             -framework WebKit \
             -framework Security \
             -lsqlite3 \
             -parse-as-library \
             -o ClaudeMeter
+
+      - name: Run unit tests
+        run: |
+          swiftc Constants.swift UsageModels.swift UsageScraper.swift \
+            UsageContentView.swift AppUpdater.swift ClaudeDesktopCookies.swift \
+            ClaudeMeterTests.swift \
+            -framework Cocoa \
+            -framework WebKit \
+            -framework Security \
+            -lsqlite3 \
+            -parse-as-library \
+            -o ClaudeMeterTests
+          ./ClaudeMeterTests
 
       - name: Build with xcodebuild
         run: |
