@@ -43,15 +43,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         let saved = UserDefaults.standard.double(forKey: AppDelegate.badgeIntervalKey)
         return saved > 0 ? saved : 120.0
     }()
-    var badgeTimer: Timer?
-
     // Update checking
     var updateCheckTimer: Timer?
     var updateAvailableVersion: String?
     var checkForUpdatesMenuItem: NSMenuItem?
     var versionMenuItem: NSMenuItem?
     var updateBadgeDot: NSView?
-    var badgeRefreshCount: Int = 0
+    var refreshCycleCount: Int = 0
+
+    // Shared data store — populated by every scrape, read by badge and popover
+    var latestSections: [UsageSection] = []
     var badgeIntervalMenuItem: NSMenuItem?
 
     static let showBadgeKey = "showMenuBarBadge"
@@ -61,32 +62,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             applyBadgeVisibility()
         }
     }
-
-    /// JS to scrape the "Current session" usage percentage from the page.
-    static let scrapeSessionPercentageJS = """
-    (function() {
-        try {
-            var snap = document.evaluate(
-                "//text()[contains(., 'Current session')]",
-                document.body, null,
-                XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null
-            );
-            if (snap.snapshotLength > 0) {
-                var node = snap.snapshotItem(0);
-                var el = node.parentElement;
-                for (var i = 0; i < 6 && el; i++) {
-                    var t = el.textContent;
-                    if (t.indexOf('Current session') !== -1 && /\\d+%\\s*used/.test(t)) {
-                        var m = t.match(/(\\d+)%\\s*used/);
-                        if (m) return parseInt(m[1], 10);
-                    }
-                    el = el.parentElement;
-                }
-            }
-        } catch(e) {}
-        return null;
-    })()
-    """
 
     // Fallback login window (email/magic-link in WKWebView)
     var loginWindow: NSWindow?
@@ -108,8 +83,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     static let loginURL = URL(string: "https://claude.ai/login")!
 
     /// JS to scrape all usage data as structured JSON from the page.
-    /// Uses the same XPath approach as scrapeSessionPercentageJS (proven to work for the badge),
-    /// extended to find ALL percentage meters and their surrounding context.
+    /// Uses XPath to find ALL percentage meters and their surrounding context.
     /// Uses textContent (not innerText) for boundary detection since Claude's page
     /// uses CSS layout that causes innerText to return empty at intermediate levels.
     static let scrapeUsageJS = """
@@ -377,16 +351,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         if webView === self.webView {
             lastRefreshDate = Date()
             usageView?.setStatusFresh(true)
-            // Scrape immediately for popover, then again after React renders for badge
-            scrapeAndUpdateUI()
-            updateMenuBarBadge()
+            // Scrape immediately, then again after React renders
+            scrapeAndDistribute()
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                 guard let self = self else { return }
-                self.scrapeAndUpdateUI()
-                self.updateMenuBarBadge()
-                // Ensure badge polling is running after initial page load
-                if self.showMenuBarBadge && self.popover?.isShown != true && self.badgeTimer == nil {
-                    self.startBadgePolling()
+                self.scrapeAndDistribute()
+                // Ensure refresh timer is running after initial page load
+                if self.refreshTimer == nil && (self.popover?.isShown == true || self.showMenuBarBadge) {
+                    self.startRefreshTimer()
                 }
             }
         }
@@ -515,9 +487,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
         sender.state = .on
 
-        // Restart badge polling if active
-        if badgeTimer != nil {
-            startBadgePolling()
+        // Restart timer if active and popover is closed
+        if refreshTimer != nil && popover?.isShown != true {
+            startRefreshTimer()
         }
     }
 
@@ -532,9 +504,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
         sender.state = .on
 
-        // Restart polling if active
-        if refreshTimer != nil {
-            startPolling()
+        // Restart timer if active and popover is open
+        if refreshTimer != nil && popover?.isShown == true {
+            startRefreshTimer()
         }
     }
 
@@ -552,7 +524,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         if popover.isShown {
             popover.performClose(nil)
         } else {
-            stopBadgePolling()
+            stopRefreshTimer()
             // Only show skeleton on first open; subsequent opens display
             // the last known data immediately while refreshing in the background.
             if usageView?.hasContent != true {
@@ -566,7 +538,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             softReload()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
-            startPolling()
+            startRefreshTimer()
         }
     }
 
@@ -595,8 +567,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             if (result as? String) == "clicked" {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                     self?.lastRefreshDate = Date()
-                    self?.scrapeAndUpdateUI()
-                    self?.updateMenuBarBadge()
+                    self?.scrapeAndDistribute()
                 }
             } else {
                 self?.gracefulReload()
@@ -670,82 +641,52 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         updateBadgeDot = dot
     }
 
-    // MARK: - Polling
+    // MARK: - Polling (Unified Adaptive Timer)
 
-    func startPolling() {
-        refreshTimer?.invalidate()
-        NSLog("[ClaudeMeter] startPolling: interval=\(statusFreshnessInterval)s")
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: statusFreshnessInterval, repeats: true) { [weak self] _ in
-            NSLog("[ClaudeMeter] timer fired, calling silentRefresh")
-            self?.silentRefresh()
+    /// The effective refresh interval depends on popover state.
+    var activeRefreshInterval: TimeInterval {
+        if popover?.isShown == true {
+            return statusFreshnessInterval   // fast (6s default)
+        } else {
+            return badgeRefreshInterval       // slow (120s default)
         }
-        refreshTimer?.tolerance = statusFreshnessInterval * 0.1
     }
 
-    func stopPolling() {
+    func startRefreshTimer() {
+        refreshTimer?.invalidate()
+        let interval = activeRefreshInterval
+        NSLog("[ClaudeMeter] startRefreshTimer: interval=\(interval)s, popoverOpen=\(popover?.isShown == true)")
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.unifiedRefresh()
+        }
+        refreshTimer?.tolerance = interval * 0.1
+    }
+
+    func stopRefreshTimer() {
         refreshTimer?.invalidate()
         refreshTimer = nil
     }
 
-    func startBadgePolling() {
-        badgeTimer?.invalidate()
-        NSLog("[ClaudeMeter] startBadgePolling: interval=\(badgeRefreshInterval)s")
-        badgeTimer = Timer.scheduledTimer(withTimeInterval: badgeRefreshInterval, repeats: true) { [weak self] _ in
-            NSLog("[ClaudeMeter] badge timer fired, calling badgeRefresh")
-            self?.badgeRefresh()
-        }
-        badgeTimer?.tolerance = badgeRefreshInterval * 0.1
-    }
+    /// Unified refresh: clicks the site's refresh button, then scrapes all data.
+    /// Adapts behavior based on whether the popover is open or closed.
+    func unifiedRefresh() {
+        guard let url = webView.url?.absoluteString, url.contains("/settings/usage") else { return }
 
-    func stopBadgePolling() {
-        badgeTimer?.invalidate()
-        badgeTimer = nil
-    }
+        let popoverOpen = popover?.isShown == true
 
-    /// Silent refresh: clicks the site's refresh button and scrapes updated data.
-    func silentRefresh() {
-        guard popover?.isShown == true,
-              let url = webView.url?.absoluteString, url.contains("/settings/usage") else { return }
-        let js = """
-        (function() {
-            var btns = document.querySelectorAll('button');
-            for (var b of btns) {
-                if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
-                    b.closest('[class*="text-xs"]')) {
-                    b.click();
-                    return 'clicked';
-                }
-            }
-            return 'not_found';
-        })()
-        """
-        webView.evaluateJavaScript(js) { [weak self] result, error in
-            if let error = error {
-                NSLog("[ClaudeMeter] silentRefresh JS error: \(error.localizedDescription)")
-            } else {
-                NSLog("[ClaudeMeter] silentRefresh result: \(result ?? "nil")")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    self?.lastRefreshDate = Date()
-                    self?.scrapeAndUpdateUI()
-                    self?.updateMenuBarBadge()
-                }
-            }
-        }
-    }
-
-    /// Background badge refresh: clicks the site's refresh button and scrapes the percentage.
-    /// Runs on the badge timer when the popover is closed but badge is enabled.
-    func badgeRefresh() {
-        guard showMenuBarBadge, popover?.isShown != true,
-              let url = webView.url?.absoluteString, url.contains("/settings/usage") else { return }
+        // When popover is closed, only refresh if badge is enabled
+        if !popoverOpen && !showMenuBarBadge { return }
 
         // Periodic full WebView reload to prevent unbounded memory growth
-        badgeRefreshCount += 1
-        if badgeRefreshCount >= 30 {
-            badgeRefreshCount = 0
-            NSLog("[ClaudeMeter] badgeRefresh: periodic full reload to reclaim WebView memory")
-            webView.load(URLRequest(url: Self.usageURL))
-            return
+        // (only relevant when running in background badge mode)
+        if !popoverOpen {
+            refreshCycleCount += 1
+            if refreshCycleCount >= 30 {
+                refreshCycleCount = 0
+                NSLog("[ClaudeMeter] unifiedRefresh: periodic full reload to reclaim WebView memory")
+                webView.load(URLRequest(url: Self.usageURL))
+                return
+            }
         }
 
         let js = """
@@ -763,23 +704,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         """
         webView.evaluateJavaScript(js) { [weak self] result, error in
             if let error = error {
-                NSLog("[ClaudeMeter] badgeRefresh JS error: \(error.localizedDescription)")
+                NSLog("[ClaudeMeter] unifiedRefresh JS error: \(error.localizedDescription)")
             } else {
-                NSLog("[ClaudeMeter] badgeRefresh result: \(result ?? "nil")")
+                NSLog("[ClaudeMeter] unifiedRefresh click result: \(result ?? "nil")")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    self?.updateMenuBarBadge()
+                    self?.lastRefreshDate = Date()
+                    self?.scrapeAndDistribute()
                 }
             }
         }
     }
 
     func popoverDidClose(_ notification: Notification) {
-        NSLog("[ClaudeMeter] popoverDidClose, stopping polling")
-        stopPolling()
+        NSLog("[ClaudeMeter] popoverDidClose")
+        stopRefreshTimer()
+        refreshCycleCount = 0
+        updateBadgeFromModel()
         if showMenuBarBadge {
-            NSLog("[ClaudeMeter] badge enabled, updating badge and starting polling")
-            updateMenuBarBadge()   // Immediate update with latest scraped data
-            startBadgePolling()
+            NSLog("[ClaudeMeter] badge enabled, starting background refresh")
+            startRefreshTimer()
         }
     }
 
@@ -793,50 +736,65 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             // Restore cached value instantly, or show placeholder
             let cached = UserDefaults.standard.integer(forKey: "lastBadgePercentage")
             button.title = cached > 0 ? "\(cached)%" : "\u{2014}%"
-            updateMenuBarBadge()
-            // Start background badge polling if popover isn't open
+            updateBadgeFromModel()
+            // Start background refresh if popover isn't open
             if popover?.isShown != true {
-                startBadgePolling()
+                startRefreshTimer()
             }
         } else {
             button.title = ""
             button.imagePosition = .imageOnly
-            stopBadgePolling()
+            stopRefreshTimer()
         }
     }
 
-    func updateMenuBarBadge() {
-        guard showMenuBarBadge, webView != nil else { return }
+    /// Update the menu bar badge from the shared data store (no JS evaluation).
+    func updateBadgeFromModel() {
+        guard showMenuBarBadge else { return }
         // Don't change badge while the popover is shown — resizing the status
         // item shifts the popover anchor and causes visible flicker.
         guard popover?.isShown != true else { return }
-        webView.evaluateJavaScript(Self.scrapeSessionPercentageJS) { [weak self] result, _ in
-            guard let self = self else { return }
-            if let percentage = result as? Int {
-                self.statusItem.button?.title = "\(percentage)%"
-                UserDefaults.standard.set(percentage, forKey: "lastBadgePercentage")
-            } else if self.statusItem.button?.title.isEmpty == true {
-                self.statusItem.button?.title = "\u{2014}%"
+
+        if let pct = sessionPercentage(from: latestSections) {
+            statusItem.button?.title = "\(pct)%"
+            UserDefaults.standard.set(pct, forKey: "lastBadgePercentage")
+        } else if statusItem.button?.title.isEmpty == true {
+            statusItem.button?.title = "\u{2014}%"
+        }
+    }
+
+    /// Extract the "Current session" percentage from the shared data store.
+    func sessionPercentage(from sections: [UsageSection]) -> Int? {
+        for section in sections {
+            for meter in section.meters {
+                if meter.label.lowercased().contains("current session") {
+                    return meter.percentage
+                }
             }
         }
+        return nil
     }
 
     private func isLoginURL(_ url: String) -> Bool {
         url.contains("/login") || url.contains("/signin") || url.contains("accounts.google.com")
     }
 
-    // MARK: - Scrape & Native UI Update
+    // MARK: - Scrape & Distribute
 
-    func scrapeAndUpdateUI() {
+    /// Single scrape function: runs the full JS scraper, stores results in the shared
+    /// data model, updates the popover view, and syncs the badge.
+    func scrapeAndDistribute() {
         webView.evaluateJavaScript(Self.scrapeUsageJS) { [weak self] result, error in
             guard let self = self, let jsonStr = result as? String, !jsonStr.isEmpty else {
-                NSLog("[ClaudeMeter] scrapeAndUpdateUI: no data scraped")
+                NSLog("[ClaudeMeter] scrapeAndDistribute: no data scraped")
                 return
             }
             let sections = Self.parseUsageJSON(jsonStr)
             NSLog("[ClaudeMeter] scraped \(sections.count) sections")
+            self.latestSections = sections
             self.usageView?.update(sections: sections)
             self.usageView?.setStatusFresh(true)
+            self.updateBadgeFromModel()
         }
     }
 
