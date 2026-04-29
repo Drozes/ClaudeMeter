@@ -16,8 +16,20 @@ xcuserdata/
 .AppleDouble
 .LSOverride
 
-# Claude Code
-.claude/
+# Claude Code — share agents/ and commands/ as project config; user-specific
+# paths and local overrides stay out.
+.claude/settings.json
+.claude/settings.local.json
+.claude/worktrees/
+
+# Editor-local config
+.vscode/
+
+# QA pipeline artifacts
+qa/node_modules/
+qa/smoke/ocr
+qa/fixtures/current.html
+qa/fixtures/current.expected.json
 
 # Temp files
 *.swp

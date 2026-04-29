@@ -4,6 +4,24 @@ Quick reference for AI assistants continuing work on this project.
 
 ## Release History
 
+### v1.9
+
+- **Fixed badge stuck at stale value** (regression from v1.8): the menu bar percentage now updates reliably even when the page's structured scrape can't produce a clean "Current session" label, by falling back to a dedicated XPath scrape
+- **Deterministic label detection**: the structured scrape now prefers leaf text matching `Current session`, `Weekly`, `Opus`, `Sonnet`, or `Haiku` before falling back to the first short text node, so meter labels no longer depend on DOM order
+- **Robust against transient empty scrapes**: popover and badge no longer flicker to `—%` during normal React re-renders; an empty result must repeat 3 times in a row before being treated as a real failure
+- **Centralized badge title updates**: every status-item title write now routes through a single helper that logs the old and new value with a reason string, making field issues much easier to diagnose
+- **Internal:** new `qa/` directory with smoke tests, drift checks, and static-audit scripts to catch DOM-scraper regressions before release
+
+### v1.8
+
+- **Unified data store and refresh timer**: badge and popover now share a single source of truth for usage data and a single background refresh timer, instead of running independent fetch paths
+
+### v1.7
+
+- **Fixed popover flickering** during refreshes
+- **Update checking**: built-in "Check for Updates..." menu item with code-signature verification
+- **Refined UI**: visual polish across popover, badge, and menu
+
 ### v1.6
 
 - **Instant badge on launch** — cached last-known usage percentage displays immediately in the menu bar, updated with fresh data once the page loads
@@ -124,3 +142,7 @@ Quick reference for AI assistants continuing work on this project.
 | XPath for DOM scraping | Anchors on stable text content ("Current session", "% used") rather than Tailwind class names which change frequently. |
 | Freshness timeout = interval + 3s | Buffer accounts for the ~1.5s delay between clicking the refresh button and data arriving. |
 | `variableLength` status item | Switched from `squareLength` to support showing percentage text alongside the gauge icon. `monospacedDigitSystemFont` prevents layout jitter. |
+| Badge keeps an independent XPath fallback even after the v1.8 unification | The structured scrape's label-detection can pick an unrelated short text from the card (tooltip, plan name) and miss the "current session" meter entirely. Without a fallback the badge gets stuck at a stale value with no recovery path. The dedicated `scrapeSessionPercentageJS` anchors on literal "Current session" text near a "% used" sibling, so the badge updates whenever either path succeeds. |
+| Empty scrapes are counter-gated, not acted on immediately | Logs show transient empty scrapes (0 sections) alternating with real scrapes (2 sections) every 2s during normal React re-renders. Clearing badge/popover on any single empty causes constant `—%` flicker. Three consecutive empties (JS errors count too) is the threshold for a real failure. |
+| All badge title writes go through `setBadgeTitle` | Centralizes logging of every change with a reason string, giving the QA pipeline a deterministic signal independent of OCR/screenshots and making field issues diagnosable from logs alone. |
+| `NSLog("%@", message)` for any string containing user data | NSLog treats its first argument as a printf format string. The badge contains `%` (e.g. "47%"), which NSLog consumes as a format specifier when inlined, mangling the output. Always pass user-data strings via `%@`. |

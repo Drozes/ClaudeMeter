@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<!--
+  Synthetic claude.ai/settings/usage DOM for the L2 DOM-contract test.
+  Mirrors the structural shape the scrapers depend on:
+    * Section containers whose text contains "limit" (Session limit / Weekly limit)
+    * Cards containing a "% used" text and a "Resets ..." sibling
+    * Mix of "happy" and "tricky" cards to catch label-detection regressions
+
+  The "tricky" card injects an unrelated short text BEFORE "Current session"
+  inside the same card. The pre-fix scraper would have picked that as the label
+  and the badge lookup (which expects "current session") would have failed.
+-->
+<html>
+<body>
+  <main>
+    <h1>Settings</h1>
+    <section data-test="session-section">
+      <div>Session limit</div>
+      <div data-test="card-current-session">
+        <span aria-hidden="true">Pro</span>
+        <div>Current session</div>
+        <div>47% used</div>
+        <div>Resets at 4:00 PM</div>
+      </div>
+    </section>
+    <section data-test="weekly-section">
+      <div>Weekly limit</div>
+      <div data-test="card-weekly-all">
+        <div>Weekly usage</div>
+        <div>23% used</div>
+        <div>Resets in 5 days</div>
+      </div>
+      <div data-test="card-weekly-opus">
+        <div>Weekly Opus 4 usage</div>
+        <div>12% used</div>
+        <div>Resets in 5 days</div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

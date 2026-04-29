@@ -1,0 +1,14 @@
+{
+  "scrapeUsageJS": {
+    "minMeters": 3,
+    "requireLabels": ["current session", "weekly", "opus"],
+    "requirePercentages": [47, 23, 12]
+  },
+  "scrapeSessionPercentageJS": {
+    "expected": 47
+  },
+  "sessionPercentageFromModel": {
+    "expected": 47,
+    "matchLabelContains": "current session"
+  }
+}

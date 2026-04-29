@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Optional launchd plist to run the drift watcher in the background.
+  Install:
+    cp qa/drift/com.claudemeter.qa.drift.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.claudemeter.qa.drift.plist
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.claudemeter.qa.drift.plist
+    rm ~/Library/LaunchAgents/com.claudemeter.qa.drift.plist
+
+  Edit the absolute path below to point at this repo's qa/drift/watch.sh.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claudemeter.qa.drift</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/msponagle/code/experiments/claude_session/qa/drift/watch.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/claudemeter.drift.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claudemeter.drift.stderr.log</string>
+</dict>
+</plist>

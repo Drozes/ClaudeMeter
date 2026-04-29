@@ -55,6 +55,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     var latestSections: [UsageSection] = []
     var badgeIntervalMenuItem: NSMenuItem?
 
+    // Empty-scrape streak. Transient empties happen during normal page renders
+    // (React mid-update), so a single empty must NOT clear the badge or popover.
+    // Only a sustained streak indicates a real failure (page DOM changed,
+    // network broke, scraper no longer matches).
+    var consecutiveEmptyScrapes: Int = 0
+    static let emptyScrapeFailureThreshold = 3
+
     static let showBadgeKey = "showMenuBarBadge"
     var showMenuBarBadge: Bool = UserDefaults.standard.bool(forKey: AppDelegate.showBadgeKey) {
         didSet {
@@ -81,6 +88,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     }()
     static let usageURL = URL(string: "https://claude.ai/settings/usage")!
     static let loginURL = URL(string: "https://claude.ai/login")!
+
+    /// Direct XPath scrape for the "Current session" percentage. Independent
+    /// fallback used by the badge when the structured scrape's label-detection
+    /// fails to surface a "current session" meter (page DOM drift, label picked
+    /// from an unrelated short text node, etc).
+    static let scrapeSessionPercentageJS = """
+    (function() {
+        try {
+            var snap = document.evaluate(
+                "//text()[contains(., 'Current session')]",
+                document.body, null,
+                XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null
+            );
+            if (snap.snapshotLength > 0) {
+                var node = snap.snapshotItem(0);
+                var el = node.parentElement;
+                for (var i = 0; i < 6 && el; i++) {
+                    var t = el.textContent;
+                    if (t.indexOf('Current session') !== -1 && /\\d+%\\s*used/.test(t)) {
+                        var m = t.match(/(\\d+)%\\s*used/);
+                        if (m) return parseInt(m[1], 10);
+                    }
+                    el = el.parentElement;
+                }
+            }
+        } catch(e) {}
+        return null;
+    })()
+    """
 
     /// JS to scrape all usage data as structured JSON from the page.
     /// Uses XPath to find ALL percentage meters and their surrounding context.
@@ -123,15 +159,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                 }
                 var texts = leafTexts(card, 50);
                 var label = '';
+                var preferredLabel = '';
                 var detail = '';
+                // Preferred label patterns — anchor the badge on stable text
+                // ("Current session", "Weekly usage", "Weekly Opus 4 usage", etc.)
+                // so the meter the badge needs is always findable by label,
+                // independent of DOM ordering of other short text in the card.
+                var preferRe = /^(current session|weekly|opus|sonnet|haiku)/i;
                 for (var k = 0; k < texts.length; k++) {
                     var t = texts[k];
                     if (/\\d+%\\s*used/.test(t)) continue;
                     if (/\\d+%/.test(t)) continue;
                     if (/reset/i.test(t) && !detail) { detail = t; continue; }
                     if (/last updated/i.test(t) || /learn more/i.test(t)) continue;
+                    if (!preferredLabel && preferRe.test(t.trim())) preferredLabel = t.trim();
                     if (!label && t.length < 50 && t.length > 1) label = t;
                 }
+                if (preferredLabel) label = preferredLabel;
                 var section = '';
                 el = card.parentElement;
                 for (var j = 0; j < 4 && el; j++) {
@@ -728,27 +772,46 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
 
     // MARK: - Menu Bar Badge
 
-    func applyBadgeVisibility() {
+    /// Centralized setter for the status-item title. Logs every change with a
+    /// `reason` so the QA pipeline (and on-call operators) have a deterministic
+    /// signal for whether the badge is updating, independent of OCR/screenshots.
+    /// Skips the assignment if the value is unchanged to avoid layout churn.
+    func setBadgeTitle(_ title: String, reason: String) {
         guard let button = statusItem.button else { return }
+        let old = button.title
+        if old == title { return }
+        button.title = title
+        // NSLog treats its first argument as a printf format string. The badge
+        // value contains '%' (e.g. "47%") which NSLog would otherwise consume
+        // as a format specifier, mangling the output. Always pass user-data
+        // strings through "%@" instead of inlining them in the format string.
+        NSLog("%@", "[ClaudeMeter] badge title: '\(old)' -> '\(title)' (\(reason))")
+    }
+
+    func applyBadgeVisibility() {
+        guard statusItem.button != nil else { return }
         badgeIntervalMenuItem?.isEnabled = showMenuBarBadge
         if showMenuBarBadge {
-            button.imagePosition = .imageLeading
+            statusItem.button?.imagePosition = .imageLeading
             // Restore cached value instantly, or show placeholder
             let cached = UserDefaults.standard.integer(forKey: "lastBadgePercentage")
-            button.title = cached > 0 ? "\(cached)%" : "\u{2014}%"
+            setBadgeTitle(cached > 0 ? "\(cached)%" : "\u{2014}%", reason: "applyBadgeVisibility cached=\(cached)")
             updateBadgeFromModel()
             // Start background refresh if popover isn't open
             if popover?.isShown != true {
                 startRefreshTimer()
             }
         } else {
-            button.title = ""
-            button.imagePosition = .imageOnly
+            setBadgeTitle("", reason: "badge disabled")
+            statusItem.button?.imagePosition = .imageOnly
             stopRefreshTimer()
         }
     }
 
-    /// Update the menu bar badge from the shared data store (no JS evaluation).
+    /// Update the menu bar badge from the shared data store, falling back to a
+    /// direct XPath scrape if the model lacks a "current session" meter.
+    /// The fallback preserves v1.7's robustness: badge updates as long as the
+    /// page contains "Current session" text near a "% used" sibling.
     func updateBadgeFromModel() {
         guard showMenuBarBadge else { return }
         // Don't change badge while the popover is shown — resizing the status
@@ -756,10 +819,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         guard popover?.isShown != true else { return }
 
         if let pct = sessionPercentage(from: latestSections) {
-            statusItem.button?.title = "\(pct)%"
+            setBadgeTitle("\(pct)%", reason: "model meter labeled current session")
             UserDefaults.standard.set(pct, forKey: "lastBadgePercentage")
-        } else if statusItem.button?.title.isEmpty == true {
-            statusItem.button?.title = "\u{2014}%"
+            return
+        }
+
+        // Fallback: direct XPath scrape (independent of structured scrape's labels).
+        NSLog("[ClaudeMeter] updateBadgeFromModel: no 'current session' meter in model, falling back to XPath")
+        webView.evaluateJavaScript(Self.scrapeSessionPercentageJS) { [weak self] result, _ in
+            guard let self = self else { return }
+            // Re-check guards on the JS callback — popover state may have changed.
+            guard self.showMenuBarBadge, self.popover?.isShown != true else { return }
+            if let pct = result as? Int {
+                self.setBadgeTitle("\(pct)%", reason: "XPath fallback scrape")
+                UserDefaults.standard.set(pct, forKey: "lastBadgePercentage")
+            } else if self.statusItem.button?.title.isEmpty == true {
+                self.setBadgeTitle("\u{2014}%", reason: "XPath fallback returned nil")
+            }
         }
     }
 
@@ -785,11 +861,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     /// data model, updates the popover view, and syncs the badge.
     func scrapeAndDistribute() {
         webView.evaluateJavaScript(Self.scrapeUsageJS) { [weak self] result, error in
-            guard let self = self, let jsonStr = result as? String, !jsonStr.isEmpty else {
-                NSLog("[ClaudeMeter] scrapeAndDistribute: no data scraped")
+            guard let self = self else { return }
+
+            // A nil/non-string result or an empty string means the JS errored
+            // before producing JSON. Treat as an empty scrape: counts toward
+            // the failure streak so a persistent JS error eventually surfaces
+            // the "—%" placeholder rather than indefinitely keeping stale data.
+            let sections: [UsageSection]
+            if let jsonStr = result as? String, !jsonStr.isEmpty {
+                sections = Self.parseUsageJSON(jsonStr)
+            } else {
+                if let error = error {
+                    NSLog("%@", "[ClaudeMeter] scrapeAndDistribute: JS error: \(error.localizedDescription)")
+                } else {
+                    NSLog("[ClaudeMeter] scrapeAndDistribute: no data scraped")
+                }
+                sections = []
+            }
+
+            if sections.isEmpty {
+                // Transient empty — keep last-known data on screen. Only a
+                // sustained streak (threshold) is treated as a real failure.
+                self.consecutiveEmptyScrapes += 1
+                NSLog("[ClaudeMeter] scraped 0 sections (streak: \(self.consecutiveEmptyScrapes)/\(Self.emptyScrapeFailureThreshold))")
+                if self.consecutiveEmptyScrapes >= Self.emptyScrapeFailureThreshold {
+                    NSLog("[ClaudeMeter] empty-scrape threshold reached — surfacing failure")
+                    self.latestSections = []
+                    self.usageView?.update(sections: [])
+                    if self.showMenuBarBadge && self.popover?.isShown != true {
+                        self.setBadgeTitle("\u{2014}%", reason: "empty-scrape streak \(self.consecutiveEmptyScrapes)")
+                    }
+                }
                 return
             }
-            let sections = Self.parseUsageJSON(jsonStr)
+
+            // Successful scrape — reset streak and distribute.
+            self.consecutiveEmptyScrapes = 0
             NSLog("[ClaudeMeter] scraped \(sections.count) sections")
             self.latestSections = sections
             self.usageView?.update(sections: sections)
