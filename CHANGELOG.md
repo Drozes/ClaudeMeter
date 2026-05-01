@@ -4,6 +4,19 @@ Quick reference for AI assistants continuing work on this project.
 
 ## Release History
 
+### v2.5
+
+- **In-place popover updates**: refresh ticks now mutate the existing meter rows instead of tearing down and rebuilding the view tree. A structural fingerprint of section titles + ordered meter labels gates the path; matching shape takes the in-place branch, anything else (skeleton transition, structural change, empty data) still goes through the full rebuild. Visible result: the popover stays still during routine 30s polls, and progress bars slide to new percentages over 0.4s easeOut instead of snapping.
+- **Animated bar fills**: each meter's progress bar uses a constant width constraint (rather than a multiplier) so its width and color tween via `NSAnimationContext` and `CABasicAnimation`. Forces a `layoutSubtreeIfNeeded` on the parent before/inside the animation block so AppKit doesn't snap straight to the new value when there's pending layout invalidation.
+- **Headline parked**: the burn-rate / ETA headline (`out at 3:31p` / `no recent activity`) is no longer rendered. The half-populated states read as debug output rather than finished UI. `HeadlineView`, `sessionPercentage(in:)`, `weeklyPercentageForHeadline(in:)`, and the matching shimmer rows in `showLoadingSkeleton` are kept dormant with explicit "PARKED v2.5" markers so re-enabling is a one-block revert.
+- **Popover sizing fix**: `emitContentSize` was over-counting hidden views (the always-present detail/countdown labels introduced by the in-place refactor) and picking the inflated `computedHeight` over `fittingSize`. Result: popover was sized 50–60 px taller than its content, and because `NSStackView` isn't flipped inside an `NSScrollView`, the empty space landed at the **top** as a visible "big gap." `emitContentSize` now filters hidden views and prefers `fittingSize` once layout has settled (`scrollView.bounds.width > 0`); the `max(fitting, computed)` fallback only applies to the first measurement before widths have propagated.
+- **Idempotent CountdownTicker**: `register(label:resetAt:isEstimate:prefix:)` now replaces any existing entry for the given label and applies the formatted text immediately, so re-binding on every refresh doesn't churn the entries array or flash stale text for up to 1 second. New `unregister(_:)` for the resetAt-becomes-nil case and `registerFlameIfMissing(_:)` for the peak-hours flame.
+- **Stable countdown / detail rows**: detail and countdown labels are always added to each meter row (visibility toggled via `isHidden`) so the in-place path can update them without view churn. `NSStackView.detachesHiddenViews` collapses them out of layout when empty, matching the prior conditional-add behavior.
+- **Internal**: the popover sizing log line now reports `arranged=N visible=M` so L4 drift and field debugging can see the hidden-view ratio at a glance.
+- **Internal**: `Info.plist` `CFBundleShortVersionString` aligned with the CHANGELOG release slug (was lagging at `1.9` while CHANGELOG advanced to `v2.4`).
+
+> **Note**: `screenshot.png` in the README is pre-v2.4 (no plan-tier suffix, separate "Resets" / countdown rows). Re-shoot before tagging the public release.
+
 ### v2.4
 
 - **Plan tier in section header**: the first section title now reads `PLAN USAGE LIMITS - MAX 20X` (or `- PRO`, `- TEAM`, `- ENTERPRISE`, etc.). The slug is read from `rate_limit_tier` on the `/api/organizations` response (top-level on each org, not nested under `settings`), mapped to a friendly display name, and persisted in UserDefaults. Unknown future tiers fall back to a titlecased stem.

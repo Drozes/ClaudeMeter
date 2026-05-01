@@ -2101,6 +2101,35 @@ class UsageContentView: NSView {
     private var lastWeeklyResetAt: Date?
     let countdownTicker = CountdownTicker()
 
+    // In-place update bookkeeping. When the structural shape of the data
+    // (section titles + ordered meter labels per section) is unchanged across
+    // refreshes, we mutate the existing row views — animating bar fills and
+    // swapping label text — instead of tearing down and recreating the view
+    // tree. The crossfade rebuild path stays for shape changes and the
+    // skeleton-to-content transition.
+    private struct MeterRowViews {
+        let nameLabel: NSTextField
+        let flameView: NSImageView
+        let pctLabel: NSTextField
+        let fill: NSView
+        let fillWidth: NSLayoutConstraint
+        let trackBarWidth: CGFloat
+        let detailLabel: NSTextField
+        let countdownLabel: NSTextField
+        var meter: UsageMeter
+    }
+    private struct SectionViews {
+        let title: String
+        let titleLabel: NSTextField?
+        var rows: [MeterRowViews]
+    }
+    private struct SectionKey: Equatable {
+        let title: String
+        let meterLabels: [String]
+    }
+    private var renderedSections: [SectionViews] = []
+    private var structuralKey: [SectionKey] = []
+
     /// True when the view has real usage data (not skeleton or empty).
     var hasContent: Bool { !lastSections.isEmpty }
 
@@ -2213,36 +2242,52 @@ class UsageContentView: NSView {
         lastSessionResetAt = sessionResetAt
         lastWeeklyResetAt = weeklyResetAt
 
+        // Choose between in-place updates (when the rendered shape — section
+        // titles + ordered meter labels — matches the new data) and a full
+        // rebuild. In-place avoids the visible flicker of recreating every
+        // view on every refresh and lets us tween bar widths.
+        let newKey = sections.map { section in
+            SectionKey(title: section.title, meterLabels: section.meters.map { $0.label })
+        }
+        let canApplyInPlace = !wasShowingSkeleton
+            && !sections.isEmpty
+            && newKey == structuralKey
+            && renderedSections.count == sections.count
+
+        // PARKED v2.5: the burn-rate / ETA headline is intentionally not
+        // rendered. To re-enable, restore the `if sessionHasETA || weeklyHasETA`
+        // block that instantiates HeadlineView and add the two shimmer rows
+        // back into showLoadingSkeleton. The forecast/resetAt parameters
+        // remain on the signature so doUpdate's caller can keep its existing
+        // wiring — discarding them here keeps the unused-parameter warnings
+        // off without changing the public surface.
+        _ = (sessionForecast, weeklyForecast, sessionResetAt, weeklyResetAt)
+
+        if canApplyInPlace {
+            applyInPlace(sections: sections)
+            // One post-layout tick is enough on the in-place path: the view
+            // tree is unchanged, so heights only shift if a detail/countdown
+            // toggled visibility. Skip the +0.35s tick that exists for the
+            // popover-resize race during full rebuilds.
+            emitContentSize(label: "in-place")
+            DispatchQueue.main.async { [weak self] in
+                self?.emitContentSize(label: "in-place-post")
+            }
+            return
+        }
+
+        // Full rebuild: tear down and recreate, capturing view refs into
+        // renderedSections so the next compatible update can take the
+        // in-place path.
         stackView.arrangedSubviews.forEach { $0.removeFromSuperview() }
         countdownTicker.clearRegistrations()
+        renderedSections.removeAll()
+        structuralKey.removeAll()
 
         if sections.isEmpty {
             let empty = makeLabel("No usage data available", size: 13, color: NSColor(white: 0.5, alpha: 1))
             stackView.addArrangedSubview(empty)
             return
-        }
-
-        // Headline (burn-rate / ETA). Hidden when we don't have forecasts yet
-        // (first scrape after launch), so the skeleton-to-content transition
-        // doesn't pop a half-empty header in.
-        let sessionPct = sessionPercentage(in: sections) ?? 0
-        let weeklyPct = weeklyPercentageForHeadline(in: sections) ?? 0
-        // Only render the headline if at least one forecast has a real ETA.
-        // Showing "gathering data..." prominently on a fresh launch reads as a
-        // glitch; let the meters speak for themselves until we can predict.
-        let sessionHasETA = sessionForecast?.state == .ok
-        let weeklyHasETA = weeklyForecast?.state == .ok
-        if sessionHasETA || weeklyHasETA {
-            let headline = HeadlineView(
-                sessionForecast: sessionForecast,
-                weeklyForecast: weeklyForecast,
-                sessionPct: sessionPct,
-                weeklyPct: weeklyPct,
-                sessionResetAt: sessionResetAt,
-                weeklyResetAt: weeklyResetAt
-            )
-            stackView.addArrangedSubview(headline)
-            stackView.setCustomSpacing(8, after: headline)
         }
 
         for (i, section) in sections.enumerated() {
@@ -2265,26 +2310,24 @@ class UsageContentView: NSView {
 
             // Section title. The "plan usage" section gets the resolved plan
             // tier appended (e.g. "PLAN USAGE LIMITS - Pro").
+            var titleLabel: NSTextField? = nil
             if !section.title.isEmpty {
-                let upper = section.title.uppercased()
-                let isPlanSection = section.title.lowercased().contains("plan")
-                let titleText: String
-                if isPlanSection, let tier = planTierDisplayName, !tier.isEmpty {
-                    titleText = "\(upper) - \(tier.uppercased())"
-                } else {
-                    titleText = upper
-                }
-                let title = makeLabel(titleText, size: 10, weight: .semibold,
+                let title = makeLabel(sectionTitleText(for: section), size: 10, weight: .semibold,
                                       color: NSColor(white: 0.5, alpha: 1))
                 title.allowsDefaultTighteningForTruncation = true
                 stackView.addArrangedSubview(title)
                 stackView.setCustomSpacing(6, after: title)
+                titleLabel = title
             }
 
+            var rows: [MeterRowViews] = []
+            rows.reserveCapacity(section.meters.count)
             for meter in section.meters {
-                addMeter(meter)
+                rows.append(createMeterRow(meter))
             }
+            renderedSections.append(SectionViews(title: section.title, titleLabel: titleLabel, rows: rows))
         }
+        structuralKey = newKey
 
         // Crossfade from skeleton to real content
         if wasShowingSkeleton {
@@ -2312,21 +2355,47 @@ class UsageContentView: NSView {
         }
     }
 
+    /// Mutate already-rendered rows to match `sections`. Caller must have
+    /// verified that the structural key still matches.
+    private func applyInPlace(sections: [UsageSection]) {
+        for (i, section) in sections.enumerated() {
+            // Section titles are stable across in-place updates except when
+            // the resolved plan tier suffix changes; recompute and assign.
+            if let titleLabel = renderedSections[i].titleLabel {
+                let titleText = sectionTitleText(for: section)
+                if titleLabel.stringValue != titleText {
+                    titleLabel.stringValue = titleText
+                }
+            }
+            for (j, meter) in section.meters.enumerated() {
+                applyMeterRow(views: &renderedSections[i].rows[j], meter: meter, animated: true)
+            }
+        }
+    }
+
+    private func sectionTitleText(for section: UsageSection) -> String {
+        let upper = section.title.uppercased()
+        let isPlanSection = section.title.lowercased().contains("plan")
+        if isPlanSection, let tier = planTierDisplayName, !tier.isEmpty {
+            return "\(upper) - \(tier.uppercased())"
+        }
+        return upper
+    }
+
     // MARK: - Loading Skeleton
 
     func showLoadingSkeleton() {
         skeletonShownAt = Date()
         stackView.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        countdownTicker.clearRegistrations()
+        renderedSections.removeAll()
+        structuralKey.removeAll()
         let barWidth: CGFloat = 368
 
-        // Headline skeleton — two stacked rows matching HeadlineView layout
-        // so the v1.5 fade-in lines up cleanly when real data lands.
-        let headlineRow1 = makeShimmerBar(width: 180, height: 14)
-        stackView.addArrangedSubview(headlineRow1)
-        stackView.setCustomSpacing(4, after: headlineRow1)
-        let headlineRow2 = makeShimmerBar(width: 220, height: 14)
-        stackView.addArrangedSubview(headlineRow2)
-        stackView.setCustomSpacing(8, after: headlineRow2)
+        // Headline shimmer rows are intentionally omitted to match the v2.5
+        // layout, where the burn-rate / ETA headline is parked. Re-add two
+        // 14pt shimmer bars here when the headline is unparked so the
+        // skeleton-to-content crossfade lines up cleanly.
 
         // Simulate 2 sections with 2 meters each
         for section in 0..<2 {
@@ -2423,7 +2492,12 @@ class UsageContentView: NSView {
         return view
     }
 
-    private func addMeter(_ meter: UsageMeter) {
+    /// Build a meter row, capture references to its mutable subviews, and
+    /// add it to the main stack. All four arranged subviews (name row, track,
+    /// detail label, countdown label) are always added; visibility is toggled
+    /// per state. Returns a `MeterRowViews` whose contents the in-place update
+    /// path can mutate without rebuilding.
+    private func createMeterRow(_ meter: UsageMeter) -> MeterRowViews {
         let barWidth: CGFloat = 368
 
         // Label row
@@ -2439,22 +2513,19 @@ class UsageContentView: NSView {
         name.setContentHuggingPriority(.defaultLow, for: .horizontal)
         row.addArrangedSubview(name)
 
-        // Flame icon for the current-session meter when we're in peak hours.
-        let isCurrentSession = meter.label.lowercased().contains("current session")
-        if isCurrentSession && AppDelegate.isInPeakWindow() {
-            let flame = NSImageView()
-            let cfg = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
-            let img = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "peak hours")?
-                .withSymbolConfiguration(cfg)
-            flame.image = img
-            flame.contentTintColor = NSColor(red: 0xc0/255.0, green: 0x5e/255.0, blue: 0x1a/255.0, alpha: 1)
-            flame.translatesAutoresizingMaskIntoConstraints = false
-            flame.setContentHuggingPriority(.required, for: .horizontal)
-            flame.setContentCompressionResistancePriority(.required, for: .horizontal)
-            flame.toolTip = Self.peakTooltipPublic()
-            countdownTicker.registerFlame(flame)
-            row.addArrangedSubview(flame)
-        }
+        // Flame icon is always present so we can toggle peak-hours visibility
+        // in place. NSStackView.detachesHiddenViews drops it from the layout
+        // when hidden, so it costs nothing visually until needed.
+        let flame = NSImageView()
+        let cfg = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+        flame.image = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "peak hours")?
+            .withSymbolConfiguration(cfg)
+        flame.contentTintColor = NSColor(red: 0xc0/255.0, green: 0x5e/255.0, blue: 0x1a/255.0, alpha: 1)
+        flame.translatesAutoresizingMaskIntoConstraints = false
+        flame.setContentHuggingPriority(.required, for: .horizontal)
+        flame.setContentCompressionResistancePriority(.required, for: .horizontal)
+        flame.isHidden = true
+        row.addArrangedSubview(flame)
 
         let pct = makeLabel("\(meter.percentage)%", size: 13, weight: .medium,
                             color: colorForPercentage(meter.percentage))
@@ -2465,7 +2536,11 @@ class UsageContentView: NSView {
         stackView.addArrangedSubview(row)
         stackView.setCustomSpacing(4, after: row)
 
-        // Progress bar
+        // Progress bar. The fill uses a constant width constraint (rather
+        // than a multiplier on track width) so the in-place update path can
+        // animate it via NSAnimationContext — multiplier constants are
+        // immutable on NSLayoutConstraint and would otherwise force a
+        // constraint swap on every tick.
         let track = NSView()
         track.wantsLayer = true
         track.layer?.backgroundColor = NSColor(white: 0.2, alpha: 1).cgColor
@@ -2480,43 +2555,133 @@ class UsageContentView: NSView {
         fill.layer?.cornerRadius = 3
         fill.translatesAutoresizingMaskIntoConstraints = false
         track.addSubview(fill)
+        let initialFraction = max(CGFloat(min(meter.percentage, 100)) / 100.0, 0.01)
+        let fillWidth = fill.widthAnchor.constraint(equalToConstant: barWidth * initialFraction)
         NSLayoutConstraint.activate([
             fill.topAnchor.constraint(equalTo: track.topAnchor),
             fill.bottomAnchor.constraint(equalTo: track.bottomAnchor),
             fill.leadingAnchor.constraint(equalTo: track.leadingAnchor),
-            fill.widthAnchor.constraint(equalTo: track.widthAnchor,
-                                        multiplier: max(CGFloat(min(meter.percentage, 100)) / 100.0, 0.01)),
+            fillWidth,
         ])
 
         stackView.addArrangedSubview(track)
+        stackView.setCustomSpacing(2, after: track)
 
-        // Detail / countdown. When detail is reset-related and we have a
-        // parsed resetAt, suppress the static row and let the live countdown
-        // absorb it with a synthesized "Resets <time>" prefix derived from
-        // resetAt itself. The prefix horizon scales: time-only within 24h,
-        // weekday+time within a week, month+day beyond. Non-reset details
-        // render statically as before.
+        // Detail and countdown labels are always added; visibility is the
+        // signal. NSStackView's detachesHiddenViews makes hidden labels
+        // collapse out of the layout, so the visual result matches the old
+        // conditional-add behavior while preserving stable view identity.
+        let detail = makeLabel("", size: 11, color: NSColor(white: 0.45, alpha: 1))
+        detail.isHidden = true
+        stackView.addArrangedSubview(detail)
+        stackView.setCustomSpacing(2, after: detail)
+
+        let countdown = makeLabel("", size: 10, color: NSColor(white: 0.45, alpha: 1))
+        countdown.isHidden = true
+        stackView.addArrangedSubview(countdown)
+        stackView.setCustomSpacing(6, after: countdown)
+
+        var views = MeterRowViews(
+            nameLabel: name,
+            flameView: flame,
+            pctLabel: pct,
+            fill: fill,
+            fillWidth: fillWidth,
+            trackBarWidth: barWidth,
+            detailLabel: detail,
+            countdownLabel: countdown,
+            meter: meter
+        )
+        applyMeterRow(views: &views, meter: meter, animated: false)
+        return views
+    }
+
+    /// Mutate an existing meter row to match `meter`. When `animated`, the
+    /// progress fill width and color tween over 0.4s; everything else snaps.
+    /// Returns the updated `MeterRowViews` (`meter` field rewritten).
+    private func applyMeterRow(views: inout MeterRowViews, meter: UsageMeter, animated: Bool) {
+        let isCurrentSession = meter.label.lowercased().contains("current session")
+        let showFlame = isCurrentSession && AppDelegate.isInPeakWindow()
+
+        let nameValue = meter.label.isEmpty ? "Usage" : meter.label
+        if views.nameLabel.stringValue != nameValue { views.nameLabel.stringValue = nameValue }
+
+        views.flameView.isHidden = !showFlame
+        if showFlame {
+            views.flameView.toolTip = Self.peakTooltipPublic()
+            countdownTicker.registerFlameIfMissing(views.flameView)
+        }
+
+        let pctText = "\(meter.percentage)%"
+        let pctColor = colorForPercentage(meter.percentage)
+        if views.pctLabel.stringValue != pctText { views.pctLabel.stringValue = pctText }
+        views.pctLabel.textColor = pctColor
+
+        // Fill width
+        let fraction = max(CGFloat(min(meter.percentage, 100)) / 100.0, 0.01)
+        let newWidth = views.trackBarWidth * fraction
+        if abs(views.fillWidth.constant - newWidth) > 0.5 {
+            if animated {
+                // Force pending layout to settle so the animator sees a clean
+                // baseline; otherwise constraint-constant animations on macOS
+                // can snap straight to the new value when the parent has
+                // pending layout invalidation.
+                views.fill.superview?.layoutSubtreeIfNeeded()
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.4
+                    ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    ctx.allowsImplicitAnimation = true
+                    views.fillWidth.animator().constant = newWidth
+                    views.fill.superview?.layoutSubtreeIfNeeded()
+                }
+            } else {
+                views.fillWidth.constant = newWidth
+            }
+        }
+
+        // Fill color
+        if let layer = views.fill.layer {
+            let newColor = pctColor.cgColor
+            if layer.backgroundColor != newColor {
+                if animated {
+                    let anim = CABasicAnimation(keyPath: "backgroundColor")
+                    anim.fromValue = layer.backgroundColor
+                    anim.toValue = newColor
+                    anim.duration = 0.4
+                    anim.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    layer.add(anim, forKey: "fillColor")
+                }
+                layer.backgroundColor = newColor
+            }
+        }
+
+        // Detail label. Reset-prefixed details are absorbed by the live
+        // countdown row, matching the original conditional render.
         let lowerDetail = meter.detail.lowercased()
         let detailIsReset = lowerDetail.hasPrefix("resets")
         let suppressDetail = detailIsReset && meter.resetAt != nil
-        if !meter.detail.isEmpty && !suppressDetail {
-            stackView.setCustomSpacing(2, after: track)
-            let detail = makeLabel(meter.detail, size: 11, color: NSColor(white: 0.45, alpha: 1))
-            stackView.addArrangedSubview(detail)
-            stackView.setCustomSpacing(2, after: detail)
-        } else {
-            stackView.setCustomSpacing(2, after: track)
+        let showDetail = !meter.detail.isEmpty && !suppressDetail
+        if showDetail && views.detailLabel.stringValue != meter.detail {
+            views.detailLabel.stringValue = meter.detail
         }
+        views.detailLabel.isHidden = !showDetail
 
+        // Countdown registration. `register` is idempotent (replaces by label),
+        // so we can call it on every refresh without churning the entries
+        // array. `unregister` clears the row when resetAt becomes nil.
         if let resetAt = meter.resetAt {
-            let countdown = makeLabel("", size: 10, color: NSColor(white: 0.45, alpha: 1))
-            countdown.isHidden = true
-            stackView.addArrangedSubview(countdown)
-            stackView.setCustomSpacing(6, after: countdown)
             let isEstimate = meter.detail.isEmpty
             let prefixOverride = detailIsReset ? Self.formatResetPrefix(resetAt) : nil
-            countdownTicker.register(label: countdown, resetAt: resetAt, isEstimate: isEstimate, prefix: prefixOverride)
+            countdownTicker.register(label: views.countdownLabel,
+                                     resetAt: resetAt,
+                                     isEstimate: isEstimate,
+                                     prefix: prefixOverride)
+        } else {
+            countdownTicker.unregister(views.countdownLabel)
+            views.countdownLabel.isHidden = true
         }
+
+        views.meter = meter
     }
 
     private static func formatResetPrefix(_ resetAt: Date, now: Date = Date()) -> String {
@@ -2558,13 +2723,26 @@ class UsageContentView: NSView {
     private func emitContentSize(label: String) {
         stackView.layoutSubtreeIfNeeded()
         let arranged = stackView.arrangedSubviews
-        let subviewHeight = arranged.reduce(0) { $0 + $1.frame.height }
-        let spacingTotal = max(0, CGFloat(arranged.count - 1)) * stackView.spacing
+        // Only count views that are participating in layout. The in-place
+        // refactor introduced always-present detail/countdown labels that
+        // get hidden when empty; their stale frame.height would otherwise
+        // inflate computedHeight every refresh.
+        let visible = arranged.filter { !$0.isHidden }
+        let subviewHeight = visible.reduce(0) { $0 + $1.frame.height }
+        let spacingTotal = max(0, CGFloat(visible.count - 1)) * stackView.spacing
         let edges = stackView.edgeInsets.top + stackView.edgeInsets.bottom
         let computedHeight = subviewHeight + spacingTotal + edges
         let fitting = stackView.fittingSize.height
-        let chosen = max(fitting, computedHeight)
-        NSLog("%@", "[ClaudeMeter] popover sizing(\(label)): fittingSize=\(fitting) computed=\(computedHeight) chosen=\(chosen) scrollW=\(scrollView.bounds.width)")
+        // Prefer fittingSize once layout has settled (scrollView has a real
+        // width). Before that, fall back to computedHeight as a defensive
+        // estimate against fittingSize under-reporting on the first pass.
+        let chosen: CGFloat
+        if scrollView.bounds.width > 0 {
+            chosen = fitting
+        } else {
+            chosen = max(fitting, computedHeight)
+        }
+        NSLog("%@", "[ClaudeMeter] popover sizing(\(label)): fittingSize=\(fitting) computed=\(computedHeight) chosen=\(chosen) scrollW=\(scrollView.bounds.width) arranged=\(arranged.count) visible=\(visible.count)")
         onContentSizeChanged?(chosen)
     }
 
@@ -2629,6 +2807,14 @@ class UsageContentView: NSView {
         }
     }
 
+    // MARK: - Parked headline helpers (v2.5)
+    //
+    // These two helpers and HeadlineView (further down) feed the burn-rate /
+    // ETA headline that v2.4 surfaced as "out at 3:31p / no recent activity".
+    // The headline was parked in v2.5 because the half-populated states read
+    // as debug output. Kept dormant — and called out here — so re-enabling is
+    // a one-block revert in doUpdate plus restoring the two shimmer rows in
+    // showLoadingSkeleton. Delete only after a clean redesign lands.
     private func sessionPercentage(in sections: [UsageSection]) -> Int? {
         for section in sections {
             for meter in section.meters where meter.label.lowercased().contains("current session") {
@@ -2672,11 +2858,28 @@ final class CountdownTicker {
     private struct Weak<T: AnyObject> { weak var value: T? }
 
     func register(label: NSTextField, resetAt: Date, isEstimate: Bool, prefix: String? = nil) {
+        // Idempotent: replace any existing entry for this label so callers can
+        // re-bind on every refresh without tracking unregister state.
+        entries.removeAll { $0.label === label }
         entries.append(Entry(label: label, resetAt: resetAt, isEstimate: isEstimate, prefix: prefix))
+        // Apply once so the label gets correct text immediately, instead of
+        // waiting up to 1s for the next tick (visible as a flash on first
+        // render or rebind).
+        apply(label: label, resetAt: resetAt, isEstimate: isEstimate, prefixOverride: prefix, now: Date())
+    }
+
+    func unregister(_ label: NSTextField) {
+        entries.removeAll { $0.label === label }
     }
 
     func registerFlame(_ flame: NSImageView) {
         flames.append(Weak(value: flame))
+    }
+
+    func registerFlameIfMissing(_ flame: NSImageView) {
+        if !flames.contains(where: { $0.value === flame }) {
+            flames.append(Weak(value: flame))
+        }
     }
 
     func clearRegistrations() {
@@ -2792,7 +2995,14 @@ extension UsageContentView {
     }
 }
 
-// MARK: - Headline View (burn-rate + ETA-to-limit)
+// MARK: - Headline View (burn-rate + ETA-to-limit) — PARKED in v2.5
+//
+// Not instantiated by the current popover (see UsageContentView.doUpdate
+// where the headline branch is replaced with `_ = sessionForecast` etc.).
+// Kept here so re-enabling is a single-block revert. See
+// `UsageContentView.sessionPercentage(in:)` / `weeklyPercentageForHeadline`
+// for the matching parked helpers, and showLoadingSkeleton for the matching
+// parked shimmer rows.
 
 private final class HeadlineView: NSStackView {
     init(sessionForecast: UsageForecast?,
