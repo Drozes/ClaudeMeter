@@ -1,0 +1,20 @@
+{
+  "session": {
+    "label": "Current session",
+    "percent_used": 47,
+    "resets_at": "at 4:00 PM"
+  },
+  "weekly": {
+    "label": "Weekly usage",
+    "percent_used": 23,
+    "resets_at": "in 5 days"
+  },
+  "per_model": [
+    {
+      "label": "Weekly Opus 4 usage",
+      "model": "Opus",
+      "percent_used": 12,
+      "resets_at": "in 5 days"
+    }
+  ]
+}

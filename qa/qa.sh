@@ -61,6 +61,7 @@ if should_run L2; then
     fi
     if [ -d "$QA_DIR/node_modules/jsdom" ]; then
         run_layer "L2 dom-contract" "node $QA_DIR/check-selectors.mjs"
+        run_layer "L2.5 json-contract" "node $QA_DIR/check-selectors.mjs json"
     fi
 fi
 if [ "$MODE" = "full" ] || [ "$ONLY" = "L3" ]; then

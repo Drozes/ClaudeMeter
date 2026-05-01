@@ -3,6 +3,7 @@ import WebKit
 import Security
 import SQLite3
 import CommonCrypto
+import UserNotifications
 
 @main
 struct ClaudeMeterApp {
@@ -53,7 +54,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
 
     // Shared data store — populated by every scrape, read by badge and popover
     var latestSections: [UsageSection] = []
+    var history: UsageHistory = UsageHistory.loadFromDisk()
     var badgeIntervalMenuItem: NSMenuItem?
+    var notifier: ThresholdNotifier!
+    var notificationsEnabledMenuItem: NSMenuItem?
+    var notificationThresholdMenuItems: [NSMenuItem] = []
 
     // Empty-scrape streak. Transient empties happen during normal page renders
     // (React mid-update), so a single empty must NOT clear the badge or popover.
@@ -61,6 +66,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     // network broke, scraper no longer matches).
     var consecutiveEmptyScrapes: Int = 0
     static let emptyScrapeFailureThreshold = 3
+
+    // JSON-primary fetch state
+    var cachedOrgUUID: String? = UserDefaults.standard.string(forKey: AppDelegate.cachedOrgUUIDKey)
+    var cachedPlanTier: String? = UserDefaults.standard.string(forKey: AppDelegate.cachedPlanTierKey)
+    var jsonFetchInFlight: Bool = false
+    var jsonConsecutiveFailures: Int = 0
+    var jsonCircuitOpen: Bool = false
+    static let jsonFailureCircuitBreaker = 5
 
     static let showBadgeKey = "showMenuBarBadge"
     var showMenuBarBadge: Bool = UserDefaults.standard.bool(forKey: AppDelegate.showBadgeKey) {
@@ -88,6 +101,41 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     }()
     static let usageURL = URL(string: "https://claude.ai/settings/usage")!
     static let loginURL = URL(string: "https://claude.ai/login")!
+
+    // Anthropic peak-hour window. Single source of truth: update this struct if
+    // the window shifts. Local display always uses Calendar.current; the peak
+    // check uses the configured timeZone (DST handled automatically).
+    struct PeakWindow {
+        let startHour: Int
+        let endHour: Int
+        let timeZone: String
+        let weekdaysOnly: Bool
+    }
+    static let peakWindow = PeakWindow(startHour: 5, endHour: 11, timeZone: "America/Los_Angeles", weekdaysOnly: true)
+
+    static let apiOrgsURL = URL(string: "https://claude.ai/api/organizations")!
+    static let apiUsagePath = "/api/organizations/%@/usage"
+    static let forceDOMOnlyKey = "forceDOMOnly"
+    static let cachedOrgUUIDKey = "cachedOrgUUID"
+    static let cachedPlanTierKey = "cachedPlanTier"
+    static let lastFetchPathKey = "lastFetchPath"
+
+    static func planTierDisplayName(slug: String?) -> String? {
+        guard let s = slug?.lowercased(), !s.isEmpty else { return nil }
+        switch s {
+        case "default_claude_free":         return "Free"
+        case "default_claude_pro":          return "Pro"
+        case "default_claude_max_5x":       return "Max 5x"
+        case "default_claude_max_20x":      return "Max 20x"
+        case "default_claude_team":         return "Team"
+        case "default_claude_enterprise":   return "Enterprise"
+        default:
+            // Titlecase the stem for unknown future tiers (e.g. max_50x).
+            let stripped = s.replacingOccurrences(of: "default_claude_", with: "")
+            guard !stripped.isEmpty else { return nil }
+            return stripped.prefix(1).uppercased() + stripped.dropFirst()
+        }
+    }
 
     /// Direct XPath scrape for the "Current session" percentage. Independent
     /// fallback used by the badge when the structured scrape's label-detection
@@ -212,12 +260,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
 
         setupMenu()
+        notifier = ThresholdNotifier()
+        UNUserNotificationCenter.current().delegate = notifier
         setupPopover()
         applyBadgeVisibility()
 
         // Prompt to move to /Applications if not already there
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             AppUpdater.promptMoveToApplicationsIfNeeded()
+        }
+
+        // Proactively populate plan tier so the chip works even when the
+        // usage JSON path is circuit-broken. Wait long enough for cookies to
+        // be imported and the WKWebView to attach them.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+            self?.refreshPlanTierIfNeeded()
         }
 
         // Silent update check after 30s, then every 4 hours
@@ -246,8 +303,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             self.webView.load(URLRequest(url: Self.usageURL))
         }
 
-        // Native popover content — sized to skeleton, auto-resizes on content load
+        // Native popover content, sized to skeleton, auto-resizes on content load.
         usageView = UsageContentView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        usageView.planTierDisplayName = Self.planTierDisplayName(slug: cachedPlanTier)
         let skeletonH = usageView.skeletonHeight
 
         let vc = NSViewController()
@@ -263,7 +321,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
 
         usageView.onContentSizeChanged = { [weak self] height in
             guard let self = self else { return }
-            let clamped = min(max(height, 120), 500)
+            // Use as much of the screen as macOS permits. NSPopover hard-caps
+            // around (visibleFrame - small margin) on its own; we just need to
+            // not under-clamp ahead of it. Floor at 1200 so smaller screens
+            // still get a generously tall popover.
+            let screenMax = (NSScreen.main?.visibleFrame.height ?? 1200) - 40
+            let ceiling = max(1200, screenMax)
+            let clamped = min(max(height, 120), ceiling)
             let current = self.popover.contentSize.height
             // Only animate if height changed meaningfully — sub-pixel layout
             // rounding differences would otherwise cause the popover to flicker.
@@ -498,6 +562,43 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         badgeIntervalMenuItem = badgeIntervalItem
         menu.addItem(badgeIntervalItem)
 
+        let notificationsItem = NSMenuItem(title: "Notifications", action: nil, keyEquivalent: "")
+        let notificationsSubmenu = NSMenu()
+        notificationThresholdMenuItems.removeAll()
+
+        let enabledItem = NSMenuItem(title: "Enable Notifications", action: #selector(toggleNotificationsEnabled(_:)), keyEquivalent: "")
+        enabledItem.target = self
+        enabledItem.state = UserDefaults.standard.bool(forKey: ThresholdNotifier.enabledKey) ? .on : .off
+        notificationsEnabledMenuItem = enabledItem
+        notificationsSubmenu.addItem(enabledItem)
+
+        notificationsSubmenu.addItem(NSMenuItem.separator())
+
+        for threshold in [50, 75, 90] {
+            let item = NSMenuItem(title: "Session \(threshold)%", action: #selector(toggleThreshold(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = "session.\(threshold)"
+            let muted = UserDefaults.standard.bool(forKey: "notif.mute.session.\(threshold)")
+            item.state = muted ? .off : .on
+            notificationsSubmenu.addItem(item)
+            notificationThresholdMenuItems.append(item)
+        }
+
+        notificationsSubmenu.addItem(NSMenuItem.separator())
+
+        for threshold in [50, 75, 90] {
+            let item = NSMenuItem(title: "Weekly \(threshold)%", action: #selector(toggleThreshold(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = "weekly.\(threshold)"
+            let muted = UserDefaults.standard.bool(forKey: "notif.mute.weekly.\(threshold)")
+            item.state = muted ? .off : .on
+            notificationsSubmenu.addItem(item)
+            notificationThresholdMenuItems.append(item)
+        }
+
+        notificationsItem.submenu = notificationsSubmenu
+        menu.addItem(notificationsItem)
+
         menu.addItem(NSMenuItem.separator())
         let updateItem = NSMenuItem(title: "Check for Updates\u{2026}", action: #selector(checkForUpdates), keyEquivalent: "u")
         checkForUpdatesMenuItem = updateItem
@@ -519,6 +620,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         showMenuBarBadge.toggle()
         sender.state = showMenuBarBadge ? .on : .off
         badgeIntervalMenuItem?.isEnabled = showMenuBarBadge
+    }
+
+    @objc func toggleNotificationsEnabled(_ sender: NSMenuItem) {
+        let current = UserDefaults.standard.bool(forKey: ThresholdNotifier.enabledKey)
+        UserDefaults.standard.set(!current, forKey: ThresholdNotifier.enabledKey)
+        sender.state = !current ? .on : .off
+    }
+
+    @objc func toggleThreshold(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        let muteKey = "notif.mute.\(key)"
+        let currentlyMuted = UserDefaults.standard.bool(forKey: muteKey)
+        UserDefaults.standard.set(!currentlyMuted, forKey: muteKey)
+        sender.state = !currentlyMuted ? .off : .on
     }
 
     @objc func setBadgeInterval(_ sender: NSMenuItem) {
@@ -582,7 +697,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             softReload()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
+            usageView?.scrollToTop()
             startRefreshTimer()
+            usageView?.startCountdownTicker()
         }
     }
 
@@ -762,6 +879,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     func popoverDidClose(_ notification: Notification) {
         NSLog("[ClaudeMeter] popoverDidClose")
         stopRefreshTimer()
+        usageView?.stopCountdownTicker()
         refreshCycleCount = 0
         updateBadgeFromModel()
         if showMenuBarBadge {
@@ -857,9 +975,56 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
 
     // MARK: - Scrape & Distribute
 
-    /// Single scrape function: runs the full JS scraper, stores results in the shared
-    /// data model, updates the popover view, and syncs the badge.
+    /// Coordinator: tries the JSON-primary path first, falls back to DOM scrape
+    /// when JSON is disabled, errored, or its in-memory circuit breaker has tripped.
+    /// Both paths funnel through the same empty-streak gate and badge/model updates,
+    /// so callers see a uniform interface regardless of which path succeeded.
     func scrapeAndDistribute() {
+        let forceDOM = UserDefaults.standard.bool(forKey: Self.forceDOMOnlyKey)
+        if forceDOM || jsonCircuitOpen {
+            let reason = forceDOM ? "forceDOMOnly=true" : "json circuit open"
+            logFetchOutcome(path: "dom", outcome: "selected", detail: reason)
+            scrapeViaDOM()
+            return
+        }
+
+        fetchViaJSON { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .success(let sections):
+                if sections.isEmpty {
+                    // Empty means our permissive Codable couldn't pull any meters
+                    // from the response (shape mismatch or auth-soft-fail).
+                    // Treat as failure and fall through to DOM rather than
+                    // letting the empty-streak gate eventually clear the UI.
+                    self.jsonConsecutiveFailures += 1
+                    self.logFetchOutcome(path: "json", outcome: "empty", detail: "n=0 failures=\(self.jsonConsecutiveFailures), falling through to DOM")
+                    if self.jsonConsecutiveFailures >= Self.jsonFailureCircuitBreaker && !self.jsonCircuitOpen {
+                        self.jsonCircuitOpen = true
+                        NSLog("%@", "[ClaudeMeter] json circuit breaker tripped after \(self.jsonConsecutiveFailures) consecutive empty/error responses, falling back to DOM-only for this session")
+                    }
+                    self.scrapeViaDOM()
+                } else {
+                    self.jsonConsecutiveFailures = 0
+                    self.logFetchOutcome(path: "json", outcome: "success", detail: "n=\(sections.count)")
+                    self.distributeFetchResult(sections, path: "json")
+                }
+            case .failure(let err):
+                self.jsonConsecutiveFailures += 1
+                self.logFetchOutcome(path: "json", outcome: "error", detail: "\(err) failures=\(self.jsonConsecutiveFailures)")
+                if self.jsonConsecutiveFailures >= Self.jsonFailureCircuitBreaker && !self.jsonCircuitOpen {
+                    self.jsonCircuitOpen = true
+                    NSLog("%@", "[ClaudeMeter] json circuit breaker tripped after \(self.jsonConsecutiveFailures) consecutive failures, falling back to DOM-only for this session")
+                }
+                self.scrapeViaDOM()
+            }
+        }
+    }
+
+    /// DOM scrape path: runs the JS scraper in WKWebView and funnels results
+    /// through the shared distribution gate. Kept as a working fallback because
+    /// the JSON endpoint is undocumented and may rotate.
+    private func scrapeViaDOM() {
         webView.evaluateJavaScript(Self.scrapeUsageJS) { [weak self] result, error in
             guard let self = self else { return }
 
@@ -872,37 +1037,435 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                 sections = Self.parseUsageJSON(jsonStr)
             } else {
                 if let error = error {
-                    NSLog("%@", "[ClaudeMeter] scrapeAndDistribute: JS error: \(error.localizedDescription)")
+                    self.logFetchOutcome(path: "dom", outcome: "error", detail: "JS error: \(error.localizedDescription)")
                 } else {
-                    NSLog("[ClaudeMeter] scrapeAndDistribute: no data scraped")
+                    self.logFetchOutcome(path: "dom", outcome: "empty", detail: "no data scraped")
                 }
                 sections = []
             }
 
-            if sections.isEmpty {
-                // Transient empty — keep last-known data on screen. Only a
-                // sustained streak (threshold) is treated as a real failure.
-                self.consecutiveEmptyScrapes += 1
-                NSLog("[ClaudeMeter] scraped 0 sections (streak: \(self.consecutiveEmptyScrapes)/\(Self.emptyScrapeFailureThreshold))")
-                if self.consecutiveEmptyScrapes >= Self.emptyScrapeFailureThreshold {
-                    NSLog("[ClaudeMeter] empty-scrape threshold reached — surfacing failure")
-                    self.latestSections = []
-                    self.usageView?.update(sections: [])
-                    if self.showMenuBarBadge && self.popover?.isShown != true {
-                        self.setBadgeTitle("\u{2014}%", reason: "empty-scrape streak \(self.consecutiveEmptyScrapes)")
-                    }
-                }
-                return
+            if !sections.isEmpty {
+                self.logFetchOutcome(path: "dom", outcome: "success", detail: "n=\(sections.count)")
             }
-
-            // Successful scrape — reset streak and distribute.
-            self.consecutiveEmptyScrapes = 0
-            NSLog("[ClaudeMeter] scraped \(sections.count) sections")
-            self.latestSections = sections
-            self.usageView?.update(sections: sections)
-            self.usageView?.setStatusFresh(true)
-            self.updateBadgeFromModel()
+            self.distributeFetchResult(sections, path: "dom")
         }
+    }
+
+    /// Shared distribution + empty-streak gate. Both JSON and DOM paths feed
+    /// here so the popover and badge see a single source of truth.
+    private func distributeFetchResult(_ sections: [UsageSection], path: String) {
+        if sections.isEmpty {
+            // Transient empty — keep last-known data on screen. Only a
+            // sustained streak (threshold) is treated as a real failure.
+            self.consecutiveEmptyScrapes += 1
+            NSLog("[ClaudeMeter] scraped 0 sections via \(path) (streak: \(self.consecutiveEmptyScrapes)/\(Self.emptyScrapeFailureThreshold))")
+            if self.consecutiveEmptyScrapes >= Self.emptyScrapeFailureThreshold {
+                NSLog("[ClaudeMeter] empty-scrape threshold reached, surfacing failure")
+                self.latestSections = []
+                self.usageView?.update(sections: [])
+                if self.showMenuBarBadge && self.popover?.isShown != true {
+                    self.setBadgeTitle("\u{2014}%", reason: "empty-scrape streak \(self.consecutiveEmptyScrapes)")
+                }
+            }
+            return
+        }
+
+        self.consecutiveEmptyScrapes = 0
+        UserDefaults.standard.set(path, forKey: Self.lastFetchPathKey)
+        NSLog("[ClaudeMeter] distributed \(sections.count) sections via \(path)")
+        let sections = self.applyResetEstimates(to: sections)
+        self.latestSections = sections
+        self.notifier.evaluate(sections: sections)
+
+        let sessionPct = self.sessionPercentage(from: sections) ?? 0
+        let weeklyPct = self.weeklyPercentage(from: sections) ?? 0
+        self.history.append(timestamp: Date(), sessionPct: sessionPct, weeklyPct: weeklyPct)
+        self.history.persistThrottled()
+
+        let now = Date()
+        let sessionReset = self.sessionResetDate(from: sections, now: now)
+        let weeklyReset = self.weeklyResetDate(from: sections, now: now)
+
+        let sessionForecast = UsageForecast.compute(
+            samples: self.history.samples,
+            currentPct: sessionPct,
+            resetAt: sessionReset,
+            windowSeconds: 30 * 60,
+            minSpanSeconds: 5 * 60,
+            keyPath: \UsageHistory.Sample.s,
+            now: now
+        )
+        let weeklyForecast = UsageForecast.compute(
+            samples: self.history.samples,
+            currentPct: weeklyPct,
+            resetAt: weeklyReset,
+            windowSeconds: 24 * 3600,
+            minSpanSeconds: 30 * 60,
+            keyPath: \UsageHistory.Sample.w,
+            now: now
+        )
+
+        self.usageView?.update(
+            sections: sections,
+            sessionForecast: sessionForecast,
+            weeklyForecast: weeklyForecast,
+            sessionResetAt: sessionReset,
+            weeklyResetAt: weeklyReset
+        )
+        self.usageView?.setStatusFresh(true)
+        self.updateBadgeFromModel()
+    }
+
+    /// Extract the headline weekly percentage (the unscoped "Weekly" / "Weekly usage"
+    /// meter, falling back to the first weekly meter in the section).
+    func weeklyPercentage(from sections: [UsageSection]) -> Int? {
+        for section in sections where section.title.lowercased().contains("weekly") {
+            for meter in section.meters {
+                let l = meter.label.lowercased()
+                if l == "weekly" || l == "weekly usage" || l.hasPrefix("weekly usage") {
+                    return meter.percentage
+                }
+            }
+            if let first = section.meters.first { return first.percentage }
+        }
+        return nil
+    }
+
+    /// Find the session-meter detail string and parse a reset date out of it.
+    /// Falls back to now + 5h if the detail is missing or unparseable.
+    func sessionResetDate(from sections: [UsageSection], now: Date) -> Date {
+        for section in sections {
+            for meter in section.meters where meter.label.lowercased().contains("current session") {
+                if let parsed = Date.parseClaudeReset(meter.detail, now: now) { return parsed }
+            }
+        }
+        return now.addingTimeInterval(5 * 3600)
+    }
+
+    /// Weekly reset: parse from any weekly meter's detail; fall back to next Monday 00:00 local.
+    func weeklyResetDate(from sections: [UsageSection], now: Date) -> Date {
+        for section in sections where section.title.lowercased().contains("weekly") {
+            for meter in section.meters {
+                if let parsed = Date.parseClaudeReset(meter.detail, now: now) { return parsed }
+            }
+        }
+        var comps = DateComponents()
+        comps.weekday = 2 // Monday
+        comps.hour = 0
+        comps.minute = 0
+        return Calendar.current.nextDate(after: now, matching: comps, matchingPolicy: .nextTime)
+            ?? now.addingTimeInterval(7 * 24 * 3600)
+    }
+
+    /// Centralized telemetry sink for fetch outcomes. Mirrors setBadgeTitle's
+    /// NSLog("%@", ...) convention so the QA pipeline can detect path/outcome
+    /// transitions from stderr alone.
+    func logFetchOutcome(path: String, outcome: String, detail: String) {
+        NSLog("%@", "[ClaudeMeter] fetch path=\(path) outcome=\(outcome) \(detail)")
+    }
+
+    // MARK: - Reset Estimation (DOM fallback)
+
+    static let firstSeenPrefix = "resetEstimate.firstSeen."
+    static let firstSeenPctPrefix = "resetEstimate.firstSeenPct."
+
+    /// Fills missing UsageMeter.resetAt values with estimates. JSON path already
+    /// populates resetAt directly; DOM path either parses from meter.detail or
+    /// falls back to a "first seen" anchor in UserDefaults plus a fixed window
+    /// (5h session, 7d weekly). The anchor is reset whenever the percentage
+    /// drops, since that signals a new cycle.
+    func applyResetEstimates(to sections: [UsageSection]) -> [UsageSection] {
+        let now = Date()
+        let defaults = UserDefaults.standard
+        return sections.map { section in
+            let meters = section.meters.map { meter -> UsageMeter in
+                if meter.resetAt != nil { return meter }
+
+                // First, try parsing the detail string (DOM path supplies things
+                // like "Resets at 3:42pm").
+                if !meter.detail.isEmpty,
+                   let parsed = Date.parseClaudeReset(meter.detail, now: now) {
+                    var copy = meter
+                    copy.resetAt = parsed
+                    return copy
+                }
+
+                // Fall back to a persisted first-seen anchor only for meters
+                // whose reset cadence we actually know (5h session, 7d weekly).
+                // Other meters (Extra usage = monthly billing reset, All models
+                // / Sonnet only = arbitrary tier-specific cadences) stay nil
+                // rather than getting a misleading short countdown.
+                let key = meter.label.lowercased()
+                let isSession = key.contains("current session")
+                let isWeekly = section.title.lowercased().contains("weekly") || key.contains("weekly")
+                guard isSession || isWeekly else { return meter }
+
+                let firstSeenKey = Self.firstSeenPrefix + key
+                let firstSeenPctKey = Self.firstSeenPctPrefix + key
+                let stored = defaults.double(forKey: firstSeenKey)
+                let storedPct = defaults.integer(forKey: firstSeenPctKey)
+                let windowSeconds: TimeInterval = isWeekly ? 7 * 24 * 3600 : 5 * 3600
+
+                let anchor: TimeInterval
+                if stored <= 0 || meter.percentage < storedPct {
+                    anchor = now.timeIntervalSince1970
+                    defaults.set(anchor, forKey: firstSeenKey)
+                    defaults.set(meter.percentage, forKey: firstSeenPctKey)
+                } else {
+                    anchor = stored
+                }
+
+                var copy = meter
+                copy.resetAt = Date(timeIntervalSince1970: anchor + windowSeconds)
+                return copy
+            }
+            return UsageSection(title: section.title, meters: meters)
+        }
+    }
+
+    // MARK: - Peak Window
+
+    /// True when "now" lies inside the configured peak-hour window (Mon-Fri
+    /// 5-11 AM Pacific by default). DST handled automatically by TimeZone.
+    static func isInPeakWindow(now: Date = Date()) -> Bool {
+        guard let tz = TimeZone(identifier: peakWindow.timeZone) else { return false }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        let hour = cal.component(.hour, from: now)
+        let weekday = cal.component(.weekday, from: now)
+        if peakWindow.weekdaysOnly && !(2...6).contains(weekday) { return false }
+        return hour >= peakWindow.startHour && hour < peakWindow.endHour
+    }
+
+    /// Time remaining until the peak window closes today. Returns nil when not
+    /// currently in the peak window.
+    static func peakWindowRemaining(now: Date = Date()) -> TimeInterval? {
+        guard isInPeakWindow(now: now), let tz = TimeZone(identifier: peakWindow.timeZone) else {
+            return nil
+        }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        var comps = cal.dateComponents([.year, .month, .day], from: now)
+        comps.hour = peakWindow.endHour
+        comps.minute = 0
+        comps.second = 0
+        guard let endDate = cal.date(from: comps) else { return nil }
+        return max(0, endDate.timeIntervalSince(now))
+    }
+
+    // MARK: - JSON Fetch Path
+
+    /// JSON-primary fetch. Copies cookies from the WKWebView data store into a
+    /// per-call URLSession, discovers the org UUID lazily, and decodes the
+    /// undocumented /api/organizations/{uuid}/usage response.
+    func fetchViaJSON(completion: @escaping (Result<[UsageSection], FetchError>) -> Void) {
+        if jsonFetchInFlight {
+            completion(.failure(.transport(NSError(domain: "ClaudeMeter", code: -1, userInfo: [NSLocalizedDescriptionKey: "fetch already in flight"]))))
+            return
+        }
+        jsonFetchInFlight = true
+
+        copyCookiesToSession { [weak self] session in
+            guard let self = self else { return }
+            self.discoverOrgUUID(session: session) { [weak self] uuid in
+                guard let self = self else { return }
+                guard let uuid = uuid else {
+                    self.jsonFetchInFlight = false
+                    completion(.failure(.noOrg))
+                    return
+                }
+
+                let urlStr = "https://claude.ai" + String(format: Self.apiUsagePath, uuid)
+                guard let url = URL(string: urlStr) else {
+                    self.jsonFetchInFlight = false
+                    completion(.failure(.noOrg))
+                    return
+                }
+
+                var req = URLRequest(url: url)
+                req.setValue("application/json", forHTTPHeaderField: "Accept")
+                req.setValue(Self.safariUA, forHTTPHeaderField: "User-Agent")
+
+                session.dataTask(with: req) { [weak self] data, response, error in
+                    guard let self = self else { return }
+                    DispatchQueue.main.async {
+                        self.jsonFetchInFlight = false
+                        if let error = error {
+                            completion(.failure(.transport(error)))
+                            return
+                        }
+                        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                        if status == 401 || status == 403 || status == 404 {
+                            // Cached UUID may be stale; clear so next attempt rediscovers.
+                            self.cachedOrgUUID = nil
+                            UserDefaults.standard.removeObject(forKey: Self.cachedOrgUUIDKey)
+                            completion(.failure(.http(status)))
+                            return
+                        }
+                        if status < 200 || status >= 300 {
+                            completion(.failure(.http(status)))
+                            return
+                        }
+                        guard let data = data else {
+                            completion(.failure(.http(status)))
+                            return
+                        }
+                        do {
+                            let decoded = try JSONDecoder().decode(UsageAPIResponse.self, from: data)
+                            let sections = self.normalizeJSONResponse(decoded)
+                            completion(.success(sections))
+                        } catch {
+                            completion(.failure(.decode(error)))
+                        }
+                    }
+                }.resume()
+            }
+        }
+    }
+
+    /// Lazily discovers the org UUID. Returns the cached value when present.
+    /// Picks the org whose capabilities include claude_pro/claude_max when present,
+    /// else the first org in the list.
+    func discoverOrgUUID(session: URLSession, completion: @escaping (String?) -> Void) {
+        // Re-fetch when uuid is cached but plan tier isn't, so the chip
+        // populates after upgrading to a build that captures it.
+        if let cached = cachedOrgUUID, !cached.isEmpty, cachedPlanTier != nil {
+            completion(cached)
+            return
+        }
+        var req = URLRequest(url: Self.apiOrgsURL)
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue(Self.safariUA, forHTTPHeaderField: "User-Agent")
+
+        session.dataTask(with: req) { [weak self] data, response, err in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                if let err = err {
+                    NSLog("%@", "[ClaudeMeter] discoverOrgUUID transport error: \(err.localizedDescription)")
+                    completion(nil); return
+                }
+                guard status >= 200, status < 300, let data = data else {
+                    NSLog("%@", "[ClaudeMeter] discoverOrgUUID HTTP \(status), bytes=\(data?.count ?? 0)")
+                    completion(nil); return
+                }
+                var orgs: [OrgListResponse.Org] = []
+                if let arr = try? JSONDecoder().decode([OrgListResponse.Org].self, from: data) {
+                    orgs = arr
+                } else if let env = try? JSONDecoder().decode(OrgListResponse.self, from: data) {
+                    orgs = env.organizations ?? []
+                } else {
+                    let preview = String(data: data.prefix(200), encoding: .utf8) ?? "<binary>"
+                    NSLog("%@", "[ClaudeMeter] discoverOrgUUID decode failed; first 200 bytes: \(preview)")
+                }
+                NSLog("%@", "[ClaudeMeter] discoverOrgUUID got \(orgs.count) orgs")
+                let preferred = orgs.first { ($0.capabilities ?? []).contains { c in
+                    c == "claude_pro" || c == "claude_max"
+                } }
+                let chosen = preferred ?? orgs.first
+                if let chosen = chosen {
+                    self.cachedOrgUUID = chosen.uuid
+                    UserDefaults.standard.set(chosen.uuid, forKey: Self.cachedOrgUUIDKey)
+                    if let tier = chosen.rate_limit_tier, !tier.isEmpty {
+                        self.cachedPlanTier = tier
+                        UserDefaults.standard.set(tier, forKey: Self.cachedPlanTierKey)
+                        NSLog("%@", "[ClaudeMeter] plan tier resolved: \(tier)")
+                    }
+                    self.usageView?.planTierDisplayName = Self.planTierDisplayName(slug: self.cachedPlanTier)
+                }
+                completion(chosen?.uuid)
+            }
+        }.resume()
+    }
+
+    /// Proactive plan-tier fetch independent of the usage JSON path. The usage
+    /// endpoint may be circuit-broken or shape-mismatched, but plan tier still
+    /// works because /api/organizations is a different endpoint.
+    func refreshPlanTierIfNeeded() {
+        copyCookiesToSession { [weak self] session in
+            guard let self = self else { return }
+            self.discoverOrgUUID(session: session) { _ in }
+        }
+    }
+
+    /// Snapshots all WKWebView cookies into a URLSession so the JSON request
+    /// rides the same authenticated session as the page itself.
+    func copyCookiesToSession(completion: @escaping (URLSession) -> Void) {
+        let store = webView.configuration.websiteDataStore.httpCookieStore
+        store.getAllCookies { cookies in
+            // ephemeral config already has its own in-memory HTTPCookieStorage.
+            // The previous sharedCookieStorage(forGroupContainerIdentifier:)
+            // path required an app-group entitlement we don't have, which is
+            // why cookies weren't actually being attached to outbound requests.
+            let config = URLSessionConfiguration.ephemeral
+            if let jar = config.httpCookieStorage {
+                for c in cookies { jar.setCookie(c) }
+            }
+            config.httpShouldSetCookies = true
+            config.httpCookieAcceptPolicy = .always
+            NSLog("%@", "[ClaudeMeter] copyCookiesToSession: attached \(cookies.count) cookies")
+            let session = URLSession(configuration: config)
+            DispatchQueue.main.async { completion(session) }
+        }
+    }
+
+    /// Maps the JSON API response into the existing UsageSection/UsageMeter
+    /// shape, preserving the label conventions ("Current session", "Weekly",
+    /// "Opus", etc.) so sessionPercentage(from:) and updateBadgeFromModel
+    /// keep working unchanged.
+    func normalizeJSONResponse(_ response: UsageAPIResponse) -> [UsageSection] {
+        func percent(_ w: UsageAPIResponse.Window) -> Int {
+            if let p = w.percent_used { return p }
+            if let u = w.utilization {
+                let scaled = u <= 1.0 ? u * 100.0 : u
+                return Int(scaled.rounded())
+            }
+            return 0
+        }
+        func detail(_ w: UsageAPIResponse.Window) -> String {
+            if let r = w.resets_at, !r.isEmpty { return "Resets \(r)" }
+            return ""
+        }
+        func resetDate(_ w: UsageAPIResponse.Window) -> Date? {
+            guard let r = w.resets_at, !r.isEmpty else { return nil }
+            // Try ISO-8601 first (the JSON path's canonical form), then fall
+            // back to the v2.1 string parser for human-format strings.
+            let iso = ISO8601DateFormatter()
+            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let d = iso.date(from: r) { return d }
+            let isoNoFrac = ISO8601DateFormatter()
+            isoNoFrac.formatOptions = [.withInternetDateTime]
+            if let d = isoNoFrac.date(from: r) { return d }
+            return Date.parseClaudeReset(r)
+        }
+
+        var sessionMeters: [UsageMeter] = []
+        var weeklyMeters: [UsageMeter] = []
+
+        if let s = response.session {
+            let label = s.label ?? "Current session"
+            sessionMeters.append(UsageMeter(label: label, percentage: percent(s), detail: detail(s), resetAt: resetDate(s)))
+        }
+        if let w = response.weekly {
+            let label = w.label ?? "Weekly usage"
+            weeklyMeters.append(UsageMeter(label: label, percentage: percent(w), detail: detail(w), resetAt: resetDate(w)))
+        }
+        if let perModel = response.per_model {
+            for w in perModel {
+                let model = w.model ?? ""
+                let baseLabel = w.label ?? (model.isEmpty ? "Weekly" : "Weekly \(model) usage")
+                weeklyMeters.append(UsageMeter(label: baseLabel, percentage: percent(w), detail: detail(w), resetAt: resetDate(w)))
+            }
+        }
+
+        var out: [UsageSection] = []
+        if !sessionMeters.isEmpty {
+            out.append(UsageSection(title: "Session limit", meters: sessionMeters))
+        }
+        if !weeklyMeters.isEmpty {
+            out.append(UsageSection(title: "Weekly limit", meters: weeklyMeters))
+        }
+        return out
     }
 
     static func parseUsageJSON(_ jsonString: String) -> [UsageSection] {
@@ -942,11 +1505,572 @@ struct UsageMeter: Equatable {
     let label: String
     let percentage: Int
     let detail: String
+    var resetAt: Date?
+
+    init(label: String, percentage: Int, detail: String, resetAt: Date? = nil) {
+        self.label = label
+        self.percentage = percentage
+        self.detail = detail
+        self.resetAt = resetAt
+    }
+
+    // Equality intentionally ignores resetAt: parseClaudeReset is computed
+    // against `now`, so the drifting timestamp would otherwise force a full
+    // popover rebuild on every scrape (causing flicker the v1.7 work fixed).
+    // The countdown ticker handles its own tick-by-tick updates.
+    static func == (lhs: UsageMeter, rhs: UsageMeter) -> Bool {
+        return lhs.label == rhs.label
+            && lhs.percentage == rhs.percentage
+            && lhs.detail == rhs.detail
+    }
 }
 
 struct UsageSection: Equatable {
     let title: String
     let meters: [UsageMeter]
+}
+
+// MARK: - Usage API Models
+// Permissive Optional fields throughout — endpoint is undocumented and may
+// rotate. The mapper picks whichever non-nil percent representation is present.
+
+struct UsageAPIResponse: Decodable {
+    struct Window: Decodable {
+        let label: String?
+        let utilization: Double?
+        let percent_used: Int?
+        let resets_at: String?
+        let model: String?
+    }
+    let session: Window?
+    let weekly: Window?
+    let per_model: [Window]?
+}
+
+struct OrgListResponse: Decodable {
+    struct Org: Decodable {
+        let uuid: String
+        let capabilities: [String]?
+        let rate_limit_tier: String?
+    }
+    let organizations: [Org]?
+}
+
+enum FetchError: Error {
+    case noCookies
+    case noOrg
+    case http(Int)
+    case decode(Error)
+    case transport(Error)
+}
+
+// MARK: - Usage History (ring buffer + disk persistence)
+
+/// Bounded sample buffer for burn-rate / ETA computation. Capped at 24h on
+/// retention so the JSON file stays tiny (a few KB) and EWMA over the recent
+/// slice is cheap (n typically < 300). Persisted to Application Support so
+/// rate estimates survive relaunches.
+struct UsageHistory {
+    struct Sample: Codable, Equatable {
+        let t: TimeInterval
+        let s: Int   // session pct
+        let w: Int   // weekly pct
+    }
+
+    private(set) var samples: [Sample] = []
+    private var lastPersist: Date = .distantPast
+    private static let retentionSeconds: TimeInterval = 24 * 3600
+    private static let persistThrottle: TimeInterval = 30
+
+    static var fileURL: URL {
+        let fm = FileManager.default
+        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        return base.appendingPathComponent("ClaudeMeter/history.json")
+    }
+
+    static func loadFromDisk() -> UsageHistory {
+        var h = UsageHistory()
+        guard let data = try? Data(contentsOf: fileURL),
+              let envelope = try? JSONDecoder().decode(Envelope.self, from: data) else {
+            return h
+        }
+        let cutoff = Date().timeIntervalSince1970 - retentionSeconds
+        h.samples = envelope.samples.filter { $0.t >= cutoff }
+        return h
+    }
+
+    mutating func append(timestamp: Date, sessionPct: Int, weeklyPct: Int) {
+        let sample = Sample(t: timestamp.timeIntervalSince1970, s: sessionPct, w: weeklyPct)
+        samples.append(sample)
+        let cutoff = timestamp.timeIntervalSince1970 - Self.retentionSeconds
+        if let firstKeep = samples.firstIndex(where: { $0.t >= cutoff }), firstKeep > 0 {
+            samples.removeFirst(firstKeep)
+        }
+    }
+
+    mutating func persistThrottled(now: Date = Date()) {
+        guard now.timeIntervalSince(lastPersist) >= Self.persistThrottle else { return }
+        lastPersist = now
+        let envelope = Envelope(version: 1, samples: samples)
+        guard let data = try? JSONEncoder().encode(envelope) else { return }
+        let url = Self.fileURL
+        let dir = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? data.write(to: url, options: .atomic)
+    }
+
+    /// Samples within the last `seconds`, oldest first.
+    func recent(seconds: TimeInterval, now: Date = Date()) -> [Sample] {
+        let cutoff = now.timeIntervalSince1970 - seconds
+        return samples.filter { $0.t >= cutoff }
+    }
+
+    private struct Envelope: Codable {
+        let version: Int
+        let samples: [Sample]
+    }
+}
+
+// MARK: - Threshold Notifier
+
+/// Fires macOS user notifications when session/weekly usage crosses 50/75/90%.
+/// Idempotent per cycle: each (scope, threshold, cycleKey) tuple fires at most
+/// once. Per-threshold mute toggles and a "Snooze rest of cycle" action let
+/// users opt out without disabling notifications globally.
+final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
+    static let enabledKey = "notif.enabled"
+    static let authRequestedKey = "notif.authRequested"
+    static let cycleStartSessionKey = "notif.cycleStart.session"
+    static let cycleStartWeeklyKey = "notif.cycleStart.weekly"
+    static let categoryID = "CM_THRESHOLD"
+    static let snoozeActionID = "CM_SNOOZE_CYCLE"
+
+    private let thresholds: [Int] = [50, 75, 90]
+    private let center = UNUserNotificationCenter.current()
+
+    enum Scope: String {
+        case session
+        case weekly
+    }
+
+    override init() {
+        super.init()
+        registerCategory()
+        pruneStaleKeys()
+    }
+
+    private func registerCategory() {
+        let snooze = UNNotificationAction(
+            identifier: Self.snoozeActionID,
+            title: "Snooze rest of cycle",
+            options: []
+        )
+        let category = UNNotificationCategory(
+            identifier: Self.categoryID,
+            actions: [snooze],
+            intentIdentifiers: [],
+            options: []
+        )
+        center.setNotificationCategories([category])
+    }
+
+    func evaluate(sections: [UsageSection]) {
+        guard UserDefaults.standard.bool(forKey: Self.enabledKey) else { return }
+
+        let now = Date()
+        let sessionPct = percentage(in: sections, scope: .session)
+        let weeklyPct = percentage(in: sections, scope: .weekly)
+        let sessionDetail = detail(in: sections, scope: .session)
+        let weeklyDetail = detail(in: sections, scope: .weekly)
+
+        if let pct = sessionPct {
+            evaluateScope(.session, pct: pct, detail: sessionDetail, sections: sections, now: now)
+        }
+        if let pct = weeklyPct {
+            evaluateScope(.weekly, pct: pct, detail: weeklyDetail, sections: sections, now: now)
+        }
+    }
+
+    private func evaluateScope(_ scope: Scope, pct: Int, detail: String, sections: [UsageSection], now: Date) {
+        let cycleKey = self.cycleKey(for: scope, sections: sections, now: now)
+        let lastPctKey = "notif.lastPct.\(scope.rawValue).\(cycleKey)"
+        let snoozedKey = "notif.snoozed.\(scope.rawValue).\(cycleKey)"
+        let defaults = UserDefaults.standard
+        let lastPct = defaults.integer(forKey: lastPctKey)
+        let snoozed = defaults.bool(forKey: snoozedKey)
+
+        if !snoozed {
+            for threshold in thresholds {
+                let muteKey = "notif.mute.\(scope.rawValue).\(threshold)"
+                let firedKey = "notif.fired.\(scope.rawValue).\(threshold).\(cycleKey)"
+                let muted = defaults.bool(forKey: muteKey)
+                let alreadyFired = defaults.bool(forKey: firedKey)
+                if lastPct < threshold && pct >= threshold && !muted && !alreadyFired {
+                    // Set fired BEFORE dispatching so concurrent evaluates can't double-fire.
+                    defaults.set(true, forKey: firedKey)
+                    fire(scope: scope, threshold: threshold, detail: detail, cycleKey: cycleKey)
+                }
+            }
+        }
+
+        defaults.set(pct, forKey: lastPctKey)
+    }
+
+    private func fire(scope: Scope, threshold: Int, detail: String, cycleKey: String) {
+        let scopeName = (scope == .session) ? "session" : "weekly"
+        let title = "Claude \(scopeName) at \(threshold)%"
+        let body: String
+        if !detail.isEmpty {
+            body = detail
+        } else {
+            body = "You've used \(threshold)% of your \(scopeName) limit."
+        }
+
+        let dispatch = { [weak self] in
+            self?.dispatchNotification(title: title, body: body, scope: scope, cycleKey: cycleKey)
+        }
+
+        if UserDefaults.standard.bool(forKey: Self.authRequestedKey) {
+            dispatch()
+            return
+        }
+
+        // Lazy authorization request on first fire (privacy-respecting).
+        UserDefaults.standard.set(true, forKey: Self.authRequestedKey)
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+            if granted {
+                DispatchQueue.main.async { dispatch() }
+            }
+        }
+    }
+
+    private func dispatchNotification(title: String, body: String, scope: Scope, cycleKey: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.categoryIdentifier = Self.categoryID
+        content.interruptionLevel = .timeSensitive
+        content.userInfo = ["scope": scope.rawValue, "cycleKey": cycleKey]
+
+        let req = UNNotificationRequest(
+            identifier: "CM_\(scope.rawValue)_\(cycleKey)_\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        center.add(req) { err in
+            if let err = err {
+                NSLog("[ClaudeMeter] notif dispatch error: %@", err.localizedDescription)
+            }
+        }
+    }
+
+    // MARK: - Cycle key
+
+    /// Stable identifier for the current cycle window. Prefer the parsed reset
+    /// timestamp (rounded to seconds); fall back to a rolling anchor stored in
+    /// UserDefaults when the detail string isn't parseable.
+    func cycleKey(for scope: Scope, sections: [UsageSection], now: Date) -> String {
+        let detailStr = detail(in: sections, scope: scope)
+        if !detailStr.isEmpty, let resets = Date.parseClaudeReset(detailStr, now: now) {
+            return String(Int(resets.timeIntervalSince1970))
+        }
+
+        let anchorKey: String
+        let windowSeconds: TimeInterval
+        switch scope {
+        case .session:
+            anchorKey = Self.cycleStartSessionKey
+            windowSeconds = 5 * 3600
+        case .weekly:
+            anchorKey = Self.cycleStartWeeklyKey
+            windowSeconds = 7 * 24 * 3600
+        }
+        let stored = UserDefaults.standard.double(forKey: anchorKey)
+        let nowTS = now.timeIntervalSince1970
+        if stored <= 0 || (nowTS - stored) >= windowSeconds {
+            UserDefaults.standard.set(nowTS, forKey: anchorKey)
+            return String(Int(nowTS))
+        }
+        return String(Int(stored))
+    }
+
+    // MARK: - Percentage / detail extraction
+
+    private func percentage(in sections: [UsageSection], scope: Scope) -> Int? {
+        switch scope {
+        case .session:
+            for section in sections {
+                for meter in section.meters where meter.label.lowercased().contains("current session") {
+                    return meter.percentage
+                }
+            }
+        case .weekly:
+            for section in sections where section.title.lowercased().contains("weekly") {
+                for meter in section.meters {
+                    let l = meter.label.lowercased()
+                    if l == "weekly" || l == "weekly usage" || l.hasPrefix("weekly usage") {
+                        return meter.percentage
+                    }
+                }
+                if let first = section.meters.first { return first.percentage }
+            }
+        }
+        return nil
+    }
+
+    private func detail(in sections: [UsageSection], scope: Scope) -> String {
+        switch scope {
+        case .session:
+            for section in sections {
+                for meter in section.meters where meter.label.lowercased().contains("current session") {
+                    return meter.detail
+                }
+            }
+        case .weekly:
+            for section in sections where section.title.lowercased().contains("weekly") {
+                for meter in section.meters {
+                    let l = meter.label.lowercased()
+                    if l == "weekly" || l == "weekly usage" || l.hasPrefix("weekly usage") {
+                        return meter.detail
+                    }
+                }
+                if let first = section.meters.first { return first.detail }
+            }
+        }
+        return ""
+    }
+
+    // MARK: - Stale key cleanup
+
+    /// Drop notif.fired.* / notif.snoozed.* / notif.lastPct.* entries whose
+    /// embedded cycle timestamp is more than 14 days old. Without this the
+    /// UserDefaults plist would grow unbounded over months.
+    private func pruneStaleKeys() {
+        let cutoff = Date().timeIntervalSince1970 - (14 * 24 * 3600)
+        let defaults = UserDefaults.standard
+        let prefixes = ["notif.fired.", "notif.snoozed.", "notif.lastPct."]
+        for (key, _) in defaults.dictionaryRepresentation() {
+            guard prefixes.contains(where: { key.hasPrefix($0) }) else { continue }
+            // Cycle key is the trailing dot-separated component; parse as Int seconds.
+            if let lastDot = key.lastIndex(of: "."), let ts = Double(key[key.index(after: lastDot)...]) {
+                if ts < cutoff {
+                    defaults.removeObject(forKey: key)
+                }
+            }
+        }
+    }
+
+    // MARK: - UNUserNotificationCenterDelegate
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        if response.actionIdentifier == Self.snoozeActionID {
+            let info = response.notification.request.content.userInfo
+            if let scope = info["scope"] as? String, let cycleKey = info["cycleKey"] as? String {
+                let key = "notif.snoozed.\(scope).\(cycleKey)"
+                UserDefaults.standard.set(true, forKey: key)
+            }
+        }
+        completionHandler()
+    }
+}
+
+// MARK: - Usage Forecast (EWMA burn rate + ETA)
+
+struct UsageForecast {
+    enum State {
+        case ok
+        case idle
+        case insufficientData
+        case willNotExhaust
+    }
+
+    let ratePerHour: Double
+    let etaDate: Date?
+    let state: State
+
+    /// Pure value computation. EWMA over inter-sample slopes (alpha = 0.3:
+    /// weights recent slopes a few samples deep without overfitting one tick).
+    /// Pass `windowSeconds` to limit how far back to look (e.g. session uses
+    /// the last 30 min slice; weekly uses the full retention window).
+    static func compute(
+        samples: [UsageHistory.Sample],
+        currentPct: Int,
+        resetAt: Date,
+        windowSeconds: TimeInterval,
+        minSpanSeconds: TimeInterval,
+        keyPath: KeyPath<UsageHistory.Sample, Int>,
+        now: Date = Date()
+    ) -> UsageForecast {
+        let cutoff = now.timeIntervalSince1970 - windowSeconds
+        let window = samples.filter { $0.t >= cutoff }
+
+        guard window.count >= 3 else {
+            return UsageForecast(ratePerHour: 0, etaDate: nil, state: .insufficientData)
+        }
+        let span = window.last!.t - window.first!.t
+        guard span >= minSpanSeconds else {
+            return UsageForecast(ratePerHour: 0, etaDate: nil, state: .insufficientData)
+        }
+
+        // alpha = 0.3 favours the last ~3-5 slopes; small enough to ride out
+        // a single jittery sample, large enough to react inside one window.
+        let alpha = 0.3
+        var ewma: Double? = nil
+        for i in 1..<window.count {
+            let dt = window[i].t - window[i - 1].t
+            guard dt > 0 else { continue }
+            let dPct = Double(window[i][keyPath: keyPath] - window[i - 1][keyPath: keyPath])
+            let slope = dPct / (dt / 3600.0)
+            if let prev = ewma {
+                ewma = alpha * slope + (1 - alpha) * prev
+            } else {
+                ewma = slope
+            }
+        }
+        let rate = ewma ?? 0
+
+        if rate <= 0.05 {
+            return UsageForecast(ratePerHour: rate, etaDate: nil, state: .idle)
+        }
+
+        let remaining = max(0, 100 - currentPct)
+        let hoursToExhaust = Double(remaining) / rate
+        let eta = now.addingTimeInterval(hoursToExhaust * 3600)
+
+        if eta >= resetAt {
+            return UsageForecast(ratePerHour: rate, etaDate: nil, state: .willNotExhaust)
+        }
+        return UsageForecast(ratePerHour: rate, etaDate: eta, state: .ok)
+    }
+}
+
+// MARK: - Reset-time parsing
+
+extension Date {
+    /// Parses Claude usage-card reset strings. Handles "Resets at 3:42pm",
+    /// "Resets Wed 9am", and "Resets in 2h" forms. Returns nil if unparseable
+    /// so the caller can fall back to a sensible default.
+    static func parseClaudeReset(_ text: String, now: Date = Date(), calendar: Calendar = .current) -> Date? {
+        let lower = text.lowercased()
+
+        // Relative "in Nh Mm" / "in N hr M min" / "in Nh" / "in Nm" forms.
+        // Combine hours + minutes when both appear so "4 hr 11 min" anchors at
+        // 4h11m, not 4h flat.
+        if let inRange = lower.range(of: #"in\s+"#, options: .regularExpression) {
+            let tail = String(lower[inRange.upperBound...])
+            let hourRe = try? NSRegularExpression(pattern: #"(\d+)\s*h"#, options: [])
+            let minRe = try? NSRegularExpression(pattern: #"(\d+)\s*m(?:in)?\b"#, options: [])
+            let ns = tail as NSString
+            var hours = 0
+            var minutes = 0
+            if let m = hourRe?.firstMatch(in: tail, range: NSRange(location: 0, length: ns.length)) {
+                hours = Int(ns.substring(with: m.range(at: 1))) ?? 0
+            }
+            if let m = minRe?.firstMatch(in: tail, range: NSRange(location: 0, length: ns.length)) {
+                minutes = Int(ns.substring(with: m.range(at: 1))) ?? 0
+            }
+            if hours > 0 || minutes > 0 {
+                return now.addingTimeInterval(TimeInterval(hours) * 3600 + TimeInterval(minutes) * 60)
+            }
+        }
+
+        // Time-of-day: "3:42pm", "9am", "3pm"
+        let timeRe = try? NSRegularExpression(pattern: #"(\d{1,2})(?::(\d{2}))?\s*(am|pm)"#, options: [])
+        let ns = lower as NSString
+        let match = timeRe?.firstMatch(in: lower, range: NSRange(location: 0, length: ns.length))
+
+        // Weekday (mon/tue/...) optionally precedes the time
+        let weekdayMap: [String: Int] = [
+            "sun": 1, "mon": 2, "tue": 3, "wed": 4, "thu": 5, "fri": 6, "sat": 7
+        ]
+        var targetWeekday: Int? = nil
+        for (k, v) in weekdayMap where lower.contains(k) { targetWeekday = v; break }
+
+        // Month + day forms ("Jun 1", "January 5"). Used for billing-style
+        // resets (Extra usage). Returns the next future occurrence.
+        let monthMap: [String: Int] = [
+            "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
+        ]
+        var targetMonth: Int? = nil
+        var targetDay: Int? = nil
+        if let monthRe = try? NSRegularExpression(
+            pattern: #"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})\b"#,
+            options: []),
+           let mm = monthRe.firstMatch(in: lower, range: NSRange(location: 0, length: ns.length)) {
+            let monthKey = ns.substring(with: mm.range(at: 1))
+            targetMonth = monthMap[monthKey]
+            targetDay = Int(ns.substring(with: mm.range(at: 2)))
+        }
+
+        guard let m = match else {
+            // No time-of-day. Prefer month+day, then weekday.
+            if let mo = targetMonth, let d = targetDay {
+                return nextDate(month: mo, day: d, hour: 0, minute: 0, after: now, calendar: calendar)
+            }
+            if let wd = targetWeekday {
+                return nextDate(weekday: wd, hour: 0, minute: 0, after: now, calendar: calendar)
+            }
+            return nil
+        }
+
+        let hour = Int(ns.substring(with: m.range(at: 1))) ?? 0
+        let minute = m.range(at: 2).location != NSNotFound
+            ? (Int(ns.substring(with: m.range(at: 2))) ?? 0) : 0
+        let ampm = ns.substring(with: m.range(at: 3))
+        var h24 = hour % 12
+        if ampm == "pm" { h24 += 12 }
+
+        if let mo = targetMonth, let d = targetDay {
+            return nextDate(month: mo, day: d, hour: h24, minute: minute, after: now, calendar: calendar)
+        }
+        if let wd = targetWeekday {
+            return nextDate(weekday: wd, hour: h24, minute: minute, after: now, calendar: calendar)
+        }
+        return nextTimeOfDay(hour: h24, minute: minute, after: now, calendar: calendar)
+    }
+
+    private static func nextDate(month: Int, day: Int, hour: Int, minute: Int, after: Date, calendar: Calendar) -> Date {
+        var comps = calendar.dateComponents([.year], from: after)
+        comps.month = month
+        comps.day = day
+        comps.hour = hour
+        comps.minute = minute
+        guard var candidate = calendar.date(from: comps) else { return after }
+        if candidate <= after {
+            comps.year = (comps.year ?? 0) + 1
+            candidate = calendar.date(from: comps) ?? candidate
+        }
+        return candidate
+    }
+
+    private static func nextTimeOfDay(hour: Int, minute: Int, after: Date, calendar: Calendar) -> Date {
+        var comps = calendar.dateComponents([.year, .month, .day], from: after)
+        comps.hour = hour
+        comps.minute = minute
+        guard var candidate = calendar.date(from: comps) else { return after }
+        if candidate <= after {
+            candidate = calendar.date(byAdding: .day, value: 1, to: candidate) ?? candidate
+        }
+        return candidate
+    }
+
+    private static func nextDate(weekday: Int, hour: Int, minute: Int, after: Date, calendar: Calendar) -> Date {
+        var comps = DateComponents()
+        comps.weekday = weekday
+        comps.hour = hour
+        comps.minute = minute
+        return calendar.nextDate(after: after, matching: comps, matchingPolicy: .nextTime) ?? after
+    }
 }
 
 // MARK: - Native Usage View
@@ -956,9 +2080,26 @@ class UsageContentView: NSView {
     private let stackView = NSStackView()
     private let statusDot = NSView()
     var onContentSizeChanged: ((CGFloat) -> Void)?
+    private var pendingScrollToTop = false
+    var planTierDisplayName: String? {
+        didSet {
+            guard oldValue != planTierDisplayName else { return }
+            // Force a re-render so the section header picks up the new tier.
+            update(sections: lastSections,
+                   sessionForecast: lastSessionForecast,
+                   weeklyForecast: lastWeeklyForecast,
+                   sessionResetAt: lastSessionResetAt,
+                   weeklyResetAt: lastWeeklyResetAt)
+        }
+    }
     private var skeletonShownAt: Date?
     private static let minSkeletonDuration: TimeInterval = 0.6
     private var lastSections: [UsageSection] = []
+    private var lastSessionForecast: UsageForecast?
+    private var lastWeeklyForecast: UsageForecast?
+    private var lastSessionResetAt: Date?
+    private var lastWeeklyResetAt: Date?
+    let countdownTicker = CountdownTicker()
 
     /// True when the view has real usage data (not skeleton or empty).
     var hasContent: Bool { !lastSections.isEmpty }
@@ -1019,37 +2160,89 @@ class UsageContentView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     func update(sections: [UsageSection]) {
+        update(sections: sections, sessionForecast: nil, weeklyForecast: nil,
+               sessionResetAt: nil, weeklyResetAt: nil)
+    }
+
+    func update(sections: [UsageSection],
+                sessionForecast: UsageForecast?,
+                weeklyForecast: UsageForecast?,
+                sessionResetAt: Date?,
+                weeklyResetAt: Date?) {
         // If skeleton is still showing, ensure minimum display time
         if let shown = skeletonShownAt {
             let elapsed = Date().timeIntervalSince(shown)
             let remaining = Self.minSkeletonDuration - elapsed
             if remaining > 0 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
-                    self?.doUpdate(sections: sections)
+                    self?.doUpdate(sections: sections,
+                                   sessionForecast: sessionForecast,
+                                   weeklyForecast: weeklyForecast,
+                                   sessionResetAt: sessionResetAt,
+                                   weeklyResetAt: weeklyResetAt)
                 }
                 return
             }
         }
-        doUpdate(sections: sections)
+        doUpdate(sections: sections,
+                 sessionForecast: sessionForecast,
+                 weeklyForecast: weeklyForecast,
+                 sessionResetAt: sessionResetAt,
+                 weeklyResetAt: weeklyResetAt)
     }
 
-    private func doUpdate(sections: [UsageSection]) {
+    private func doUpdate(sections: [UsageSection],
+                          sessionForecast: UsageForecast?,
+                          weeklyForecast: UsageForecast?,
+                          sessionResetAt: Date?,
+                          weeklyResetAt: Date?) {
         let wasShowingSkeleton = skeletonShownAt != nil
         skeletonShownAt = nil
 
         // Skip full rebuild if the data hasn't changed (unless transitioning
         // from skeleton) — avoids layout churn that causes popover flicker.
-        if !wasShowingSkeleton && sections == lastSections {
+        if !wasShowingSkeleton
+            && sections == lastSections
+            && forecastsEqual(sessionForecast, lastSessionForecast)
+            && forecastsEqual(weeklyForecast, lastWeeklyForecast) {
             return
         }
         lastSections = sections
+        lastSessionForecast = sessionForecast
+        lastWeeklyForecast = weeklyForecast
+        lastSessionResetAt = sessionResetAt
+        lastWeeklyResetAt = weeklyResetAt
 
         stackView.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        countdownTicker.clearRegistrations()
 
         if sections.isEmpty {
             let empty = makeLabel("No usage data available", size: 13, color: NSColor(white: 0.5, alpha: 1))
             stackView.addArrangedSubview(empty)
             return
+        }
+
+        // Headline (burn-rate / ETA). Hidden when we don't have forecasts yet
+        // (first scrape after launch), so the skeleton-to-content transition
+        // doesn't pop a half-empty header in.
+        let sessionPct = sessionPercentage(in: sections) ?? 0
+        let weeklyPct = weeklyPercentageForHeadline(in: sections) ?? 0
+        // Only render the headline if at least one forecast has a real ETA.
+        // Showing "gathering data..." prominently on a fresh launch reads as a
+        // glitch; let the meters speak for themselves until we can predict.
+        let sessionHasETA = sessionForecast?.state == .ok
+        let weeklyHasETA = weeklyForecast?.state == .ok
+        if sessionHasETA || weeklyHasETA {
+            let headline = HeadlineView(
+                sessionForecast: sessionForecast,
+                weeklyForecast: weeklyForecast,
+                sessionPct: sessionPct,
+                weeklyPct: weeklyPct,
+                sessionResetAt: sessionResetAt,
+                weeklyResetAt: weeklyResetAt
+            )
+            stackView.addArrangedSubview(headline)
+            stackView.setCustomSpacing(8, after: headline)
         }
 
         for (i, section) in sections.enumerated() {
@@ -1070,9 +2263,18 @@ class UsageContentView: NSView {
                 stackView.setCustomSpacing(6, after: divider)
             }
 
-            // Section title
+            // Section title. The "plan usage" section gets the resolved plan
+            // tier appended (e.g. "PLAN USAGE LIMITS - Pro").
             if !section.title.isEmpty {
-                let title = makeLabel(section.title.uppercased(), size: 10, weight: .semibold,
+                let upper = section.title.uppercased()
+                let isPlanSection = section.title.lowercased().contains("plan")
+                let titleText: String
+                if isPlanSection, let tier = planTierDisplayName, !tier.isEmpty {
+                    titleText = "\(upper) - \(tier.uppercased())"
+                } else {
+                    titleText = upper
+                }
+                let title = makeLabel(titleText, size: 10, weight: .semibold,
                                       color: NSColor(white: 0.5, alpha: 1))
                 title.allowsDefaultTighteningForTruncation = true
                 stackView.addArrangedSubview(title)
@@ -1094,9 +2296,20 @@ class UsageContentView: NSView {
             }
         }
 
-        stackView.layoutSubtreeIfNeeded()
-        let fittingHeight = stackView.fittingSize.height
-        onContentSizeChanged?(fittingHeight)
+        // Initial measurement is unreliable: at first doUpdate the scrollView
+        // hasn't been given its real width yet, so labels can't compute wrapped
+        // heights and fittingSize under-reports. Report the best we have now,
+        // then re-measure on the next runloop tick once layout has settled
+        // and again after a brief delay (enough for the popover resize
+        // animation to bring the scrollView width up).
+        emitContentSize(label: "initial")
+        DispatchQueue.main.async { [weak self] in
+            self?.emitContentSize(label: "post-layout")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.emitContentSize(label: "post-animation")
+            self?.applyPendingScrollToTopIfNeeded()
+        }
     }
 
     // MARK: - Loading Skeleton
@@ -1105,6 +2318,15 @@ class UsageContentView: NSView {
         skeletonShownAt = Date()
         stackView.arrangedSubviews.forEach { $0.removeFromSuperview() }
         let barWidth: CGFloat = 368
+
+        // Headline skeleton — two stacked rows matching HeadlineView layout
+        // so the v1.5 fade-in lines up cleanly when real data lands.
+        let headlineRow1 = makeShimmerBar(width: 180, height: 14)
+        stackView.addArrangedSubview(headlineRow1)
+        stackView.setCustomSpacing(4, after: headlineRow1)
+        let headlineRow2 = makeShimmerBar(width: 220, height: 14)
+        stackView.addArrangedSubview(headlineRow2)
+        stackView.setCustomSpacing(8, after: headlineRow2)
 
         // Simulate 2 sections with 2 meters each
         for section in 0..<2 {
@@ -1208,19 +2430,38 @@ class UsageContentView: NSView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.distribution = .fill
+        row.alignment = .firstBaseline
+        row.spacing = 4
         row.translatesAutoresizingMaskIntoConstraints = false
         row.widthAnchor.constraint(equalToConstant: barWidth).isActive = true
 
         let name = makeLabel(meter.label.isEmpty ? "Usage" : meter.label, size: 13, weight: .medium, color: .white)
         name.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(name)
+
+        // Flame icon for the current-session meter when we're in peak hours.
+        let isCurrentSession = meter.label.lowercased().contains("current session")
+        if isCurrentSession && AppDelegate.isInPeakWindow() {
+            let flame = NSImageView()
+            let cfg = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+            let img = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "peak hours")?
+                .withSymbolConfiguration(cfg)
+            flame.image = img
+            flame.contentTintColor = NSColor(red: 0xc0/255.0, green: 0x5e/255.0, blue: 0x1a/255.0, alpha: 1)
+            flame.translatesAutoresizingMaskIntoConstraints = false
+            flame.setContentHuggingPriority(.required, for: .horizontal)
+            flame.setContentCompressionResistancePriority(.required, for: .horizontal)
+            flame.toolTip = Self.peakTooltipPublic()
+            countdownTicker.registerFlame(flame)
+            row.addArrangedSubview(flame)
+        }
 
         let pct = makeLabel("\(meter.percentage)%", size: 13, weight: .medium,
                             color: colorForPercentage(meter.percentage))
         pct.alignment = .right
         pct.setContentHuggingPriority(.required, for: .horizontal)
-
-        row.addArrangedSubview(name)
         row.addArrangedSubview(pct)
+
         stackView.addArrangedSubview(row)
         stackView.setCustomSpacing(4, after: row)
 
@@ -1249,15 +2490,47 @@ class UsageContentView: NSView {
 
         stackView.addArrangedSubview(track)
 
-        // Detail
-        if !meter.detail.isEmpty {
+        // Detail / countdown. When detail is reset-related and we have a
+        // parsed resetAt, suppress the static row and let the live countdown
+        // absorb it with a synthesized "Resets <time>" prefix derived from
+        // resetAt itself. The prefix horizon scales: time-only within 24h,
+        // weekday+time within a week, month+day beyond. Non-reset details
+        // render statically as before.
+        let lowerDetail = meter.detail.lowercased()
+        let detailIsReset = lowerDetail.hasPrefix("resets")
+        let suppressDetail = detailIsReset && meter.resetAt != nil
+        if !meter.detail.isEmpty && !suppressDetail {
             stackView.setCustomSpacing(2, after: track)
             let detail = makeLabel(meter.detail, size: 11, color: NSColor(white: 0.45, alpha: 1))
             stackView.addArrangedSubview(detail)
-            stackView.setCustomSpacing(6, after: detail)
+            stackView.setCustomSpacing(2, after: detail)
         } else {
-            stackView.setCustomSpacing(6, after: track)
+            stackView.setCustomSpacing(2, after: track)
         }
+
+        if let resetAt = meter.resetAt {
+            let countdown = makeLabel("", size: 10, color: NSColor(white: 0.45, alpha: 1))
+            countdown.isHidden = true
+            stackView.addArrangedSubview(countdown)
+            stackView.setCustomSpacing(6, after: countdown)
+            let isEstimate = meter.detail.isEmpty
+            let prefixOverride = detailIsReset ? Self.formatResetPrefix(resetAt) : nil
+            countdownTicker.register(label: countdown, resetAt: resetAt, isEstimate: isEstimate, prefix: prefixOverride)
+        }
+    }
+
+    private static func formatResetPrefix(_ resetAt: Date, now: Date = Date()) -> String {
+        let remaining = resetAt.timeIntervalSince(now)
+        let f = DateFormatter()
+        if remaining < 24 * 3600 {
+            f.timeStyle = .short
+            f.dateStyle = .none
+        } else if remaining < 7 * 24 * 3600 {
+            f.dateFormat = "EEE h:mm a"
+        } else {
+            f.dateFormat = "MMM d"
+        }
+        return "Resets \(f.string(from: resetAt))"
     }
 
     // MARK: - Status Dot
@@ -1270,6 +2543,50 @@ class UsageContentView: NSView {
 
     func setStatusLoading() {
         statusDot.layer?.backgroundColor = NSColor(red: 0xc0/255.0, green: 0x96/255.0, blue: 0x3a/255.0, alpha: 1).cgColor
+    }
+
+    // MARK: - Countdown Ticker (popover-only)
+
+    func startCountdownTicker() {
+        countdownTicker.start()
+    }
+
+    func stopCountdownTicker() {
+        countdownTicker.stop()
+    }
+
+    private func emitContentSize(label: String) {
+        stackView.layoutSubtreeIfNeeded()
+        let arranged = stackView.arrangedSubviews
+        let subviewHeight = arranged.reduce(0) { $0 + $1.frame.height }
+        let spacingTotal = max(0, CGFloat(arranged.count - 1)) * stackView.spacing
+        let edges = stackView.edgeInsets.top + stackView.edgeInsets.bottom
+        let computedHeight = subviewHeight + spacingTotal + edges
+        let fitting = stackView.fittingSize.height
+        let chosen = max(fitting, computedHeight)
+        NSLog("%@", "[ClaudeMeter] popover sizing(\(label)): fittingSize=\(fitting) computed=\(computedHeight) chosen=\(chosen) scrollW=\(scrollView.bounds.width)")
+        onContentSizeChanged?(chosen)
+    }
+
+    func scrollToTop() {
+        // Latch the request and apply it on the next data-render or runloop tick.
+        // Calling it immediately after popover.show races with the resize-to-fit
+        // animation triggered by onContentSizeChanged, which can leave the
+        // scroll mid-content.
+        pendingScrollToTop = true
+        DispatchQueue.main.async { [weak self] in
+            self?.applyPendingScrollToTopIfNeeded()
+        }
+    }
+
+    fileprivate func applyPendingScrollToTopIfNeeded() {
+        guard pendingScrollToTop, let docView = scrollView.documentView else { return }
+        pendingScrollToTop = false
+        docView.scroll(NSPoint(x: 0, y: docView.bounds.height))
+        scrollView.contentView.scrollToVisible(NSRect(x: 0,
+                                                       y: docView.bounds.height - 1,
+                                                       width: 1, height: 1))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
     // MARK: - Helpers
@@ -1291,6 +2608,308 @@ class UsageContentView: NSView {
         case 80..<95: return NSColor(red: 0xc0/255.0, green: 0x5e/255.0, blue: 0x1a/255.0, alpha: 1)  // deep amber
         default: return NSColor(red: 0xb8/255.0, green: 0x3a/255.0, blue: 0x3a/255.0, alpha: 1)       // muted crimson
         }
+    }
+
+    // MARK: - Headline support helpers
+
+    private func forecastsEqual(_ a: UsageForecast?, _ b: UsageForecast?) -> Bool {
+        switch (a, b) {
+        case (nil, nil): return true
+        case (let x?, let y?):
+            // Date equality on minute granularity is fine; second-level drift
+            // would otherwise rebuild the popover on every scrape.
+            let etaSame: Bool
+            switch (x.etaDate, y.etaDate) {
+            case (nil, nil): etaSame = true
+            case (let dx?, let dy?): etaSame = abs(dx.timeIntervalSince(dy)) < 60
+            default: etaSame = false
+            }
+            return x.state == y.state && etaSame
+        default: return false
+        }
+    }
+
+    private func sessionPercentage(in sections: [UsageSection]) -> Int? {
+        for section in sections {
+            for meter in section.meters where meter.label.lowercased().contains("current session") {
+                return meter.percentage
+            }
+        }
+        return nil
+    }
+
+    private func weeklyPercentageForHeadline(in sections: [UsageSection]) -> Int? {
+        for section in sections where section.title.lowercased().contains("weekly") {
+            for meter in section.meters {
+                let l = meter.label.lowercased()
+                if l == "weekly" || l == "weekly usage" || l.hasPrefix("weekly usage") {
+                    return meter.percentage
+                }
+            }
+            if let first = section.meters.first { return first.percentage }
+        }
+        return nil
+    }
+}
+
+// MARK: - Countdown Ticker
+// 1Hz timer for live "resets in Xh Ym" countdown labels and the peak-window
+// flame tooltip. Only ticks while the popover is visible (battery requirement);
+// AppDelegate.togglePopover starts it and AppDelegate.popoverDidClose stops it.
+
+final class CountdownTicker {
+    private struct Entry {
+        weak var label: NSTextField?
+        let resetAt: Date
+        let isEstimate: Bool
+        let prefix: String?
+    }
+
+    private var entries: [Entry] = []
+    private var flames: [Weak<NSImageView>] = []
+    private var timer: Timer?
+
+    private struct Weak<T: AnyObject> { weak var value: T? }
+
+    func register(label: NSTextField, resetAt: Date, isEstimate: Bool, prefix: String? = nil) {
+        entries.append(Entry(label: label, resetAt: resetAt, isEstimate: isEstimate, prefix: prefix))
+    }
+
+    func registerFlame(_ flame: NSImageView) {
+        flames.append(Weak(value: flame))
+    }
+
+    func clearRegistrations() {
+        entries.removeAll()
+        flames.removeAll()
+    }
+
+    func start() {
+        timer?.invalidate()
+        tick()
+        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+        t.tolerance = 0.2
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func tick() {
+        let now = Date()
+        var anyAlive = false
+        for entry in entries {
+            guard let label = entry.label else { continue }
+            anyAlive = true
+            apply(label: label, resetAt: entry.resetAt, isEstimate: entry.isEstimate, prefixOverride: entry.prefix, now: now)
+        }
+        let tooltip = AppDelegate.isInPeakWindow(now: now)
+            ? UsageContentView.peakTooltipPublic(now: now)
+            : nil
+        for ref in flames {
+            guard let flame = ref.value else { continue }
+            anyAlive = true
+            flame.toolTip = tooltip
+        }
+        // Self-prune dead refs so a long-running session doesn't accumulate.
+        entries.removeAll { $0.label == nil }
+        flames.removeAll { $0.value == nil }
+        // Auto-stop if everything has been deallocated. Defensive only;
+        // popoverDidClose is the canonical stop site.
+        if !anyAlive {
+            stop()
+        }
+    }
+
+    private func apply(label: NSTextField, resetAt: Date, isEstimate: Bool, prefixOverride: String?, now: Date) {
+        let remaining = resetAt.timeIntervalSince(now)
+        let amber = NSColor(red: 0xc9/255.0, green: 0x9a/255.0, blue: 0x2e/255.0, alpha: 1)
+        let dim = NSColor(white: 0.45, alpha: 1)
+        // When the upstream detail already gives an absolute marker
+        // ("Resets Tue 11:00 PM", "Resets Jun 1"), preserve it and append the
+        // live duration: "Resets Tue 11:00 PM, in 4d 9h". Otherwise fall back
+        // to the lone "resets in Xh Ym" form.
+        let prefix: String
+        if let p = prefixOverride, !p.isEmpty {
+            prefix = "\(p), in "
+        } else {
+            prefix = isEstimate ? "resets in ~" : "resets in "
+        }
+
+        if remaining <= 0 {
+            // Reset already passed. Stay hidden until the next scrape supplies
+            // a fresh resetAt; the row was previously visible only while live.
+            label.isHidden = true
+            return
+        }
+        if remaining <= 60 {
+            label.stringValue = "resetting\u{2026}"
+            label.textColor = amber
+            label.isHidden = false
+            return
+        }
+        if remaining <= 600 {
+            let secs = Int(remaining.rounded())
+            label.stringValue = "\(prefix)\(secs)s"
+            label.textColor = amber
+            label.isHidden = false
+            return
+        }
+        if remaining <= 60 * 60 {
+            let mins = Int(remaining / 60)
+            label.stringValue = "\(prefix)\(mins)m"
+            label.textColor = dim
+            label.isHidden = false
+            return
+        }
+        if remaining > 24 * 3600 {
+            let days = Int(remaining / (24 * 3600))
+            let hours = (Int(remaining) % (24 * 3600)) / 3600
+            label.stringValue = "\(prefix)\(days)d \(hours)h"
+            label.textColor = dim
+            label.isHidden = false
+            return
+        }
+        let hours = Int(remaining / 3600)
+        let mins = (Int(remaining) % 3600) / 60
+        label.stringValue = "\(prefix)\(hours)h \(mins)m"
+        label.textColor = dim
+        label.isHidden = false
+    }
+}
+
+extension UsageContentView {
+    static func peakTooltipPublic(now: Date = Date()) -> String {
+        let remaining = AppDelegate.peakWindowRemaining(now: now) ?? 0
+        let hours = Int(remaining) / 3600
+        let mins = (Int(remaining) % 3600) / 60
+        return "Peak window in PT. Expect faster session burn until 11am PT (\(hours)h \(mins)m)."
+    }
+}
+
+// MARK: - Headline View (burn-rate + ETA-to-limit)
+
+private final class HeadlineView: NSStackView {
+    init(sessionForecast: UsageForecast?,
+         weeklyForecast: UsageForecast?,
+         sessionPct: Int,
+         weeklyPct: Int,
+         sessionResetAt: Date?,
+         weeklyResetAt: Date?) {
+        super.init(frame: .zero)
+        orientation = .vertical
+        alignment = .leading
+        spacing = 4
+        translatesAutoresizingMaskIntoConstraints = false
+
+        let row1 = Self.makeRow(prefix: "out at ",
+                                forecast: sessionForecast,
+                                pct: sessionPct,
+                                resetAt: sessionResetAt,
+                                kind: .session)
+        let row2 = Self.makeRow(prefix: "hits weekly cap ",
+                                forecast: weeklyForecast,
+                                pct: weeklyPct,
+                                resetAt: weeklyResetAt,
+                                kind: .weekly)
+        addArrangedSubview(row1)
+        addArrangedSubview(row2)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private enum Kind { case session, weekly }
+
+    private static func makeRow(prefix: String,
+                                forecast: UsageForecast?,
+                                pct: Int,
+                                resetAt: Date?,
+                                kind: Kind) -> NSStackView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.distribution = .fill
+        row.alignment = .firstBaseline
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: 368).isActive = true
+
+        let attributed = NSMutableAttributedString()
+        let baseFont = NSFont.systemFont(ofSize: 17, weight: .semibold)
+        let baseColor = NSColor.white
+        let dimColor = NSColor(white: 0.55, alpha: 1)
+        let redColor = NSColor(red: 0xb8/255.0, green: 0x3a/255.0, blue: 0x3a/255.0, alpha: 1)
+
+        guard let f = forecast else {
+            attributed.append(NSAttributedString(
+                string: "gathering data\u{2026}",
+                attributes: [.font: baseFont, .foregroundColor: dimColor]))
+            let text = NSTextField(labelWithAttributedString: attributed)
+            text.lineBreakMode = .byTruncatingTail
+            text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            row.addArrangedSubview(text)
+            return row
+        }
+
+        switch f.state {
+        case .insufficientData:
+            attributed.append(NSAttributedString(
+                string: "gathering data\u{2026}",
+                attributes: [.font: baseFont, .foregroundColor: dimColor]))
+        case .idle:
+            attributed.append(NSAttributedString(
+                string: "no recent activity",
+                attributes: [.font: baseFont, .foregroundColor: dimColor]))
+        case .willNotExhaust:
+            attributed.append(NSAttributedString(
+                string: kind == .session ? "session won\u{2019}t hit limit" : "won\u{2019}t hit weekly cap",
+                attributes: [.font: baseFont, .foregroundColor: dimColor]))
+        case .ok:
+            attributed.append(NSAttributedString(
+                string: prefix,
+                attributes: [.font: baseFont, .foregroundColor: baseColor]))
+            let stamp = formatETA(f.etaDate, kind: kind)
+            let etaColor: NSColor
+            if let eta = f.etaDate, let reset = resetAt, eta < reset {
+                etaColor = redColor
+            } else {
+                etaColor = baseColor
+            }
+            attributed.append(NSAttributedString(
+                string: stamp,
+                attributes: [.font: baseFont, .foregroundColor: etaColor]))
+        }
+
+        let text = NSTextField(labelWithAttributedString: attributed)
+        text.lineBreakMode = .byTruncatingTail
+        text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(text)
+
+        let pctLabel = NSTextField(labelWithString: "\(pct)%")
+        pctLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        pctLabel.textColor = dimColor
+        pctLabel.alignment = .right
+        pctLabel.setContentHuggingPriority(.required, for: .horizontal)
+        row.addArrangedSubview(pctLabel)
+        return row
+    }
+
+    private static func formatETA(_ date: Date?, kind: Kind) -> String {
+        guard let date = date else { return "?" }
+        let cal = Calendar.current
+        let df = DateFormatter()
+        df.locale = Locale.current
+        let sameDay = cal.isDate(date, inSameDayAs: Date())
+        df.dateFormat = (kind == .session && sameDay) ? "h:mma" : "EEE h:mma"
+        var s = df.string(from: date).lowercased()
+        // Compact "3:42pm" -> "3:42p" so the headline stays scannable.
+        if s.hasSuffix("am") || s.hasSuffix("pm") {
+            s = String(s.dropLast())
+        }
+        return s
     }
 }
 

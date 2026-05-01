@@ -4,6 +4,59 @@ Quick reference for AI assistants continuing work on this project.
 
 ## Release History
 
+### v2.4
+
+- **Plan tier in section header**: the first section title now reads `PLAN USAGE LIMITS - MAX 20X` (or `- PRO`, `- TEAM`, `- ENTERPRISE`, etc.). The slug is read from `rate_limit_tier` on the `/api/organizations` response (top-level on each org, not nested under `settings`), mapped to a friendly display name, and persisted in UserDefaults. Unknown future tiers fall back to a titlecased stem.
+- **Proactive plan-tier fetch**: a new `refreshPlanTierIfNeeded` runs ~4s after launch and is independent of the usage JSON path, so the chip populates even when the JSON circuit breaker is open.
+- **Combined countdown row**: the static "Resets ..." detail and the live countdown are collapsed into one row, e.g. `Resets Tue 11:00 PM, in 4d 9h` or `Resets Jun 1, in 30d 10h`. The "Resets ..." prefix is synthesized from the parsed `resetAt` and scales by horizon (time-only within 24h, weekday+time within a week, month+day beyond).
+- **Headline hidden until predictable**: "gathering data..." no longer renders on fresh launch; the ETA headline only appears once a forecast has a real ETA, so the popover does not look like it is glitching while history accrues.
+- **Reset parser improvements**: `parseClaudeReset` now combines hours and minutes when both appear ("Resets in 4 hr 11 min" anchors at 4h11m, not 4h flat) and handles month+day forms ("Jun 1", "January 5") used by billing-style resets.
+- **Estimator scoped to known cadences**: `applyResetEstimates` only applies the 5h/7d firstSeen fallback to "Current session" and "Weekly" meters. Other meters (Extra usage, All models, Sonnet only) keep their countdown row hidden when the detail string cannot be parsed, avoiding wrong short-horizon countdowns.
+- **Long-duration formatting**: countdowns longer than 24 hours render as `Nd Mh` instead of `105h 31m`.
+- **Popover height**: the resize ceiling is now `max(1200, screen.visibleFrame.height - 40)` so taller content fits, with deferred re-measurements (initial, post-layout, post-animation) to work around `fittingSize` under-reporting before the scrollView's real width has settled. The popover also auto-scrolls to the top on every open and re-snaps after each fresh data render.
+- **JSON empty falls through to DOM**: when the JSON path returns zero meters (shape mismatch or auth-soft-fail), the coordinator now invokes the DOM scrape instead of feeding the empty result into the empty-streak gate. Counts toward the same circuit breaker as JSON errors.
+- **Cookie copy fix**: `copyCookiesToSession` was previously using `sharedCookieStorage(forGroupContainerIdentifier:)`, which silently fails without an app-group entitlement. It now uses the ephemeral session's own in-memory storage and explicitly seeds it from the WKWebView cookie store, so JSON requests actually carry auth.
+- **Internal**: new diagnostic logs (`copyCookiesToSession: attached N cookies`, `discoverOrgUUID got N orgs`, `plan tier resolved: <slug>`) make field issues with the JSON path traceable from stderr alone.
+
+### v2.3
+
+- **Live reset countdown**: each meter now shows a small "resets in 2h 14m" line directly under its detail row, updated once per second while the popover is open. Format adapts to remaining time: `Xh Ym` (over an hour), `Xm` (under an hour), `Xs` in amber (under 10 min), and `resetting...` in amber (under a minute). Hidden entirely when no `resetAt` is available, and hidden again after the reset fires until the next scrape supplies a fresh value.
+- **Peak-hour flame indicator**: a small flame icon appears next to the "Current session" meter label when the local clock falls inside Anthropic's peak-hour window (Mon-Fri, 5 to 11 AM Pacific). The icon's tooltip shows how much of the window is left and is refreshed every second so the remaining time stays current.
+- **Peak window definition:** Mon-Fri 5 to 11 AM Pacific. Stored as a single `peakWindow` constant near the top of `AppDelegate`; update there if Anthropic shifts it. DST is handled automatically because the check uses `TimeZone(identifier: "America/Los_Angeles")`.
+- **`UsageMeter.resetAt`**: the data model now carries a parsed reset `Date?` per meter. The JSON path populates it directly from the `resets_at` field (ISO-8601, with a fall-through to the v2.1 string parser); the DOM path parses from `meter.detail` first, then falls back to a persisted "first seen" anchor in UserDefaults plus a 5h (session) or 7d (weekly) window. The first DOM scrape after launch with no anchor stores `Date()` and tags the countdown with a leading `~` to signal an estimate.
+- **Battery-respecting ticker**: a single 1Hz `Timer` lives inside `UsageContentView` and is started from `togglePopover` and stopped from `popoverDidClose`, so the ticker is dormant whenever the popover is hidden. Tolerance `0.2`, common run-loop mode. The unified refresh timer is unchanged; no third refresh path was added.
+- **Internal**: new L1 static-audit checks enforce a single `peakWindow` struct definition and a `popoverDidClose` that stops the countdown ticker (battery regression guard).
+
+### v2.2
+
+- **Threshold notifications**: macOS user notifications fire when session or weekly usage crosses 50%, 75%, or 90%. Notifications are time-sensitive (so Focus modes won't suppress them by default), include a "Snooze rest of cycle" action, and are off by default to respect user privacy. Authorization is requested lazily on the first fire, never on launch.
+- **Per-threshold mute toggles**: a new "Notifications" submenu in the right-click menu exposes a master enable toggle plus six per-threshold checkboxes (Session 50/75/90%, Weekly 50/75/90%) so users can opt out of any subset without disabling notifications globally.
+- **Idempotent, anti-flap fire logic**: each `(scope, threshold, cycleKey)` tuple fires at most once per cycle. The "fired" flag is set BEFORE the notification is dispatched, so concurrent scrape evaluations can't double-fire, and percentage drops back below a threshold do not re-arm it (only a new cycle does).
+- **Cycle-boundary detection**: cycle keys are derived from the parsed reset timestamp (via the v2.1 `Date.parseClaudeReset` helper) when available; an in-defaults rolling anchor (5h session, 7d weekly) is used when the detail string is missing or unparseable.
+- **Snooze action**: tapping "Snooze rest of cycle" on any notification suppresses all further thresholds for that scope until the next cycle; once the cycle key changes, snooze and fired flags effectively reset.
+- **Single evaluation seam**: notifier evaluation runs exactly once per successful scrape, gated by the same `distributeFetchResult` funnel that owns history append and view update. No additional timers; no risk of rogue evaluations.
+- **Internal**: stale `notif.fired.*`, `notif.snoozed.*`, and `notif.lastPct.*` UserDefaults keys are pruned on init when their embedded cycle timestamp is older than 14 days, keeping the plist bounded.
+- **Internal**: new L1 static-audit checks enforce no consent-on-launch regression, a single evaluation callsite, paired idempotency guards on every `notif.fired.*` write, presence of `interruptionLevel = .timeSensitive`, and no `NSUserNotification` (deprecated) usage.
+
+### v2.1
+
+- **Burn-rate + ETA-to-limit headline**: the popover now leads with two big-text rows ("out at 3:42p" for the session, "hits weekly cap Wed 9a" for the weekly cap), with the raw % demoted to a small secondary number on the right. The ETA timestamp turns red when the projected exhaustion lands before the next reset, white otherwise. Per-meter percentages in the section list stay untouched.
+- **EWMA burn-rate model**: rate is computed as an exponentially weighted moving average (alpha = 0.3) over inter-sample slopes (% per hour). Session forecast looks at the last 30 min of samples; weekly forecast uses the full 24h retention window. ETA is `now + (100 - currentPct) / rate`, clamped to the next reset.
+- **Sample history with disk persistence**: every successful scrape appends a `(timestamp, sessionPct, weeklyPct)` sample to a 24h ring buffer, persisted (throttled to once per 30s) to `~/Library/Application Support/ClaudeMeter/history.json`. This is the first on-disk file the app writes; the directory is created lazily.
+- **Reset-time parsing**: a new `Date.parseClaudeReset(_:)` helper converts strings like "Resets at 3:42pm", "Resets Wed 9am", and "Resets in 2h" into absolute Date values. Falls back to `now + 5h` (session) or next Monday 00:00 local (weekly) when the string is missing or unparseable.
+- **Noise-floor states**: the headline shows "gathering data..." until at least 3 samples spanning the minimum window land; "no recent activity" when the smoothed rate is at or below 0.05 %/hr; and "won't hit weekly cap" / "session won't hit limit" when the projected ETA lands past the reset.
+- **Skeleton parity**: the loading skeleton now includes two shimmer rows above the section list so the v1.5 fade-in stays aligned with the new headline.
+
+### v2.0
+
+- **JSON-primary fetch path with DOM-scrape fallback**: usage data now comes from the undocumented `/api/organizations/{uuid}/usage` endpoint when available, falling back to the existing DOM scrape when JSON is disabled, errored, or its in-memory circuit breaker has tripped. Both paths funnel through a single distribution gate so popover, badge, empty-streak detection, and telemetry are unchanged from the consumer's perspective.
+- **Lazy org UUID discovery**: first JSON attempt with no cached UUID hits `/api/organizations`, prefers an org whose capabilities include `claude_pro`/`claude_max`, and caches the result in UserDefaults. 401/403/404 from the usage endpoint invalidates the cache so the next attempt rediscovers.
+- **Cookie bridging**: per-call URLSession is built from a snapshot of all WKWebView cookies, so the JSON request rides the same authenticated session as the page itself.
+- **Rollback switch**: `defaults write com.local.ClaudeMeter forceDOMOnly -bool YES` skips the JSON path entirely. No restart needed.
+- **Soft circuit breaker**: 5 consecutive JSON failures silently degrade to DOM-only for the session; reset on relaunch.
+- **Centralized fetch telemetry**: every fetch logs `[ClaudeMeter] fetch path=json|dom outcome=success|empty|error detail=...` via `logFetchOutcome`, mirroring the `setBadgeTitle` convention so the QA pipeline can verify path/outcome transitions from stderr alone.
+- **Internal**: new L2.5 QA layer validates `UsageAPIResponse` normalization against a sample API response, in addition to the existing DOM-contract check.
+
 ### v1.9
 
 - **Fixed badge stuck at stale value** (regression from v1.8): the menu bar percentage now updates reliably even when the page's structured scrape can't produce a clean "Current session" label, by falling back to a dedicated XPath scrape

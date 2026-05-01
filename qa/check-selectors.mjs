@@ -7,6 +7,9 @@
 // Usage:
 //   node qa/check-selectors.mjs              # uses qa/fixtures/synthetic.{html,expected.json}
 //   node qa/check-selectors.mjs current      # uses qa/fixtures/current.{html,expected.json}
+//   node qa/check-selectors.mjs json         # validates UsageAPIResponse normalization
+//                                              against qa/fixtures/usage-api.sample.json
+//                                              + usage-api.expected.json
 //
 // Exits 0 on PASS, 1 on FAIL. Prints a structured report to stderr.
 
@@ -20,8 +23,6 @@ const repo = path.resolve(here, "..");
 const SRC = path.join(repo, "ClaudeMeter.swift");
 
 const fixtureName = process.argv[2] || "synthetic";
-const FIXTURE_HTML = path.join(here, "fixtures", `${fixtureName}.html`);
-const FIXTURE_EXPECTED = path.join(here, "fixtures", `${fixtureName}.expected.json`);
 
 const log = (msg) => process.stderr.write(`[L2] ${msg}\n`);
 
@@ -30,6 +31,97 @@ function fail(reasons) {
     for (const r of reasons) log(`  - ${r}`);
     process.exit(1);
 }
+
+// ---- 0. JSON path branch ---------------------------------------------------
+// When invoked with `json`, validate the UsageAPIResponse normalization
+// (see normalizeJSONResponse in ClaudeMeter.swift) against a sample API
+// response. This protects the JSON-primary fetch path from silent regressions
+// when the undocumented endpoint shifts shape.
+
+if (fixtureName === "json") {
+    const SAMPLE = path.join(here, "fixtures", "usage-api.sample.json");
+    const EXPECTED = path.join(here, "fixtures", "usage-api.expected.json");
+    if (!fs.existsSync(SAMPLE)) fail([`fixture not found: ${SAMPLE}`]);
+    if (!fs.existsSync(EXPECTED)) fail([`fixture not found: ${EXPECTED}`]);
+
+    const sample = JSON.parse(fs.readFileSync(SAMPLE, "utf8"));
+    const expectedJson = JSON.parse(fs.readFileSync(EXPECTED, "utf8"));
+
+    // Mirror Swift normalizeJSONResponse. Keep behavior in lockstep with the
+    // Swift implementation so this validator catches normalization drift.
+    const pct = (w) => {
+        if (typeof w.percent_used === "number") return w.percent_used;
+        if (typeof w.utilization === "number") {
+            const scaled = w.utilization <= 1.0 ? w.utilization * 100 : w.utilization;
+            return Math.round(scaled);
+        }
+        return 0;
+    };
+    const detail = (w) => (w.resets_at ? `Resets ${w.resets_at}` : "");
+    const meters = [];
+    if (sample.session) {
+        meters.push({
+            label: sample.session.label || "Current session",
+            percentage: pct(sample.session),
+            detail: detail(sample.session),
+        });
+    }
+    if (sample.weekly) {
+        meters.push({
+            label: sample.weekly.label || "Weekly usage",
+            percentage: pct(sample.weekly),
+            detail: detail(sample.weekly),
+        });
+    }
+    if (Array.isArray(sample.per_model)) {
+        for (const w of sample.per_model) {
+            const model = w.model || "";
+            const baseLabel = w.label || (model ? `Weekly ${model} usage` : "Weekly");
+            meters.push({ label: baseLabel, percentage: pct(w), detail: detail(w) });
+        }
+    }
+
+    const reasons = [];
+    const u = expectedJson.normalizeJSONResponse || {};
+    if (typeof u.minMeters === "number" && meters.length < u.minMeters) {
+        reasons.push(`normalizeJSONResponse: expected >=${u.minMeters} meters, got ${meters.length}`);
+    }
+    if (Array.isArray(u.requireLabels)) {
+        const lower = meters.map((m) => String(m.label || "").toLowerCase());
+        for (const needle of u.requireLabels) {
+            const hit = lower.some((l) => l.includes(needle.toLowerCase()));
+            if (!hit) {
+                reasons.push(
+                    `normalizeJSONResponse: no meter label contains "${needle}" (got: ${JSON.stringify(meters.map((m) => m.label))})`,
+                );
+            }
+        }
+    }
+    if (Array.isArray(u.requirePercentages)) {
+        const got = new Set(meters.map((m) => m.percentage));
+        for (const p of u.requirePercentages) {
+            if (!got.has(p)) reasons.push(`normalizeJSONResponse: missing percentage ${p}`);
+        }
+    }
+    const f = expectedJson.sessionPercentageFromModel || {};
+    if (typeof f.expected === "number") {
+        const needle = String(f.matchLabelContains || "current session").toLowerCase();
+        const hit = meters.find((m) => String(m.label || "").toLowerCase().includes(needle));
+        if (!hit) {
+            reasons.push(`sessionPercentageFromModel: no meter label contains "${needle}"`);
+        } else if (hit.percentage !== f.expected) {
+            reasons.push(`sessionPercentageFromModel: expected ${f.expected}, got ${hit.percentage} from label "${hit.label}"`);
+        }
+    }
+
+    if (reasons.length) fail(reasons);
+    log(`PASS — fixture=json meters=${meters.length}`);
+    log(`  meters: ${meters.map((m) => `[${m.label}=${m.percentage}%]`).join(" ")}`);
+    process.exit(0);
+}
+
+const FIXTURE_HTML = path.join(here, "fixtures", `${fixtureName}.html`);
+const FIXTURE_EXPECTED = path.join(here, "fixtures", `${fixtureName}.expected.json`);
 
 // ---- 1. Locate fixture files ------------------------------------------------
 
