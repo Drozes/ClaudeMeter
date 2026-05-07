@@ -73,7 +73,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     var jsonFetchInFlight: Bool = false
     var jsonConsecutiveFailures: Int = 0
     var jsonCircuitOpen: Bool = false
+    var jsonCircuitOpenedAt: Date?
     static let jsonFailureCircuitBreaker = 5
+    // Background WebView is process-suspended when the popover is closed, so a
+    // permanently-open JSON circuit means DOM scrapes return stale page data
+    // until the next ~hourly full reload. Auto-reset gives JSON another shot.
+    static let jsonCircuitResetInterval: TimeInterval = 30 * 60
 
     static let showBadgeKey = "showMenuBarBadge"
     var showMenuBarBadge: Bool = UserDefaults.standard.bool(forKey: AppDelegate.showBadgeKey) {
@@ -850,6 +855,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             }
         }
 
+        // Skip the in-page Refresh-button click when JSON is the active path:
+        // JSON hits Anthropic's API directly and doesn't depend on the page's
+        // own React state, so the click + 1.5s wait is dead weight (and the
+        // button selector is currently brittle, returning 'not_found').
+        let lastPath = UserDefaults.standard.string(forKey: Self.lastFetchPathKey) ?? ""
+        if lastPath == "json" && !jsonCircuitOpen {
+            lastRefreshDate = Date()
+            scrapeAndDistribute()
+            return
+        }
+
         let js = """
         (function() {
             var btns = document.querySelectorAll('button');
@@ -981,6 +997,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     /// so callers see a uniform interface regardless of which path succeeded.
     func scrapeAndDistribute() {
         let forceDOM = UserDefaults.standard.bool(forKey: Self.forceDOMOnlyKey)
+        // Auto-reset a stale circuit so JSON gets periodic re-attempts. The
+        // circuit re-opens on its own if 5 fresh failures recur.
+        if jsonCircuitOpen, let openedAt = jsonCircuitOpenedAt,
+           Date().timeIntervalSince(openedAt) >= Self.jsonCircuitResetInterval {
+            NSLog("%@", "[ClaudeMeter] json circuit auto-reset after \(Int(Self.jsonCircuitResetInterval/60))min cooldown")
+            jsonCircuitOpen = false
+            jsonConsecutiveFailures = 0
+            jsonCircuitOpenedAt = nil
+        }
         if forceDOM || jsonCircuitOpen {
             let reason = forceDOM ? "forceDOMOnly=true" : "json circuit open"
             logFetchOutcome(path: "dom", outcome: "selected", detail: reason)
@@ -1001,7 +1026,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                     self.logFetchOutcome(path: "json", outcome: "empty", detail: "n=0 failures=\(self.jsonConsecutiveFailures), falling through to DOM")
                     if self.jsonConsecutiveFailures >= Self.jsonFailureCircuitBreaker && !self.jsonCircuitOpen {
                         self.jsonCircuitOpen = true
-                        NSLog("%@", "[ClaudeMeter] json circuit breaker tripped after \(self.jsonConsecutiveFailures) consecutive empty/error responses, falling back to DOM-only for this session")
+                        self.jsonCircuitOpenedAt = Date()
+                        NSLog("%@", "[ClaudeMeter] json circuit breaker tripped after \(self.jsonConsecutiveFailures) consecutive empty/error responses, falling back to DOM-only (will retry in \(Int(Self.jsonCircuitResetInterval/60))min)")
                     }
                     self.scrapeViaDOM()
                 } else {
@@ -1014,7 +1040,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                 self.logFetchOutcome(path: "json", outcome: "error", detail: "\(err) failures=\(self.jsonConsecutiveFailures)")
                 if self.jsonConsecutiveFailures >= Self.jsonFailureCircuitBreaker && !self.jsonCircuitOpen {
                     self.jsonCircuitOpen = true
-                    NSLog("%@", "[ClaudeMeter] json circuit breaker tripped after \(self.jsonConsecutiveFailures) consecutive failures, falling back to DOM-only for this session")
+                    self.jsonCircuitOpenedAt = Date()
+                    NSLog("%@", "[ClaudeMeter] json circuit breaker tripped after \(self.jsonConsecutiveFailures) consecutive failures, falling back to DOM-only (will retry in \(Int(Self.jsonCircuitResetInterval/60))min)")
                 }
                 self.scrapeViaDOM()
             }
@@ -1442,13 +1469,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         var sessionMeters: [UsageMeter] = []
         var weeklyMeters: [UsageMeter] = []
 
-        if let s = response.session {
+        // Session window: prefer current `five_hour`, fall back to legacy `session`.
+        if let s = response.five_hour ?? response.session {
             let label = s.label ?? "Current session"
             sessionMeters.append(UsageMeter(label: label, percentage: percent(s), detail: detail(s), resetAt: resetDate(s)))
         }
-        if let w = response.weekly {
+        // Weekly aggregate: prefer current `seven_day`, fall back to legacy `weekly`.
+        if let w = response.seven_day ?? response.weekly {
             let label = w.label ?? "Weekly usage"
             weeklyMeters.append(UsageMeter(label: label, percentage: percent(w), detail: detail(w), resetAt: resetDate(w)))
+        }
+        // Per-model weekly windows. Anthropic's current shape splits these into
+        // named keys (`seven_day_opus`, etc.); the older `per_model` array is
+        // honored too for resilience.
+        let perModelWindows: [(model: String, window: UsageAPIResponse.Window?)] = [
+            ("Opus",   response.seven_day_opus),
+            ("Sonnet", response.seven_day_sonnet),
+        ]
+        for (modelName, window) in perModelWindows {
+            guard let w = window else { continue }
+            weeklyMeters.append(UsageMeter(label: "Weekly \(modelName) usage",
+                                            percentage: percent(w), detail: detail(w), resetAt: resetDate(w)))
         }
         if let perModel = response.per_model {
             for w in perModel {
@@ -1542,9 +1583,20 @@ struct UsageAPIResponse: Decodable {
         let resets_at: String?
         let model: String?
     }
+    // Current schema (observed 2026-05-07): per-window fields keyed by name
+    // (`five_hour`, `seven_day`, `seven_day_opus`, etc.). Older code paths used
+    // `session` / `weekly` / `per_model`; left in as Optional for resilience if
+    // Anthropic restores them.
     let session: Window?
     let weekly: Window?
     let per_model: [Window]?
+    let five_hour: Window?
+    let seven_day: Window?
+    let seven_day_opus: Window?
+    let seven_day_sonnet: Window?
+    let seven_day_cowork: Window?
+    let seven_day_omelette: Window?
+    let seven_day_oauth_apps: Window?
 }
 
 struct OrgListResponse: Decodable {
@@ -2375,7 +2427,12 @@ class UsageContentView: NSView {
 
     private func sectionTitleText(for section: UsageSection) -> String {
         let upper = section.title.uppercased()
-        let isPlanSection = section.title.lowercased().contains("plan")
+        // The plan tier (Pro / Max 20x / etc.) gates the session window, so
+        // we render the chip on whichever section header refers to the plan
+        // or session limit. Old DOM-scraped pages used "Plan limits"; the
+        // current JSON normalizer emits "Session limit" — both qualify.
+        let lower = section.title.lowercased()
+        let isPlanSection = lower.contains("plan") || lower.contains("session")
         if isPlanSection, let tier = planTierDisplayName, !tier.isEmpty {
             return "\(upper) - \(tier.uppercased())"
         }
