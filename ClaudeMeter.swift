@@ -44,6 +44,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         let saved = UserDefaults.standard.double(forKey: AppDelegate.badgeIntervalKey)
         return saved > 0 ? saved : 120.0
     }()
+    // v2.7 — track latest session forecast for the menu-bar tooltip.
+    var lastSessionForecast: UsageForecast?
+    var tooltipRefreshTimer: Timer?
+
     // Update checking
     var updateCheckTimer: Timer?
     var updateAvailableVersion: String?
@@ -86,6 +90,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             UserDefaults.standard.set(showMenuBarBadge, forKey: Self.showBadgeKey)
             applyBadgeVisibility()
         }
+    }
+
+    // Default-on prefs (v2.7). Bool-with-explicit-default pattern so users
+    // who upgrade get the new visuals automatically; opting out persists.
+    static let showBurnRateKey = "showBurnRate"
+    static let showSparklineKey = "showSparkline"
+    var showBurnRate: Bool = AppDelegate.boolPref(key: AppDelegate.showBurnRateKey, default: true) {
+        didSet {
+            UserDefaults.standard.set(showBurnRate, forKey: Self.showBurnRateKey)
+            usageView?.showBurnRate = showBurnRate
+        }
+    }
+    var showSparkline: Bool = AppDelegate.boolPref(key: AppDelegate.showSparklineKey, default: true) {
+        didSet {
+            UserDefaults.standard.set(showSparkline, forKey: Self.showSparklineKey)
+            usageView?.showSparkline = showSparkline
+        }
+    }
+    private static func boolPref(key: String, default defaultValue: Bool) -> Bool {
+        if UserDefaults.standard.object(forKey: key) == nil { return defaultValue }
+        return UserDefaults.standard.bool(forKey: key)
     }
 
     // Fallback login window (email/magic-link in WKWebView)
@@ -287,6 +312,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             self?.silentUpdateCheck()
         }
         startUpdateCheckTimer()
+
+        // v2.7 — refresh the menu-bar tooltip every minute so the "at HH:MM"
+        // peak time stays current between scrapes.
+        tooltipRefreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.updateMenuBarTooltip()
+        }
+        tooltipRefreshTimer?.tolerance = 10
     }
 
     // MARK: - Popover
@@ -311,6 +343,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         // Native popover content, sized to skeleton, auto-resizes on content load.
         usageView = UsageContentView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
         usageView.planTierDisplayName = Self.planTierDisplayName(slug: cachedPlanTier)
+        usageView.showBurnRate = showBurnRate
+        usageView.showSparkline = showSparkline
         let skeletonH = usageView.skeletonHeight
 
         let vc = NSViewController()
@@ -567,6 +601,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         badgeIntervalMenuItem = badgeIntervalItem
         menu.addItem(badgeIntervalItem)
 
+        menu.addItem(NSMenuItem.separator())
+        let burnRateItem = NSMenuItem(title: "Show Burn Rate Chip",
+                                       action: #selector(toggleBurnRate(_:)),
+                                       keyEquivalent: "")
+        burnRateItem.target = self
+        burnRateItem.state = showBurnRate ? .on : .off
+        menu.addItem(burnRateItem)
+        let sparklineItem = NSMenuItem(title: "Show 24h Sparkline",
+                                        action: #selector(toggleSparkline(_:)),
+                                        keyEquivalent: "")
+        sparklineItem.target = self
+        sparklineItem.state = showSparkline ? .on : .off
+        menu.addItem(sparklineItem)
+
         let notificationsItem = NSMenuItem(title: "Notifications", action: nil, keyEquivalent: "")
         let notificationsSubmenu = NSMenu()
         notificationThresholdMenuItems.removeAll()
@@ -650,6 +698,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
 
     @objc func sendTestNotification() {
         notifier.sendTestNotification()
+    }
+
+    @objc func toggleBurnRate(_ sender: NSMenuItem) {
+        showBurnRate.toggle()
+        sender.state = showBurnRate ? .on : .off
+    }
+
+    @objc func toggleSparkline(_ sender: NSMenuItem) {
+        showSparkline.toggle()
+        sender.state = showSparkline ? .on : .off
     }
 
     @objc func setBadgeInterval(_ sender: NSMenuItem) {
@@ -984,6 +1042,53 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
     }
 
+    /// v2.7 — Menu-bar tooltip with today's peak / 24h avg / streak,
+    /// computed from `history`. Idempotent and cheap (linear scan over
+    /// at most ~720 samples). Called after every successful scrape and
+    /// from a 1-min refresh tick so the "at HH:MM" timestamp doesn't go
+    /// stale between fetches.
+    func updateMenuBarTooltip() {
+        guard let button = statusItem.button else { return }
+        let samples = history.samples
+        guard !samples.isEmpty else {
+            button.toolTip = "ClaudeMeter — no usage data yet"
+            return
+        }
+
+        // Peak session pct in the last 24h (history is already 24h-bounded).
+        let peak = samples.max { $0.s < $1.s }!
+        let peakDate = Date(timeIntervalSince1970: peak.t)
+        let f = DateFormatter()
+        f.dateFormat = "h:mma"
+        f.amSymbol = "a"; f.pmSymbol = "p"
+        let peakTime = f.string(from: peakDate).lowercased()
+
+        // 24h average session pct (mean of all retained samples).
+        let avg = Int((Double(samples.reduce(0) { $0 + $1.s }) / Double(samples.count)).rounded())
+
+        var lines = ["Peak: \(peak.s)% at \(peakTime) · 24h avg: \(avg)%"]
+
+        // Streak: how many consecutive recent samples were < 90%? Useful as
+        // a "you've been pacing well" signal once history grows.
+        var streak = 0
+        for s in samples.reversed() {
+            if s.s < 90 { streak += 1 } else { break }
+        }
+        if streak >= 5 {
+            lines.append("Streak under 90%: \(streak) samples")
+        }
+
+        if let forecast = lastSessionForecast, case .ok = forecast.state, forecast.ratePerHour >= 0.05 {
+            let rate = forecast.ratePerHour
+            let formatted: String
+            if rate >= 10 { formatted = String(format: "%.0f%%/h", rate) }
+            else { formatted = String(format: "%.1f%%/h", rate) }
+            lines.append("Burn rate: +\(formatted)")
+        }
+
+        button.toolTip = lines.joined(separator: "\n")
+    }
+
     /// Extract the "Current session" percentage from the shared data store.
     func sessionPercentage(from sections: [UsageSection]) -> Int? {
         for section in sections {
@@ -1143,15 +1248,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             now: now
         )
 
+        self.lastSessionForecast = sessionForecast
         self.usageView?.update(
             sections: sections,
             sessionForecast: sessionForecast,
             weeklyForecast: weeklyForecast,
             sessionResetAt: sessionReset,
-            weeklyResetAt: weeklyReset
+            weeklyResetAt: weeklyReset,
+            history: self.history
         )
         self.usageView?.setStatusFresh(true)
         self.updateBadgeFromModel()
+        self.updateMenuBarTooltip()
     }
 
     /// Extract the headline weekly percentage (the unscoped "Weekly" / "Weekly usage"
@@ -2178,7 +2286,33 @@ class UsageContentView: NSView {
                    sessionForecast: lastSessionForecast,
                    weeklyForecast: lastWeeklyForecast,
                    sessionResetAt: lastSessionResetAt,
-                   weeklyResetAt: lastWeeklyResetAt)
+                   weeklyResetAt: lastWeeklyResetAt,
+                   history: lastHistory)
+        }
+    }
+    /// v2.7 — Burn-rate chip visibility. The chip + sparkline are always
+    /// allocated for eligible rows (just hidden when off), so toggling
+    /// re-applies via applyInPlace and skips the doUpdate early-return.
+    var showBurnRate: Bool = true {
+        didSet {
+            guard oldValue != showBurnRate else { return }
+            reapplyVisibilityToRenderedRows()
+        }
+    }
+    var showSparkline: Bool = true {
+        didSet {
+            guard oldValue != showSparkline else { return }
+            reapplyVisibilityToRenderedRows()
+        }
+    }
+    private func reapplyVisibilityToRenderedRows() {
+        guard !lastSections.isEmpty,
+              renderedSections.count == lastSections.count else { return }
+        applyInPlace(sections: lastSections)
+        // Row heights may change (sparkline 22pt; rate-chip negligible);
+        // re-emit so the popover re-fits.
+        DispatchQueue.main.async { [weak self] in
+            self?.emitContentSize(label: "v2.7-toggle")
         }
     }
     private var skeletonShownAt: Date?
@@ -2186,6 +2320,7 @@ class UsageContentView: NSView {
     private var lastSections: [UsageSection] = []
     private var lastSessionForecast: UsageForecast?
     private var lastWeeklyForecast: UsageForecast?
+    private var lastHistory: UsageHistory?
     private var lastSessionResetAt: Date?
     private var lastWeeklyResetAt: Date?
     let countdownTicker = CountdownTicker()
@@ -2199,10 +2334,12 @@ class UsageContentView: NSView {
     private struct MeterRowViews {
         let nameLabel: NSTextField
         let flameView: NSImageView
+        let rateLabel: NSTextField
         let pctLabel: NSTextField
         let fill: NSView
         let fillWidth: NSLayoutConstraint
         let trackBarWidth: CGFloat
+        let sparkline: SparklineView?
         let detailLabel: NSTextField
         let countdownLabel: NSTextField
         var meter: UsageMeter
@@ -2279,14 +2416,15 @@ class UsageContentView: NSView {
 
     func update(sections: [UsageSection]) {
         update(sections: sections, sessionForecast: nil, weeklyForecast: nil,
-               sessionResetAt: nil, weeklyResetAt: nil)
+               sessionResetAt: nil, weeklyResetAt: nil, history: nil)
     }
 
     func update(sections: [UsageSection],
                 sessionForecast: UsageForecast?,
                 weeklyForecast: UsageForecast?,
                 sessionResetAt: Date?,
-                weeklyResetAt: Date?) {
+                weeklyResetAt: Date?,
+                history: UsageHistory? = nil) {
         // If skeleton is still showing, ensure minimum display time
         if let shown = skeletonShownAt {
             let elapsed = Date().timeIntervalSince(shown)
@@ -2297,7 +2435,8 @@ class UsageContentView: NSView {
                                    sessionForecast: sessionForecast,
                                    weeklyForecast: weeklyForecast,
                                    sessionResetAt: sessionResetAt,
-                                   weeklyResetAt: weeklyResetAt)
+                                   weeklyResetAt: weeklyResetAt,
+                                   history: history)
                 }
                 return
             }
@@ -2306,14 +2445,16 @@ class UsageContentView: NSView {
                  sessionForecast: sessionForecast,
                  weeklyForecast: weeklyForecast,
                  sessionResetAt: sessionResetAt,
-                 weeklyResetAt: weeklyResetAt)
+                 weeklyResetAt: weeklyResetAt,
+                 history: history)
     }
 
     private func doUpdate(sections: [UsageSection],
                           sessionForecast: UsageForecast?,
                           weeklyForecast: UsageForecast?,
                           sessionResetAt: Date?,
-                          weeklyResetAt: Date?) {
+                          weeklyResetAt: Date?,
+                          history: UsageHistory?) {
         let wasShowingSkeleton = skeletonShownAt != nil
         skeletonShownAt = nil
 
@@ -2330,6 +2471,7 @@ class UsageContentView: NSView {
         lastWeeklyForecast = weeklyForecast
         lastSessionResetAt = sessionResetAt
         lastWeeklyResetAt = weeklyResetAt
+        lastHistory = history
 
         // Choose between in-place updates (when the rendered shape — section
         // titles + ordered meter labels — matches the new data) and a full
@@ -2344,13 +2486,12 @@ class UsageContentView: NSView {
             && renderedSections.count == sections.count
 
         // PARKED v2.5: the burn-rate / ETA headline is intentionally not
-        // rendered. To re-enable, restore the `if sessionHasETA || weeklyHasETA`
-        // block that instantiates HeadlineView and add the two shimmer rows
-        // back into showLoadingSkeleton. The forecast/resetAt parameters
-        // remain on the signature so doUpdate's caller can keep its existing
-        // wiring — discarding them here keeps the unused-parameter warnings
-        // off without changing the public surface.
-        _ = (sessionForecast, weeklyForecast, sessionResetAt, weeklyResetAt)
+        // rendered. v2.7 reuses sessionForecast / weeklyForecast for the
+        // per-row burn-rate chip via applyMeterRow's lookup of
+        // lastSessionForecast / lastWeeklyForecast (already stored above).
+        // The resetAt args are still latched on the view in case future
+        // surfaces need them.
+        _ = (sessionResetAt, weeklyResetAt)
 
         if canApplyInPlace {
             applyInPlace(sections: sections)
@@ -2621,6 +2762,19 @@ class UsageContentView: NSView {
         flame.isHidden = true
         row.addArrangedSubview(flame)
 
+        // Burn-rate chip (v2.7). Renders e.g. "+4.2%/h" between flame and pct,
+        // colored by rate magnitude. Hidden until a forecast lands; collapses
+        // out of layout via detachesHiddenViews so the row stays the same
+        // height as before when the chip is off.
+        let rate = makeLabel("", size: 11, weight: .medium,
+                              color: NSColor(white: 0.55, alpha: 1))
+        rate.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        rate.alignment = .right
+        rate.setContentHuggingPriority(.required, for: .horizontal)
+        rate.setContentCompressionResistancePriority(.required, for: .horizontal)
+        rate.isHidden = true
+        row.addArrangedSubview(rate)
+
         let pct = makeLabel("\(meter.percentage)%", size: 13, weight: .medium,
                             color: colorForPercentage(meter.percentage))
         pct.alignment = .right
@@ -2661,6 +2815,25 @@ class UsageContentView: NSView {
         stackView.addArrangedSubview(track)
         stackView.setCustomSpacing(2, after: track)
 
+        // Sparkline (v2.7) — only for the two aggregate meters that have
+        // useful 24h history dimension (session/weekly). Per-model meters
+        // skip allocation: their pct is too noisy at the 24h scope to be
+        // visually informative right now.
+        var sparkline: SparklineView? = nil
+        let lower = meter.label.lowercased()
+        let isAggregateSession = lower.contains("current session")
+        let isAggregateWeekly = lower == "weekly usage"
+        if isAggregateSession || isAggregateWeekly {
+            let sv = SparklineView(barWidth: barWidth)
+            sv.translatesAutoresizingMaskIntoConstraints = false
+            sv.heightAnchor.constraint(equalToConstant: 22).isActive = true
+            sv.widthAnchor.constraint(equalToConstant: barWidth).isActive = true
+            sv.isHidden = !showSparkline
+            stackView.addArrangedSubview(sv)
+            stackView.setCustomSpacing(2, after: sv)
+            sparkline = sv
+        }
+
         // Detail and countdown labels are always added; visibility is the
         // signal. NSStackView's detachesHiddenViews makes hidden labels
         // collapse out of the layout, so the visual result matches the old
@@ -2678,10 +2851,12 @@ class UsageContentView: NSView {
         var views = MeterRowViews(
             nameLabel: name,
             flameView: flame,
+            rateLabel: rate,
             pctLabel: pct,
             fill: fill,
             fillWidth: fillWidth,
             trackBarWidth: barWidth,
+            sparkline: sparkline,
             detailLabel: detail,
             countdownLabel: countdown,
             meter: meter
@@ -2694,7 +2869,9 @@ class UsageContentView: NSView {
     /// progress fill width and color tween over 0.4s; everything else snaps.
     /// Returns the updated `MeterRowViews` (`meter` field rewritten).
     private func applyMeterRow(views: inout MeterRowViews, meter: UsageMeter, animated: Bool) {
-        let isCurrentSession = meter.label.lowercased().contains("current session")
+        let lower = meter.label.lowercased()
+        let isCurrentSession = lower.contains("current session")
+        let isAggregateWeekly = lower == "weekly usage"
         let showFlame = isCurrentSession && AppDelegate.isInPeakWindow()
 
         let nameValue = meter.label.isEmpty ? "Usage" : meter.label
@@ -2704,6 +2881,31 @@ class UsageContentView: NSView {
         if showFlame {
             views.flameView.toolTip = Self.peakTooltipPublic()
             countdownTicker.registerFlameIfMissing(views.flameView)
+        }
+
+        // Burn-rate chip (v2.7) — populated from the forecast EWMA. Hidden
+        // when the chip pref is off, when the meter isn't an aggregate
+        // session/weekly window, or when the forecast hasn't accumulated
+        // enough samples (state == .insufficientData / .idle).
+        let forecast: UsageForecast? = isCurrentSession ? lastSessionForecast
+                                       : isAggregateWeekly ? lastWeeklyForecast
+                                       : nil
+        applyBurnRateChip(label: views.rateLabel, forecast: forecast)
+
+        // Sparkline (v2.7) — pull samples for the matching scope. Hidden
+        // when the user toggled it off or when too few samples are present.
+        if let sv = views.sparkline {
+            sv.isHidden = !showSparkline
+            if showSparkline, let history = lastHistory {
+                let samples: [(t: TimeInterval, pct: Int)]
+                if isCurrentSession {
+                    samples = history.samples.map { ($0.t, $0.s) }
+                } else {
+                    samples = history.samples.map { ($0.t, $0.w) }
+                }
+                sv.setData(samples: samples,
+                           color: colorForPercentage(meter.percentage))
+            }
         }
 
         let pctText = "\(meter.percentage)%"
@@ -2776,6 +2978,44 @@ class UsageContentView: NSView {
         }
 
         views.meter = meter
+    }
+
+    /// v2.7 — Render the burn-rate chip from the precomputed EWMA forecast.
+    /// Hidden when the user toggled the chip off, when the meter has no
+    /// matching forecast (per-model windows currently), or when the
+    /// forecast is in a noise-floor state (insufficientData / idle).
+    private func applyBurnRateChip(label: NSTextField, forecast: UsageForecast?) {
+        guard showBurnRate, let f = forecast else {
+            label.isHidden = true
+            return
+        }
+        switch f.state {
+        case .insufficientData, .idle:
+            label.isHidden = true
+            return
+        case .ok, .willNotExhaust:
+            break
+        }
+        let rate = f.ratePerHour
+        // Format: "+4.2%/h", with one decimal under 10 and zero decimals at
+        // higher rates so the chip never grows wider than ~50 pts.
+        let formatted: String
+        if rate >= 10 {
+            formatted = String(format: "+%.0f%%/h", rate)
+        } else {
+            formatted = String(format: "+%.1f%%/h", rate)
+        }
+        let color: NSColor
+        switch rate {
+        case ..<1.0:   color = NSColor(red: 0x2b/255.0, green: 0xa8/255.0, blue: 0x82/255.0, alpha: 1) // green
+        case ..<5.0:   color = NSColor(red: 0xc9/255.0, green: 0xa6/255.0, blue: 0x2c/255.0, alpha: 1) // gold
+        case ..<15.0:  color = NSColor(red: 0xc0/255.0, green: 0x5e/255.0, blue: 0x1a/255.0, alpha: 1) // amber
+        default:       color = NSColor(red: 0xc0/255.0, green: 0x3a/255.0, blue: 0x3a/255.0, alpha: 1) // crimson
+        }
+        if label.stringValue != formatted { label.stringValue = formatted }
+        label.textColor = color
+        label.toolTip = "EWMA burn rate over recent samples"
+        label.isHidden = false
     }
 
     private static func formatResetPrefix(_ resetAt: Date, now: Date = Date()) -> String {
@@ -2929,6 +3169,127 @@ class UsageContentView: NSView {
             if let first = section.meters.first { return first.percentage }
         }
         return nil
+    }
+}
+
+// MARK: - Sparkline View (v2.7)
+
+/// Tiny inline 24h history chart rendered under the Current Session and
+/// Weekly meters. Pure custom-draw so it can sit in an `NSStackView` row
+/// without any layout drama. Y is percentage 0-100; X is wall time over
+/// the entire history span (latest sample anchors the right edge). When
+/// fewer than 3 samples are present, draws a dim guideline + "collecting…".
+final class SparklineView: NSView {
+    private var samples: [(t: TimeInterval, pct: Int)] = []
+    private var lineColor: NSColor = .white
+
+    init(barWidth: CGFloat) {
+        super.init(frame: NSRect(x: 0, y: 0, width: barWidth, height: 22))
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(white: 0.08, alpha: 1).cgColor
+        layer?.cornerRadius = 3
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func setData(samples: [(t: TimeInterval, pct: Int)], color: NSColor) {
+        self.samples = samples
+        self.lineColor = color
+        if let latest = samples.last, let oldest = samples.first {
+            let span = latest.t - oldest.t
+            let h = Int(span / 3600)
+            let m = Int((span.truncatingRemainder(dividingBy: 3600)) / 60)
+            let oldestPct = oldest.pct, newestPct = latest.pct
+            let delta = newestPct - oldestPct
+            let sign = delta >= 0 ? "+" : ""
+            if span >= 60 {
+                let span = h > 0 ? "\(h)h \(m)m" : "\(m)m"
+                toolTip = "\(oldestPct)% \(sign)\(delta) over \(span) (last 24h)"
+            } else {
+                toolTip = "Collecting samples…"
+            }
+        } else {
+            toolTip = "No history yet"
+        }
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let bounds = self.bounds
+        let inset: CGFloat = 2
+        let plotRect = bounds.insetBy(dx: inset, dy: inset)
+
+        // Subtle gridlines at 50/75/90% so users have a reference for height.
+        let gridColor = NSColor(white: 0.22, alpha: 1)
+        gridColor.setStroke()
+        for pct in [50, 75, 90] {
+            let y = plotRect.minY + plotRect.height * CGFloat(pct) / 100.0
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: plotRect.minX, y: y))
+            path.line(to: NSPoint(x: plotRect.maxX, y: y))
+            path.lineWidth = 0.5
+            path.setLineDash([1, 2], count: 2, phase: 0)
+            path.stroke()
+        }
+
+        // Empty / collecting state.
+        if samples.count < 3 {
+            let dim = NSColor(white: 0.35, alpha: 1)
+            let para = NSMutableParagraphStyle()
+            para.alignment = .center
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 9, weight: .regular),
+                .foregroundColor: dim,
+                .paragraphStyle: para,
+            ]
+            let label = "collecting…"
+            let size = (label as NSString).size(withAttributes: attrs)
+            let textRect = NSRect(
+                x: plotRect.midX - size.width / 2,
+                y: plotRect.midY - size.height / 2,
+                width: size.width,
+                height: size.height
+            )
+            (label as NSString).draw(in: textRect, withAttributes: attrs)
+            return
+        }
+
+        guard let oldest = samples.first, let newest = samples.last else { return }
+        let span = max(newest.t - oldest.t, 1)
+        let path = NSBezierPath()
+        let fill = NSBezierPath()
+        for (i, s) in samples.enumerated() {
+            let x = plotRect.minX + plotRect.width * CGFloat((s.t - oldest.t) / span)
+            let y = plotRect.minY + plotRect.height * CGFloat(min(s.pct, 100)) / 100.0
+            let p = NSPoint(x: x, y: y)
+            if i == 0 {
+                path.move(to: p)
+                fill.move(to: NSPoint(x: x, y: plotRect.minY))
+                fill.line(to: p)
+            } else {
+                path.line(to: p)
+                fill.line(to: p)
+            }
+        }
+        // Close the fill back along the bottom edge.
+        let lastX = plotRect.minX + plotRect.width
+        fill.line(to: NSPoint(x: lastX, y: plotRect.minY))
+        fill.close()
+
+        lineColor.withAlphaComponent(0.20).setFill()
+        fill.fill()
+
+        lineColor.setStroke()
+        path.lineWidth = 1.25
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+        path.stroke()
+
+        // Latest-sample dot.
+        let lx = plotRect.minX + plotRect.width
+        let ly = plotRect.minY + plotRect.height * CGFloat(min(newest.pct, 100)) / 100.0
+        let dot = NSBezierPath(ovalIn: NSRect(x: lx - 2.5, y: ly - 2.5, width: 5, height: 5))
+        lineColor.setFill()
+        dot.fill()
     }
 }
 

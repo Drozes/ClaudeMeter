@@ -4,6 +4,16 @@ Quick reference for AI assistants continuing work on this project.
 
 ## Release History
 
+### v2.7
+
+Three new visible features, all driven by data the app already collected and never showed.
+
+- **24-hour sparkline**: a tiny inline chart sits under the Current Session and Weekly meters, painted from the existing `UsageHistory` ring buffer. Y is percentage 0-100, X is wall time over the retained history span. Subtle dotted gridlines at 50/75/90 anchor the eye, the line is filled with a 20% tint of the current bar color, and the latest sample is marked with a dot at the right edge. With fewer than 3 samples the chart shows "collecting…" — same noise-floor convention the parked headline used. Hovering the chart reads e.g. `23% +24 over 6h 13m (last 24h)`. Toggle from right-click menu (`Show 24h Sparkline`).
+- **Burn-rate chip**: a `+4.2%/h` pill appears between the flame icon and the percentage on the Current Session and aggregate Weekly rows, sourced from the EWMA forecast `UsageForecast.ratePerHour`. Color buckets: green (≤1%/h), gold (1–5), amber (5–15), crimson (>15). Hidden when the forecast is `.idle` / `.insufficientData`. Toggle from right-click menu (`Show Burn Rate Chip`).
+- **Menu-bar tooltip**: hovering the menu-bar gauge now shows a multi-line summary — peak session %, when it happened, 24-h average, and a "streak under 90%" line once the buffer has enough samples. A 1-minute background timer keeps the "at HH:MM" timestamp current between scrapes. No popover involvement; pure `NSStatusItem.button.toolTip`.
+- **Plumbing**: `UsageContentView.update(...)` grew a `history: UsageHistory? = nil` parameter; the rate chip and sparkline are reapplied via `applyMeterRow` on every refresh and via a small `reapplyVisibilityToRenderedRows` path when prefs toggle. The previously discarded `sessionForecast` / `weeklyForecast` args at the parked-headline branch are now wired into `lastSessionForecast` / `lastWeeklyForecast` and consumed by the chip.
+- **Defaults**: both visual prefs default ON for fresh installs (`showBurnRate`, `showSparkline`); existing UserDefaults preserve user choice.
+
 ### v2.6.2
 
 - **Send Test Notification menu item**: new entry under right-click → Notifications fires a one-shot synthetic alert through the same `UNUserNotificationCenter` path as real threshold notifications (time-sensitive, snooze action, sender = ClaudeMeter). Lets users verify their Focus / Do-Not-Disturb settings let alerts through without waiting for usage to climb past 50%. Bypasses the master enabled-gate (the whole point is debugging delivery) but still rides the lazy-auth flow so the OS prompt appears on first use.
