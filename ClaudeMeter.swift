@@ -1443,9 +1443,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     func normalizeJSONResponse(_ response: UsageAPIResponse) -> [UsageSection] {
         func percent(_ w: UsageAPIResponse.Window) -> Int {
             if let p = w.percent_used { return p }
+            // Current schema returns `utilization` as a percentage (0-100), e.g.
+            // `seven_day: 22.0` for 22%, `seven_day_sonnet: 1.0` for 1%. The
+            // pre-v2.6 heuristic ("if u <= 1.0 treat as fraction and ×100") was
+            // a guess for the old undocumented shape and is now wrong: a real
+            // 1% value got scaled to 100%. Trust the percentage scale directly.
             if let u = w.utilization {
-                let scaled = u <= 1.0 ? u * 100.0 : u
-                return Int(scaled.rounded())
+                return Int(u.rounded())
             }
             return 0
         }

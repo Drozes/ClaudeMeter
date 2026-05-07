@@ -4,6 +4,10 @@ Quick reference for AI assistants continuing work on this project.
 
 ## Release History
 
+### v2.6.1
+
+- **Fix: per-model meters scaled to 100% when actual value was below 1%**: `normalizeJSONResponse` carried a pre-v2.6 heuristic (`u <= 1.0 ? u * 100.0 : u`) intended to handle the old undocumented schema where `utilization` arrived as a fraction. The current schema uses percentage scale directly (`seven_day: 22.0` for 22%, `seven_day_sonnet: 1.0` for 1%), so a real 1% value got rescaled to 100%. Heuristic dropped — utilization is trusted as a percentage.
+
 ### v2.6
 
 - **Fix: badge updates only when popover opens** — root cause was a stack of three issues that compounded so the popover masked the bug. Anthropic rotated the usage JSON schema (now `five_hour` / `seven_day` / `seven_day_opus` / `seven_day_sonnet` instead of `session` / `weekly` / `per_model`), so every JSON call decoded to zero sections. After 5 consecutive failures the soft circuit breaker tripped, but had no recovery path ("for this session" was literal). The DOM fallback then started returning stale page data because the in-page "Refresh" button selector is also broken (`click result: not_found`) and macOS suspends the WebView's process while the popover is hidden, so JS-driven refreshes don't run reliably. The badge appeared frozen because both `setBadgeTitle` and the popover read from the same `latestSections` and the data wasn't actually changing; opening the popover was the only thing that woke the WebView and pulled fresh data, so popover-content updates were perceived as "the popover working."
