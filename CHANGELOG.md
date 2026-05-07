@@ -4,6 +4,10 @@ Quick reference for AI assistants continuing work on this project.
 
 ## Release History
 
+### v2.6.2
+
+- **Send Test Notification menu item**: new entry under right-click → Notifications fires a one-shot synthetic alert through the same `UNUserNotificationCenter` path as real threshold notifications (time-sensitive, snooze action, sender = ClaudeMeter). Lets users verify their Focus / Do-Not-Disturb settings let alerts through without waiting for usage to climb past 50%. Bypasses the master enabled-gate (the whole point is debugging delivery) but still rides the lazy-auth flow so the OS prompt appears on first use.
+
 ### v2.6.1
 
 - **Fix: per-model meters scaled to 100% when actual value was below 1%**: `normalizeJSONResponse` carried a pre-v2.6 heuristic (`u <= 1.0 ? u * 100.0 : u`) intended to handle the old undocumented schema where `utilization` arrived as a fraction. The current schema uses percentage scale directly (`seven_day: 22.0` for 22%, `seven_day_sonnet: 1.0` for 1%), so a real 1% value got rescaled to 100%. Heuristic dropped — utilization is trusted as a percentage.

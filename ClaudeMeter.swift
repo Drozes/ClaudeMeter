@@ -601,6 +601,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             notificationThresholdMenuItems.append(item)
         }
 
+        notificationsSubmenu.addItem(NSMenuItem.separator())
+        let testItem = NSMenuItem(title: "Send Test Notification",
+                                   action: #selector(sendTestNotification),
+                                   keyEquivalent: "")
+        testItem.target = self
+        notificationsSubmenu.addItem(testItem)
+
         notificationsItem.submenu = notificationsSubmenu
         menu.addItem(notificationsItem)
 
@@ -639,6 +646,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         let currentlyMuted = UserDefaults.standard.bool(forKey: muteKey)
         UserDefaults.standard.set(!currentlyMuted, forKey: muteKey)
         sender.state = !currentlyMuted ? .off : .on
+    }
+
+    @objc func sendTestNotification() {
+        notifier.sendTestNotification()
     }
 
     @objc func setBadgeInterval(_ sender: NSMenuItem) {
@@ -1771,6 +1782,28 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         }
 
         defaults.set(pct, forKey: lastPctKey)
+    }
+
+    /// Manually fires a synthetic notification so the user can verify their
+    /// Focus / Do-Not-Disturb settings actually let ClaudeMeter through.
+    /// Bypasses the enabled-gate (the whole point is to debug delivery) but
+    /// still rides the lazy-auth path so the OS prompt appears on first use.
+    func sendTestNotification() {
+        let title = "ClaudeMeter test notification"
+        let body = "If you can see this, alerts are wired up correctly."
+        let dispatch = { [weak self] in
+            self?.dispatchNotification(title: title, body: body, scope: .session, cycleKey: "test")
+        }
+        if UserDefaults.standard.bool(forKey: Self.authRequestedKey) {
+            dispatch()
+            return
+        }
+        UserDefaults.standard.set(true, forKey: Self.authRequestedKey)
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+            if granted {
+                DispatchQueue.main.async { dispatch() }
+            }
+        }
     }
 
     private func fire(scope: Scope, threshold: Int, detail: String, cycleKey: String) {
