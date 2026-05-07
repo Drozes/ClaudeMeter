@@ -2460,10 +2460,17 @@ class UsageContentView: NSView {
 
         // Skip full rebuild if the data hasn't changed (unless transitioning
         // from skeleton) — avoids layout churn that causes popover flicker.
+        // v2.7.1 — also bypass the short-circuit when the history buffer
+        // grew (sparkline needs the new sample) so stable-percentage
+        // refreshes still advance the chart.
+        let prevSampleCount = lastHistory?.samples.count ?? 0
+        let newSampleCount = history?.samples.count ?? 0
+        let historyGrew = newSampleCount != prevSampleCount
         if !wasShowingSkeleton
             && sections == lastSections
             && forecastsEqual(sessionForecast, lastSessionForecast)
-            && forecastsEqual(weeklyForecast, lastWeeklyForecast) {
+            && forecastsEqual(weeklyForecast, lastWeeklyForecast)
+            && !historyGrew {
             return
         }
         lastSections = sections
@@ -3136,7 +3143,12 @@ class UsageContentView: NSView {
             case (let dx?, let dy?): etaSame = abs(dx.timeIntervalSince(dy)) < 60
             default: etaSame = false
             }
-            return x.state == y.state && etaSame
+            // v2.7.1 — also compare ratePerHour with a small tolerance
+            // (matches the .idle floor at 0.05). Without this the burn-rate
+            // chip shows a stale number when state/ETA stay equal but the
+            // EWMA has drifted within those equal-state bounds.
+            let rateSame = abs(x.ratePerHour - y.ratePerHour) < 0.05
+            return x.state == y.state && etaSame && rateSame
         default: return false
         }
     }

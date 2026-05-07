@@ -4,6 +4,15 @@ Quick reference for AI assistants continuing work on this project.
 
 ## Release History
 
+### v2.7.1
+
+Two stale-data bugs in the popover's in-place reconciliation, surfaced by the v2.7 review pass.
+
+- **Sparkline froze on stable-percentage refreshes**: `doUpdate`'s short-circuit returned when sections + forecasts were unchanged, but `lastHistory` only got updated past the early-return — so a refresh that appended a new sample without changing the percentage left the sparkline drawing the prior buffer. Added a `historyGrew` check (sample-count delta) that bypasses the short-circuit so the chart advances even when the meters are flat.
+- **Burn-rate chip stuck on stale rate**: `forecastsEqual` compared `state` and `etaDate` only, both of which can stay constant while the EWMA's `ratePerHour` drifts within an unchanged forecast state. The chip then displayed an old rate until the next state transition. Added a 0.05%/h tolerance compare on `ratePerHour` (matches the `.idle` noise-floor threshold), so a meaningful rate change forces a re-render of the chip.
+
+Both fixes are localized to the in-place reconciliation gate; no behavior changes to the actual rendering paths.
+
 ### v2.7
 
 Three new visible features, all driven by data the app already collected and never showed.
