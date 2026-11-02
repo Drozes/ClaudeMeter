@@ -34,9 +34,12 @@ log "compiled: $OUT ($(stat -f%z "$OUT") bytes)"
 # app's preferences domain. L3 (smoke/run.sh) launches the same bundled copy.
 NAME="$(basename "$OUT")"
 APP="$OUT.app"
-# Guard the rm -rf below: never touch an installed app.
-case "$APP" in
-    /Applications/*|"$HOME"/Applications/*|*/ClaudeMeter.app|ClaudeMeter.app)
+# Guard the rm -rf below: never touch an installed app. Compared lowercased
+# because APFS is case-insensitive by default.
+APP_LC="$(printf '%s' "$APP" | tr '[:upper:]' '[:lower:]')"
+HOME_LC="$(printf '%s' "$HOME" | tr '[:upper:]' '[:lower:]')"
+case "$APP_LC" in
+    /applications/*|"$HOME_LC"/applications/*|*/claudemeter.app|claudemeter.app)
         log "FAIL: refusing to replace $APP (looks like an installed app); set CLAUDEMETER_QA_BIN elsewhere"
         exit 1 ;;
 esac

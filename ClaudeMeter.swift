@@ -1785,11 +1785,25 @@ struct AccountRecord: Codable, Equatable {
     var orgUUID: String?
     var orgName: String?
     var planTier: String?
+    /// True once the user picked this org. A pinned org is never silently
+    /// replaced: an auth failure keeps the UUID and the account reads as
+    /// signed out instead.
+    var orgPinned: Bool
     /// Identifier for WKWebsiteDataStore(forIdentifier:); nil means the
     /// default store (primary account only).
     var storeIdentifier: String?
 
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case id, displayName, badgeLabel, badgeSlot, email, orgUUID, orgName, planTier, orgPinned, storeIdentifier
+    }
+
     var isPrimary: Bool { id == Self.primaryID }
+
+    /// Account IDs are "primary" or a UUID string. Neither contains a dot, so
+    /// the ID is always exactly one segment of a namespaced key.
+    static func isValidID(_ id: String) -> Bool {
+        id == primaryID || UUID(uuidString: id) != nil
+    }
 
     static func defaultBadgeLabel(for name: String) -> String {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1801,7 +1815,43 @@ struct AccountRecord: Codable, Equatable {
         return AccountRecord(id: primaryID, displayName: name,
                              badgeLabel: defaultBadgeLabel(for: name), badgeSlot: .left,
                              email: nil, orgUUID: orgUUID, orgName: nil, planTier: planTier,
-                             storeIdentifier: nil)
+                             orgPinned: false, storeIdentifier: nil)
+    }
+}
+
+extension AccountRecord {
+    /// Tolerant decoding. Only `id` is required (and must be valid); every
+    /// other field falls back to a default, and an unknown badgeSlot reads as
+    /// hidden, so a record written by an older or newer build never fails the
+    /// list. Declared in an extension to keep the memberwise initializer.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let id = try c.decode(String.self, forKey: .id)
+        guard AccountRecord.isValidID(id) else {
+            throw DecodingError.dataCorruptedError(forKey: .id, in: c, debugDescription: "invalid account id")
+        }
+        let isPrimary = id == AccountRecord.primaryID
+        func string(_ key: CodingKeys) -> String? {
+            guard let value = try? c.decodeIfPresent(String.self, forKey: key), !value.isEmpty else { return nil }
+            return value
+        }
+        let name = string(.displayName) ?? (isPrimary ? "Personal" : "Account")
+        let slot: BadgeSlot
+        if let raw = string(.badgeSlot) {
+            slot = BadgeSlot(rawValue: raw) ?? .hidden
+        } else {
+            slot = isPrimary ? .left : .hidden
+        }
+        self.init(id: id,
+                  displayName: name,
+                  badgeLabel: string(.badgeLabel) ?? AccountRecord.defaultBadgeLabel(for: name),
+                  badgeSlot: slot,
+                  email: string(.email),
+                  orgUUID: string(.orgUUID),
+                  orgName: string(.orgName),
+                  planTier: string(.planTier),
+                  orgPinned: (try? c.decodeIfPresent(Bool.self, forKey: .orgPinned)) ?? false,
+                  storeIdentifier: string(.storeIdentifier))
     }
 }
 
@@ -1819,34 +1869,95 @@ enum AccountKeys {
     }
 }
 
-/// Loads and saves the account list (a JSON string in UserDefaults) and runs
-/// the one-time migration of v2.7.1's global per-account state.
+/// Loads and saves the account list and runs the one-time migration of
+/// v2.7.1's global per-account state. The list is a JSON string in
+/// UserDefaults: {"schema": 1, "accounts": [ ...records... ]}.
 enum AccountStore {
     static let listKey = "accounts.list"
+    static let unreadableKey = "accounts.list.unreadable"
+    static let listSchemaVersion = 1
     static let migrationVersionKey = "accounts.migrationVersion"
     static let currentMigrationVersion = 1
 
-    static func load() -> [AccountRecord] {
-        guard let json = UserDefaults.standard.string(forKey: listKey),
-              let data = json.data(using: .utf8) else { return [] }
-        do {
-            return try JSONDecoder().decode([AccountRecord].self, from: data)
-        } catch {
-            // Keep the unreadable list (non-secret) before a later save
-            // replaces it, so a bad decode never silently loses accounts.
-            let backupKey = listKey + ".unreadable"
-            if UserDefaults.standard.object(forKey: backupKey) == nil {
-                UserDefaults.standard.set(json, forKey: backupKey)
-            }
-            NSLog("%@", "[ClaudeMeter] accounts: could not decode \(listKey) (\(error.localizedDescription)); raw value kept in \(backupKey)")
-            return []
+    /// What is stored, as read. Raw dictionaries are kept so a save
+    /// round-trips fields this build does not know, plus any record it could
+    /// not decode, instead of dropping them.
+    private struct Stored {
+        var records: [AccountRecord] = []
+        var rawByID: [String: [String: Any]] = [:]
+        var undecodable: [Any] = []
+        var schema = AccountStore.listSchemaVersion
+        /// False when a value exists but is not a readable list. Saving is
+        /// then refused, so a list we failed to read is never overwritten.
+        var writable = true
+    }
+
+    private static func read() -> Stored {
+        var out = Stored()
+        guard let json = UserDefaults.standard.string(forKey: listKey) else { return out }
+        let parsed = json.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) }
+        let elements: [Any]?
+        if let envelope = parsed as? [String: Any] {
+            elements = envelope["accounts"] as? [Any]
+            out.schema = max(listSchemaVersion, envelope["schema"] as? Int ?? listSchemaVersion)
+        } else {
+            elements = parsed as? [Any]   // bare array, written before the schema envelope
         }
+        guard let items = elements else {
+            preserveUnreadable(json, reason: "not a readable account list")
+            out.writable = false
+            return out
+        }
+        for item in items {
+            guard let dict = item as? [String: Any],
+                  let data = try? JSONSerialization.data(withJSONObject: dict),
+                  let record = try? JSONDecoder().decode(AccountRecord.self, from: data),
+                  out.rawByID[record.id] == nil else {
+                out.undecodable.append(item)
+                continue
+            }
+            out.records.append(record)
+            out.rawByID[record.id] = dict
+        }
+        if !out.undecodable.isEmpty {
+            preserveUnreadable(json, reason: "\(out.undecodable.count) record(s) could not be decoded and are kept as-is")
+        }
+        return out
+    }
+
+    /// Keeps the first unreadable value seen (non-secret) under unreadableKey.
+    private static func preserveUnreadable(_ json: String, reason: String) {
+        guard UserDefaults.standard.object(forKey: unreadableKey) == nil else { return }
+        UserDefaults.standard.set(json, forKey: unreadableKey)
+        NSLog("%@", "[ClaudeMeter] accounts: \(reason); raw value kept in \(unreadableKey)")
+    }
+
+    static func load() -> [AccountRecord] {
+        read().records
     }
 
     static func save(_ records: [AccountRecord]) {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        guard let data = try? encoder.encode(records),
+        let stored = read()
+        guard stored.writable else {
+            NSLog("%@", "[ClaudeMeter] accounts: not saving, the stored list is unreadable (see \(unreadableKey))")
+            return
+        }
+        let knownKeys = Set(AccountRecord.CodingKeys.allCases.map { $0.rawValue })
+        var items: [Any] = []
+        for record in records {
+            guard let data = try? JSONEncoder().encode(record),
+                  let known = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+            // Start from what was stored so unknown (newer) fields survive,
+            // then apply every field this build knows, dropping known fields
+            // that are now nil.
+            var merged = stored.rawByID[record.id] ?? [:]
+            for key in knownKeys { merged.removeValue(forKey: key) }
+            for (key, value) in known { merged[key] = value }
+            items.append(merged)
+        }
+        items.append(contentsOf: stored.undecodable)
+        let envelope: [String: Any] = ["schema": stored.schema, "accounts": items]
+        guard let data = try? JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else { return }
         UserDefaults.standard.set(json, forKey: listKey)
     }
@@ -1874,7 +1985,10 @@ enum AccountStore {
     /// history.json into the primary account's namespace, then records the
     /// migration version. Copy-only: every legacy key and history.json stay in
     /// place for one release as a rollback path, and a destination that
-    /// already exists is never overwritten, so re-running is harmless.
+    /// already exists is never overwritten, so re-running is harmless. If the
+    /// history copy fails the version is not recorded, so the next launch
+    /// retries (UsageHistory also reads history.json for the primary account
+    /// until history-primary.json exists).
     static func migrateIfNeeded() {
         let defaults = UserDefaults.standard
         guard defaults.integer(forKey: migrationVersionKey) < currentMigrationVersion else { return }
@@ -1897,8 +2011,9 @@ enum AccountStore {
 
         // Families with a trailing component. Notification keys qualify only
         // when the component after the family is a scope, which excludes keys
-        // that are already namespaced; reset-estimate labels already under
-        // "primary." are skipped for the same reason.
+        // that are already namespaced. A reset-estimate key is skipped when its
+        // next segment is an account ID ("primary" or a UUID), so no account's
+        // keys are ever nested under primary.
         let legacyKeys = Array(defaults.dictionaryRepresentation().keys)
         let notifFamilies = [ThresholdNotifier.firedFamily, ThresholdNotifier.lastPctFamily,
                              ThresholdNotifier.snoozedFamily]
@@ -1912,7 +2027,9 @@ enum AccountStore {
             }
             for family in resetFamilies where key.hasPrefix(family + ".") {
                 let rest = String(key.dropFirst(family.count + 1))
-                if !rest.isEmpty && !rest.hasPrefix(pid + ".") {
+                let segments = rest.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+                let namespaced = segments.count == 2 && AccountRecord.isValidID(String(segments[0]))
+                if !rest.isEmpty && !namespaced {
                     copy(key, to: AccountKeys.key(family, pid, rest))
                 }
             }
@@ -1925,6 +2042,7 @@ enum AccountStore {
         upsert(record)
 
         // History file.
+        var historyOK = true
         let historyResult: String
         let fm = FileManager.default
         let legacy = UsageHistory.legacyFileURL
@@ -1933,16 +2051,20 @@ enum AccountStore {
             historyResult = "kept existing"
         } else if fm.fileExists(atPath: legacy.path) {
             do {
+                try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try fm.copyItem(at: legacy, to: target)
                 historyResult = "copied"
             } catch {
-                historyResult = "copy failed (\(error.localizedDescription))"
+                historyOK = false
+                historyResult = "copy failed (\(error.localizedDescription)); will retry next launch"
             }
         } else {
             historyResult = "none to copy"
         }
 
-        defaults.set(currentMigrationVersion, forKey: migrationVersionKey)
+        if historyOK {
+            defaults.set(currentMigrationVersion, forKey: migrationVersionKey)
+        }
         NSLog("%@", "[ClaudeMeter] accounts migration v\(currentMigrationVersion): copied \(copied) keys into '\(pid)', history: \(historyResult)")
     }
 }
@@ -2084,7 +2206,15 @@ struct UsageHistory {
         var h = UsageHistory()
         let fileURL = Self.fileURL(accountID: accountID)
         h.fileURL = fileURL
-        guard let data = try? Data(contentsOf: fileURL),
+        // Until the migration has produced history-primary.json, the primary
+        // account reads v2.7.1's history.json. Writes always go to fileURL.
+        var readURL = fileURL
+        if accountID == AccountRecord.primaryID,
+           !FileManager.default.fileExists(atPath: fileURL.path),
+           FileManager.default.fileExists(atPath: legacyFileURL.path) {
+            readURL = legacyFileURL
+        }
+        guard let data = try? Data(contentsOf: readURL),
               let envelope = try? JSONDecoder().decode(Envelope.self, from: data) else {
             return h
         }
