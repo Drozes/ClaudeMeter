@@ -205,11 +205,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// Logs what an unmapped tier looks like (tier code, variant, capability
     /// strings), never org names or emails.
+    /// Logs a non-standard tier once per launch per tier code: "raven"
+    /// (Team/Enterprise) tiers as plan-tier detail, anything else as
+    /// unmapped.
     static func logUnmappedTier(_ org: OrgListResponse.Org, context: String) {
         let tier = (org.rate_limit_tier ?? "").lowercased()
-        guard !tier.isEmpty, !knownPlanTierSlugs.contains(tier) else { return }
-        NSLog("%@", "[ClaudeMeter] \(context): unmapped plan tier '\(tier)' raven_type=\(org.raven_type ?? "nil") capabilities=\(org.capabilities ?? []) -> '\(planTierDisplayName(slug: tier, variant: planVariant(for: org)) ?? "nil")'")
+        guard !tier.isEmpty, !knownPlanTierSlugs.contains(tier), !loggedPlanTiers.contains(tier) else { return }
+        loggedPlanTiers.insert(tier)
+        let kind = tier.contains("raven") ? "plan tier detail" : "unmapped plan tier"
+        NSLog("%@", "[ClaudeMeter] \(context): \(kind) '\(tier)' raven_type=\(org.raven_type ?? "nil") capabilities=\(org.capabilities ?? []) -> '\(planTierDisplayName(slug: tier, variant: planVariant(for: org)) ?? "nil")'")
     }
+    private static var loggedPlanTiers = Set<String>()
 
     /// Direct XPath scrape for the "Current session" percentage. Independent
     /// fallback used by the badge when the structured scrape's label-detection
@@ -373,6 +379,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         tooltipRefreshTimer?.tolerance = 10
 
+        // Activity dots follow the status button's size and the screen setup.
+        statusItem.button?.postsFrameChangedNotifications = true
+        if let button = statusItem.button {
+            NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification, object: button,
+                                                   queue: .main) { [weak self] _ in self?.relayoutBadgeDotsIfNeeded() }
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil,
+                                               queue: .main) { [weak self] _ in self?.layoutBadgeDots() }
+
         #if CLAUDEMETER_TESTHOOKS
         runQATestHooks()   // qa/multiaccount/testhooks.swift; never in release builds
         #endif
@@ -387,6 +402,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // accounts load from their own isolated store, staggered.
         accounts = makeAccountControllers()
         normalizeBadgeSlots()
+        persistDerivedAccountColors()
         let account = accounts[0]
         accounts.forEach { $0.start() }
 
@@ -784,12 +800,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let newStyle = (style?.isEmpty ?? true) ? nil : style
         if old == title && newStyle == appliedBadgeStyle { return }
         if let newStyle = newStyle {
-            button.attributedTitle = attributedBadgeTitle(title, style: newStyle, font: button.font)
+            button.attributedTitle = attributedBadgeTitle(title, style: newStyle, font: button.font,
+                                                          alignment: button.alignment)
         } else {
             button.title = title
         }
         appliedBadgeStyle = newStyle
         layoutBadgeDots()
+        updateBadgeAccessibility(title: title)
         // NSLog treats its first argument as a printf format string. The badge
         // value contains '%' (e.g. "47%") which NSLog would otherwise consume
         // as a format specifier, mangling the output. Always pass user-data
@@ -804,11 +822,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// The badge text with account labels tinted. Other text keeps the
     /// standard menu-bar text colour.
-    func attributedBadgeTitle(_ title: String, style: BadgeStyle, font: NSFont?) -> NSAttributedString {
+    func attributedBadgeTitle(_ title: String, style: BadgeStyle, font: NSFont?,
+                              alignment: NSTextAlignment = .center) -> NSAttributedString {
         let base = font ?? NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        // labelColor is dynamic: it resolves against the menu bar's own
-        // appearance (light, dark, Reduce Transparency) when drawn.
-        let text = NSMutableAttributedString(string: title, attributes: [.font: base, .foregroundColor: NSColor.labelColor])
+        // controlTextColor matches AppKit's own plain status-item title in
+        // every menu-bar appearance (light, dark, vibrant, highlighted);
+        // labelColor renders lighter on a vibrant light menu bar.
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = alignment
+        let text = NSMutableAttributedString(string: title, attributes: [
+            .font: base, .foregroundColor: NSColor.controlTextColor, .paragraphStyle: paragraph,
+        ])
         let length = (title as NSString).length
         for tint in style.tints where NSMaxRange(tint.range) <= length {
             text.addAttribute(.foregroundColor, value: tint.color.color, range: tint.range)
@@ -829,15 +853,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let fullWidth = title.size().width
         let originX = titleRect.minX + max(0, (titleRect.width - fullWidth) / 2)
         let diameter: CGFloat = 4
-        let y: CGFloat = button.isFlipped ? button.bounds.height - diameter - 1.5 : 1.5
         for dot in style.dots where NSMaxRange(dot.range) <= title.length {
             let prefixWidth = title.attributedSubstring(from: NSRange(location: 0, length: dot.range.location)).size().width
             let numberWidth = title.attributedSubstring(from: dot.range).size().width
             let centerX = originX + prefixWidth + numberWidth / 2
-            let view = ColorDotView(frame: NSRect(x: (centerX - diameter / 2).rounded(), y: y,
-                                                  width: diameter, height: diameter))
+            let view = ColorDotView(frame: .zero)
+            view.translatesAutoresizingMaskIntoConstraints = false
             view.color = dot.band.color
             button.addSubview(view)
+            // Pinned to the button's bottom edge (like the update dot), so a
+            // menu-bar height change keeps it under the number.
+            NSLayoutConstraint.activate([
+                view.widthAnchor.constraint(equalToConstant: diameter),
+                view.heightAnchor.constraint(equalToConstant: diameter),
+                view.bottomAnchor.constraint(equalTo: button.bottomAnchor, constant: -1.5),
+                view.centerXAnchor.constraint(equalTo: button.leadingAnchor, constant: centerX.rounded()),
+            ])
             badgeDotViews.append(view)
         }
         // The status item resizes to the new title on the next pass; lay out
@@ -852,7 +883,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    private func relayoutBadgeDotsIfNeeded() {
+    func relayoutBadgeDotsIfNeeded() {
         guard let button = statusItem.button, appliedBadgeStyle?.dots.isEmpty == false else { return }
         if button.bounds != lastBadgeDotBounds {
             lastBadgeDotBounds = button.bounds
@@ -869,6 +900,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         } else if let account = accounts.first {
             setBadgeTitle(title, reason: reason, style: singleAccountBadgeStyle(for: account, text: title))
         }
+    }
+
+    /// VoiceOver text for the badge: each shown side as words, with its
+    /// activity (from the session burn rate), e.g. "Personal 47 percent,
+    /// rising fast". Only the user's own account display names are used.
+    func updateBadgeAccessibility(title: String) {
+        guard let button = statusItem.button else { return }
+        guard !title.isEmpty else {
+            button.setAccessibilityValue(nil)
+            return
+        }
+        func spoken(_ value: String, _ account: AccountController?, _ name: String?) -> String {
+            let prefix = name.map { "\($0) " } ?? "Claude usage "
+            if value == "--" { return prefix + "signed out" }
+            guard value.hasSuffix("%"), let number = Int(value.dropLast()) else { return prefix + "no data yet" }
+            var text = prefix + "\(number) percent"
+            if let account = account, let band = BurnRateBand.band(for: account.lastSessionForecast) {
+                text += ", " + band.spokenTrend
+            }
+            return text
+        }
+        let parts: [String]
+        if accounts.count < 2 {
+            parts = [spoken(title, accounts.first, nil)]
+        } else {
+            parts = badgeAccounts().map { account in
+                let value = account.isSignedOut ? "--" : (badgeSideText[account.id] ?? cachedBadgeSideText(for: account))
+                return spoken(value, account, account.record.displayName)
+            }
+        }
+        button.setAccessibilityValue(parts.joined(separator: "; "))
     }
 
     /// One account: no label, so the only styling is the activity dot.
@@ -898,6 +960,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             used.insert(accountColor(for: other))
         }
         return AccountColor.allCases.first { !used.contains($0) } ?? .blue
+    }
+
+    /// Saves the derived colour of every account that has none yet, so a
+    /// later change to one account's colour cannot shift another's.
+    func persistDerivedAccountColors() {
+        for account in accounts where account.record.colorKey == nil {
+            let color = accountColor(for: account)
+            account.updateRecord { $0.colorKey = color.rawValue }
+        }
     }
 
     /// First palette colour not used by any running account.
@@ -1648,6 +1719,10 @@ extension AppDelegate {
             var parts: [String] = []
             if let s = account.sessionPercentage(from: account.latestSections) { parts.append("session \(s)%") }
             if let w = account.weeklyPercentage(from: account.latestSections) { parts.append("weekly \(w)%") }
+            if let f = account.lastSessionForecast, BurnRateBand.band(for: f) != nil {
+                parts.append(f.ratePerHour >= 10 ? String(format: "+%.0f%%/h", f.ratePerHour)
+                                                 : String(format: "+%.1f%%/h", f.ratePerHour))
+            }
             lines.append("\(name): " + (parts.isEmpty ? "no usage data yet" : parts.joined(separator: " · ")))
             let samples = account.history.samples
             if let peak = samples.max(by: { $0.s < $1.s }) {
@@ -3050,20 +3125,23 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// endpoint may be circuit-broken or shape-mismatched, but plan tier still
     /// works because /api/organizations is a different endpoint.
     func refreshPlanTierIfNeeded() {
-        // A pinned org never re-runs org selection. Refresh its tier and
-        // Team/Enterprise kind from the org list once per launch when they
-        // are missing or a "raven" tier has no kind yet; never re-pick.
-        if record.orgPinned {
-            let tier = (record.planTier ?? "").lowercased()
-            guard !pinnedTierRefreshed, tier.isEmpty || (tier.contains("raven") && record.planVariant == nil),
+        // Refresh the tier and Team/Enterprise kind of the current org from
+        // the org list once per launch when a pinned org's tier is missing,
+        // or any account's "raven" tier has no kind yet. Only the current
+        // org's fields are updated: the selection rule is untouched and a
+        // pinned org is never re-picked.
+        let tier = (record.planTier ?? "").lowercased()
+        let ravenWithoutKind = tier.contains("raven") && record.planVariant == nil
+        if record.orgPinned || (ravenWithoutKind && record.orgUUID != nil) {
+            guard !pinnedTierRefreshed, (record.orgPinned && tier.isEmpty) || ravenWithoutKind,
                   let pinned = record.orgUUID else { return }
             pinnedTierRefreshed = true
             copyCookiesToSession(logCount: false) { [weak self] session in
                 guard let self = self else { session.finishTasksAndInvalidate(); return }
-                self.requestOrgList(session: session, context: "pinnedTierRefresh", quiet: true) { [weak self] _, orgs in
+                self.requestOrgList(session: session, context: "tierRefresh", quiet: true) { [weak self] _, orgs in
                     session.finishTasksAndInvalidate()
                     guard let self = self, let org = orgs?.first(where: { $0.uuid == pinned }) else { return }
-                    AppDelegate.logUnmappedTier(org, context: "pinnedTierRefresh")
+                    AppDelegate.logUnmappedTier(org, context: "tierRefresh")
                     self.updateRecord { r in
                         if let t = org.rate_limit_tier, !t.isEmpty { r.planTier = t }
                         r.planVariant = AppDelegate.planVariant(for: org)
@@ -3644,6 +3722,21 @@ struct OrgListResponse: Decodable {
         let rate_limit_tier: String?
         /// Team/Enterprise kind for "raven" orgs, when the API sends it.
         let raven_type: String?
+
+        enum CodingKeys: String, CodingKey {
+            case uuid, name, capabilities, rate_limit_tier, raven_type
+        }
+
+        /// Same as the synthesized decoder, except that raven_type of any
+        /// unexpected type reads as nil instead of failing the org list.
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            uuid = try c.decode(String.self, forKey: .uuid)
+            name = try c.decodeIfPresent(String.self, forKey: .name)
+            capabilities = try c.decodeIfPresent([String].self, forKey: .capabilities)
+            rate_limit_tier = try c.decodeIfPresent(String.self, forKey: .rate_limit_tier)
+            raven_type = (try? c.decodeIfPresent(String.self, forKey: .raven_type)) ?? nil
+        }
     }
     let organizations: [Org]?
 }
@@ -4285,6 +4378,16 @@ enum BurnRateBand: String {
         case ..<5.0:  return .gold
         case ..<15.0: return .amber
         default:      return .crimson
+        }
+    }
+
+    /// Words for VoiceOver.
+    var spokenTrend: String {
+        switch self {
+        case .green: return "rising slowly"
+        case .gold: return "rising"
+        case .amber: return "rising fast"
+        case .crimson: return "rising very fast"
         }
     }
 

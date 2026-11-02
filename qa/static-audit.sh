@@ -79,6 +79,26 @@ if [ -n "$bad" ]; then
     echo "  ^ replace with setBadgeTitle(...) so L3 smoke can detect updates" >&2
     failed
 fi
+# Since the activity dot (v2.8) setBadgeTitle may also set an attributed
+# title; any other attributedTitle assignment would bypass it the same way.
+log "check: no attributedTitle assignment outside setBadgeTitle"
+bad=$(awk '
+    /func setBadgeTitle/ { in_fn=1; brace=0 }
+    in_fn {
+        for (i = 1; i <= length($0); i++) {
+            c = substr($0, i, 1)
+            if (c == "{") brace++
+            else if (c == "}") { brace--; if (brace == 0) { in_fn=0; next } }
+        }
+        next
+    }
+    /\.attributedTitle[[:space:]]*=[^=]/ { print FILENAME ":" NR ": " $0 }
+' "$SRC" || true)
+if [ -n "$bad" ]; then
+    echo "$bad" >&2
+    echo "  ^ set badge text through setBadgeTitle(_:reason:style:)" >&2
+    failed
+fi
 log "check: setBadgeTitle helper is defined"
 grep -q 'func setBadgeTitle' "$SRC" || { echo "$SRC: setBadgeTitle helper missing" >&2; failed; }
 

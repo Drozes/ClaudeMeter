@@ -280,13 +280,14 @@ extension AppDelegate {
 
     private func qaMenuTree(_ menu: NSMenu) -> String {
         menu.items.filter { !$0.isSeparatorItem }.map { item in
+            // Redact the org/email line first, whatever markers it would get.
+            if item.tag == AppDelegate.accountInfoMenuTag { return "<info>" }
             let img = (item.image != nil ? "{img}" : "") + (item.isHidden ? "{hidden}" : "")
             let on = item.state == .on ? "{on}" : ""
             if let sub = item.submenu { return "\(item.title)\(img)[\(qaMenuTree(sub))]" }
             if !img.isEmpty || !on.isEmpty { return "\(item.title)\(img)\(on)" }
             // Disabled items in account submenus show the email or org name,
             // which can contain an email address: never log them.
-            if item.tag == AppDelegate.accountInfoMenuTag { return "<info>" }
             return item.title
         }.joined(separator: " | ")
     }

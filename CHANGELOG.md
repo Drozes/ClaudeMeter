@@ -6,7 +6,7 @@ Quick reference for AI assistants continuing work on this project.
 
 ### v2.8
 
-Meter several claude.ai accounts at once (for example personal Max and a work Team/Enterprise account). A user with one account sees exactly v2.7.1's badge, popover, menu and notifications; on macOS 14+ the menu gains a single "Add Account…" item.
+Meter several claude.ai accounts at once (for example personal Max and a work Team/Enterprise account). A user with one account sees v2.7.1's popover, menu and notifications; on macOS 14+ the menu gains a single "Add Account…" item and a "Show Activity Dot" toggle. The badge text is unchanged; with the activity dot on (the default) a small dot appears under the percentage when usage is rising, and turning it off restores exactly v2.7.1's badge.
 
 - **AccountController**: everything per-account (background WKWebView and its data store, login window and OAuth popups, refresh timer, JSON circuit breaker, empty-scrape streak, org and plan tier, sections, history, forecast, navigation/UI/window delegate roles) moved out of `AppDelegate` into one controller per account. `AppDelegate` keeps the status item, popover, menu, updater and app-wide preferences and holds `accounts: [AccountController]`.
 - **Isolated sessions**: the first ("primary") account stays on `WKWebsiteDataStore.default()` and is the only one fed by the Claude Desktop import. Added accounts live on `WKWebsiteDataStore(forIdentifier:)` (macOS 14+) with a UUID account ID and a UUID store identifier. On macOS 13 the app stays single-account. A launch sweep deletes isolated stores no account references (skipped unless the saved list was read completely).
