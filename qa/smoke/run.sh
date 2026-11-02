@@ -7,9 +7,11 @@
 # OCR of the actual menu bar is a supplementary check — Macs with notches
 # often hide status items, making OCR unreliable as a primary signal.
 #
-# Requires Claude Desktop signed in (the app imports cookies from there). On a
-# machine without it, the badge will stay at "—%" or "—%"-only changes will
-# show up, and this test will FAIL with a clear auth-missing message.
+# Requires a claude.ai session in the QA bundle's own WebKit store: QA
+# launches pass -skipDesktopImport YES (no Claude Desktop import, so no
+# Keychain prompt) and -suppressAutoLoginWindow YES. Without a session the
+# primary account shows signed out and this test times out. One-time setup
+# is described in qa/README.md (L3 Smoke).
 
 set -uo pipefail
 
@@ -54,7 +56,11 @@ sleep 0.5
 #    restore shows the placeholder instead of an old percentage.
 log "launching $LAUNCH with -showMenuBarBadge YES"
 : > "$STDERR"
+#    -skipDesktopImport / -suppressAutoLoginWindow: no Claude Desktop import,
+#    so no Keychain prompt; the QA bundle's own WebKit store must already hold
+#    a claude.ai session (see qa/README.md for the one-time sign-in).
 "$LAUNCH" -showMenuBarBadge YES -declinedMoveToApplications YES \
+    -skipDesktopImport YES -suppressAutoLoginWindow YES \
     -lastBadgePercentage 0 -lastBadgePercentage.primary 0 >"$STDOUT" 2>"$STDERR" &
 PID=$!
 

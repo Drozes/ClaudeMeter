@@ -127,6 +127,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     static let apiOrgsURL = URL(string: "https://claude.ai/api/organizations")!
     static let apiUsagePath = "/api/organizations/%@/usage"
     static let forceDOMOnlyKey = "forceDOMOnly"
+    // QA/dev switches, off unless set (QA passes them in the argument
+    // domain). skipDesktopImport: never read Claude Desktop's cookies, so no
+    // "Claude Safe Storage" Keychain access; the primary account uses what
+    // its own WebKit store already holds. suppressAutoLoginWindow: the
+    // primary account does not open its login window on its own when signed
+    // out (it shows signed out, like added accounts).
+    static let skipDesktopImportKey = "skipDesktopImport"
+    static let suppressAutoLoginWindowKey = "suppressAutoLoginWindow"
     // v2.7.1 global keys, now read only by AccountStore.migrateIfNeeded; the
     // values live on AccountRecord (org UUID, plan tier).
     static let cachedOrgUUIDKey = "cachedOrgUUID"
@@ -1877,6 +1885,14 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     // MARK: - Claude Desktop Cookie Import
 
     func importFromClaudeDesktop(completion: @escaping (Bool) -> Void) {
+        // The single gate for every Claude Desktop import (launch, the
+        // login-page fallback and the menu item): with skipDesktopImport set
+        // nothing reads the cookie database or the Keychain.
+        if UserDefaults.standard.bool(forKey: AppDelegate.skipDesktopImportKey) {
+            NSLog("%@", "[ClaudeMeter] Claude Desktop import skipped (skipDesktopImport); no Keychain access")
+            DispatchQueue.main.async { completion(false) }
+            return
+        }
         DispatchQueue.global(qos: .userInitiated).async {
             let cookies = ClaudeDesktopCookies.extract()
             DispatchQueue.main.async { [weak self] in
@@ -2033,6 +2049,10 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         // Popover hit a login page → show login window (desktop import already attempted at startup)
         if webView === self.webView && isLoginURL(url) {
             setSignedOut(true, reason: "background page reached a sign-in page")
+            if UserDefaults.standard.bool(forKey: AppDelegate.suppressAutoLoginWindowKey) {
+                NSLog("%@", "[ClaudeMeter] login window not opened automatically (suppressAutoLoginWindow)")
+                return
+            }
             if !hasAttemptedDesktopImport {
                 hasAttemptedDesktopImport = true
                 importFromClaudeDesktop { [weak self] success in

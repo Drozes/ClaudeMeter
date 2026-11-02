@@ -105,11 +105,19 @@ Isolation from the installed app, and what L0 really touches:
   `~/Library/Application Support/ClaudeMeter/`; the QA bundle uses
   `~/Library/Application Support/com.local.ClaudeMeter.qa/`, so QA runs never
   read, migrate or overwrite the real history files.
-- **Real side effects:** even the 4s L0 launch is a real app run. It reads the
-  Claude Desktop "Claude Safe Storage" Keychain item to decrypt Claude Desktop's
-  cookies, makes real requests to claude.ai with them, and persists cookies in
-  the QA bundle's own WebKit website data store. It never touches any
-  `Claude Code-credentials*` Keychain item.
+- **No Keychain access:** every QA launcher (L0, L3, the multi-account test)
+  passes `-skipDesktopImport YES -suppressAutoLoginWindow YES`. The app then
+  never reads Claude Desktop's cookie database or the "Claude Safe Storage"
+  Keychain item. (Each rebuilt QA binary is ad-hoc signed with a new code
+  hash, so that read would raise a fresh Keychain prompt on every run, even
+  after "Always Allow".) The primary account uses whatever claude.ai session
+  the QA bundle's own WebKit store already holds, and when it has none the
+  app shows it as signed out instead of opening a login window. Both
+  switches default to off; the installed app behaves exactly as before.
+  QA never touches any `Claude Code-credentials*` Keychain item.
+- **Real side effects:** a QA launch is still a real app run: it makes real
+  requests to claude.ai with the QA bundle's own session (if any) and keeps
+  cookies in the QA bundle's own WebKit website data store.
 - `build.sh` refuses to replace a bundle under `/Applications` or
   `~/Applications`, or one named `ClaudeMeter.app`.
 
@@ -139,8 +147,21 @@ percentage, and OCRs the menu bar via Apple's Vision framework
 end-to-end test that would have caught today's "badge stuck" bug
 *at the user-visible layer*.
 
-Requires Claude Desktop signed in (the app imports cookies from there).
-Won't work on a fresh machine or in CI without seeded auth.
+Requires a claude.ai session in the QA bundle's own WebKit store
+(`~/Library/WebKit/com.local.ClaudeMeter.qa`), because QA launches skip the
+Claude Desktop import (no Keychain prompt) and never auto-open a login window.
+Without a session L3 times out with the primary account signed out. One-time
+setup, either:
+
+- sign in by hand once (no Keychain access):
+  `/tmp/ClaudeMeter.qa.app/Contents/MacOS/ClaudeMeter.qa -declinedMoveToApplications YES -skipDesktopImport YES`
+  then right-click the QA menu-bar icon → Sign In…, sign in, and quit; or
+- import from Claude Desktop once (one Keychain prompt; choose Allow):
+  run the same command without `-skipDesktopImport YES`, wait for the badge,
+  and quit.
+
+The session persists across rebuilds because the store belongs to the bundle
+ID, not the binary. Won't work in CI without seeded auth.
 
 ### L4 Drift ([drift/watch.sh](drift/watch.sh))
 Long-running. Samples the badge every 5 minutes (configurable), logs each
@@ -174,8 +195,9 @@ the real code paths:
   to their sum, and back to one account.
 
 It cleans up the test domain and folders afterwards (`--keep` leaves them).
-Like L0/L3, the primary account imports Claude Desktop cookies into the
-bundle's own store and fetches live usage.
+Like L0/L3 it skips the Claude Desktop import (no Keychain access); the
+primary account here has no session and is shown signed out, and the badge
+and popover checks feed it synthetic data.
 
 The L3 smoke regex and the L4 OCR accept all three badge forms: `47%`,
 `W 47%` and `P 47% | W 12%` (a side may read `--`).

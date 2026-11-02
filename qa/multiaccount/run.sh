@@ -13,10 +13,10 @@
 #      "P 47% | W 12%", slot reassignment, both-hidden fallback, labels, a
 #      signed-out side, three accounts stacked in the popover, back to one.
 #
-# The primary account is real: like L0/L3 it imports Claude Desktop cookies
-# (Claude Safe Storage Keychain item) into this bundle's own default store and
-# fetches live usage. Never touches the installed app's domain or folder, and
-# never any Claude Code-credentials Keychain item.
+# Like L0/L3 it launches with -skipDesktopImport YES -suppressAutoLoginWindow
+# YES: no Claude Desktop import, so no Keychain access at all (no prompts);
+# the primary account has no session here and shows signed out. Never
+# touches the installed app's domain or folder.
 #
 # Usage: qa/multiaccount/run.sh [--keep]   (--keep leaves the test domain/folders)
 
@@ -71,7 +71,10 @@ cleanup() {
 # run_app <log> <actions>: launch, wait for QA-DONE (max 150s), stop.
 run_app() {
     local logfile="$1" actions="$2"
-    "$APP/Contents/MacOS/$NAME" -declinedMoveToApplications YES -qa.actions "$actions" >/dev/null 2>"$logfile" &
+    # No Claude Desktop import (no Keychain prompt) and no auto-opened login
+    # window: the primary account here has no session and shows signed out.
+    "$APP/Contents/MacOS/$NAME" -declinedMoveToApplications YES -skipDesktopImport YES -suppressAutoLoginWindow YES \
+        -qa.actions "$actions" >/dev/null 2>"$logfile" &
     local pid=$!
     for _ in $(seq 1 150); do
         grep -q "QA-DONE" "$logfile" 2>/dev/null && break
@@ -146,7 +149,7 @@ defaults write "$BUNDLE_ID" accounts.migrationVersion -int 1
 defaults write "$BUNDLE_ID" showMenuBarBadge -bool YES
 defaults write "$BUNDLE_ID" accounts.list -string '{"schema":1,"accounts":[{"id":"primary","displayName":"Personal","badgeLabel":"P","badgeSlot":"left","orgPinned":false}]}'
 
-B="wait:4,inject:0:47,badge,popover"                                    # badge 1, popover 1
+B="wait:8,inject:0:47,badge,popover"                                    # badge 1, popover 1
 B="$B,addSynthetic:Work,wait:10,badge"                                   # badge 2
 B="$B,inject:1:12,badge"                                                 # badge 3
 B="$B,setSlot:1:left,badge"                                              # badge 4

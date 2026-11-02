@@ -75,7 +75,11 @@ log "bundled: $APP"
 # "Move to Applications?" alert, which blocks the main thread and, if accepted,
 # copies the QA bundle into /Applications. Suppress it via the argument domain
 # (no persistent defaults write). smoke/run.sh passes the same flag.
-NO_MOVE_PROMPT=(-declinedMoveToApplications YES)
+# -skipDesktopImport / -suppressAutoLoginWindow: QA builds never read the
+# Claude Desktop cookie database or the "Claude Safe Storage" Keychain item
+# (each rebuilt ad-hoc binary would trigger a new Keychain prompt), and never
+# auto-open a login window. See qa/README.md.
+NO_MOVE_PROMPT=(-declinedMoveToApplications YES -skipDesktopImport YES -suppressAutoLoginWindow YES)
 
 # Smoke-launch: start, wait 4s, verify still alive, then terminate.
 # 4s is enough for a crash on launch (cookie import, WKWebView init, status item
