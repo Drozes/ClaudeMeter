@@ -286,6 +286,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self?.accounts.forEach { account in account.staggered { account.refreshPlanTierIfNeeded() } }
         }
 
+        // Remove WebKit stores no account references (macOS 14+).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            self?.sweepOrphanedDataStores()
+        }
+
         // Silent update check after 30s, then every 4 hours
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
             self?.silentUpdateCheck()
@@ -846,11 +851,36 @@ extension AppDelegate {
         rebuildAccountsMenu()
     }
 
-    /// Restarts every running refresh timer so offsets follow the current
-    /// account count (index * interval / count).
+    /// Restarts the running refresh timers of secondary accounts so offsets
+    /// follow the current account count (index * interval / count). The
+    /// primary account (offset 0) keeps its phase.
     func restaggerRefreshTimers() {
-        for account in accounts where account.refreshTimer != nil {
+        for account in accounts where account.refreshTimer != nil && !account.isPrimary {
             account.startRefreshTimer()
+        }
+    }
+
+    /// Deletes isolated WebKit stores that no saved, running or pending
+    /// account references (left behind by a crash mid-add, an old build, or a
+    /// failed removal). Skipped entirely unless the saved account list was
+    /// read completely, so a store is never deleted because of a read error.
+    func sweepOrphanedDataStores() {
+        guard #available(macOS 14.0, *) else { return }
+        guard AccountStore.isListFullyReadable else {
+            NSLog("%@", "[ClaudeMeter] data store sweep skipped: account list not fully readable")
+            return
+        }
+        WKWebsiteDataStore.fetchAllDataStoreIdentifiers { identifiers in
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, AccountStore.isListFullyReadable else { return }
+                var referenced = Set(AccountStore.load().compactMap { $0.storeIdentifier?.lowercased() })
+                for account in self.accounts + self.pendingAccounts {
+                    if let sid = account.record.storeIdentifier { referenced.insert(sid.lowercased()) }
+                }
+                let orphans = identifiers.filter { !referenced.contains($0.uuidString.lowercased()) }
+                NSLog("%@", "[ClaudeMeter] data store sweep: \(identifiers.count) found, \(orphans.count) orphaned")
+                for id in orphans { AccountController.removeDataStore(identifier: id) }
+            }
         }
     }
 
@@ -866,7 +896,12 @@ extension AppDelegate {
                 continue
             }
             guard let sid = record.storeIdentifier, let storeUUID = UUID(uuidString: sid) else {
-                NSLog("%@", "[ClaudeMeter] account \(record.id) skipped: missing or invalid store identifier")
+                // Unusable without its own store (it could never sign in), and
+                // invisible in the menu: drop it so nothing lingers.
+                AccountStore.remove(id: record.id)
+                AccountStore.removeKeys(forAccount: record.id)
+                try? FileManager.default.removeItem(at: UsageHistory.fileURL(accountID: record.id))
+                NSLog("%@", "[ClaudeMeter] account \(record.id) dropped: missing or invalid store identifier")
                 continue
             }
             result.append(AccountController(app: self, notifier: notifier, record: record,
@@ -980,7 +1015,12 @@ extension AppDelegate {
 
     @objc func addAccount(_ sender: Any?) {
         guard #available(macOS 14.0, *) else { return }
-        let names = Set(accounts.map { $0.record.displayName.lowercased() })
+        // One add at a time: bring the pending sign-in window forward.
+        if let pending = pendingAccounts.first {
+            pending.showLoginWindow()
+            return
+        }
+        let names = Set((accounts + pendingAccounts).map { $0.record.displayName.lowercased() })
         let suggested = names.contains("work") ? "Account \(accounts.count + 1)" : "Work"
         guard let name = promptForText(title: "Add Account",
                                        message: "Name the account, then sign in to it in the window that opens. It gets its own isolated session, so your other accounts stay signed in.",
@@ -999,10 +1039,10 @@ extension AppDelegate {
     @discardableResult
     func beginAddAccount(named name: String) -> AccountController {
         let storeUUID = UUID()
-        let rightTaken = accounts.contains { $0.record.badgeSlot == .right }
+        // The badge slot is assigned when the add completes (finishAddAccount).
         let record = AccountRecord(id: UUID().uuidString, displayName: name,
                                    badgeLabel: AccountRecord.defaultBadgeLabel(for: name),
-                                   badgeSlot: rightTaken ? .hidden : .right,
+                                   badgeSlot: .hidden,
                                    email: nil, orgUUID: nil, orgName: nil, planTier: nil,
                                    orgPinned: false, storeIdentifier: storeUUID.uuidString)
         let controller = AccountController(app: self, notifier: notifier, record: record,
@@ -1019,21 +1059,24 @@ extension AppDelegate {
                 self.discardAccount(controller)
             }
         }
-        NSLog("%@", "[ClaudeMeter] add account started: \(record.id) slot=\(record.badgeSlot.rawValue)")
+        NSLog("%@", "[ClaudeMeter] add account started: \(record.id)")
         return controller
     }
 
     /// Saves a pending account and starts metering it.
     func finishAddAccount(_ controller: AccountController) {
+        // Slot decided now, not at start, so two adds can never both take Right.
+        let rightTaken = accounts.contains { $0.record.badgeSlot == .right }
+        controller.updateRecord { $0.badgeSlot = rightTaken ? .hidden : .right }
         controller.isPendingAdd = false
         controller.persistRecord()
         accounts.append(controller)
         NSLog("%@", "[ClaudeMeter] account added: \(controller.id) slot=\(controller.record.badgeSlot.rawValue) accounts=\(accounts.count)")
+        restaggerRefreshTimers()
         if popover?.isShown == true || showMenuBarBadge {
             controller.startRefreshTimer()
         }
-        restaggerRefreshTimers()
-        rebuildAccountsMenu()
+        accountsDidChange()
     }
 
     /// Removes a secondary account completely: stops it, deletes its saved
@@ -1042,16 +1085,19 @@ extension AppDelegate {
     func removeAccount(_ account: AccountController) {
         guard !account.isPrimary else { return }
         let id = account.id
+        // Stop it first so no in-flight fetch writes history or keys back.
+        account.tearDown()
         accounts.removeAll { $0 === account }
         AccountStore.remove(id: id)
         let removedKeys = AccountStore.removeKeys(forAccount: id)
         let historyURL = UsageHistory.fileURL(accountID: id)
         let hadHistory = FileManager.default.fileExists(atPath: historyURL.path)
         try? FileManager.default.removeItem(at: historyURL)
+        notifier.removeDeliveredNotifications(forAccount: id)
         NSLog("%@", "[ClaudeMeter] account removed: \(id) keys=\(removedKeys) history=\(hadHistory ? "deleted" : "none") accounts=\(accounts.count)")
         discardAccount(account)
         restaggerRefreshTimers()
-        rebuildAccountsMenu()
+        accountsDidChange()
     }
 
     /// Tears a controller down and deletes its isolated data store once
@@ -1090,8 +1136,19 @@ extension AppDelegate {
     /// Org picker shown after a verified sign-in that returned several orgs.
     /// Always returns one of `orgs` (the preselected one if the user just
     /// confirms).
-    func pickOrganization(_ orgs: [OrgListResponse.Org], for account: AccountController) -> OrgListResponse.Org {
-        let preferred = orgs.firstIndex { ($0.capabilities ?? []).contains { $0 == "claude_pro" || $0 == "claude_max" } } ?? 0
+    /// `preselect` (the pinned org on Sign In Again) wins; otherwise a Team
+    /// or Enterprise org is preselected, since extra accounts are usually work
+    /// accounts. Orgs another account already meters are marked.
+    func pickOrganization(_ orgs: [OrgListResponse.Org], for account: AccountController,
+                          preselect: String? = nil) -> OrgListResponse.Org {
+        func isWorkOrg(_ org: OrgListResponse.Org) -> Bool {
+            let tier = (org.rate_limit_tier ?? "").lowercased()
+            let caps = (org.capabilities ?? []).map { $0.lowercased() }
+            return tier.contains("team") || tier.contains("enterprise")
+                || caps.contains { $0.contains("team") || $0.contains("enterprise") }
+        }
+        let preferred = preselect.flatMap { p in orgs.firstIndex { $0.uuid == p } }
+            ?? orgs.firstIndex(where: isWorkOrg) ?? 0
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Choose an organization for \(account.record.displayName)"
@@ -1101,6 +1158,9 @@ extension AppDelegate {
         for org in orgs {
             var title = org.name ?? "Organization"
             if let tier = Self.planTierDisplayName(slug: org.rate_limit_tier) { title += " (\(tier))" }
+            if let other = accounts.first(where: { $0 !== account && $0.record.orgUUID == org.uuid }) {
+                title += ", already metered as \(other.record.displayName)"
+            }
             popup.addItem(withTitle: title)
         }
         popup.selectItem(at: preferred)
@@ -1202,6 +1262,12 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     private var loginCheckTimer: Timer?
     private var loginCheckInFlight = false
     private var loginSucceeded = false
+    private var lastLoginCheckStatus: Int?
+    // Signed-out confirmation and slow background re-probe (secondaries).
+    private var signInProbeInFlight = false
+    private var signedOutProbeTimer: Timer?
+    private var pageRetryUsed = false
+    static let signedOutProbeInterval: TimeInterval = 15 * 60
     /// Called once when the login window closes: true after a verified
     /// sign-in, false when the user closed it first.
     var onLoginWindowClosed: ((Bool) -> Void)?
@@ -1264,7 +1330,92 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         guard signedOut != isSignedOut else { return }
         isSignedOut = signedOut
         NSLog("%@", "[ClaudeMeter] account \(id) \(signedOut ? "signed out" : "signed in") (\(reason))")
+        if signedOut && !isPrimary {
+            startSignedOutProbe()
+        } else {
+            signedOutProbeTimer?.invalidate()
+            signedOutProbeTimer = nil
+        }
         if !isPendingAdd { app.accountsDidChange() }
+    }
+
+    // MARK: - Signed-out confirmation (secondary accounts)
+
+    enum SignInVerdict { case signedIn, signedOut(String), unknown }
+
+    /// Reads an /api/organizations answer: 401/403 means signed out; 2xx
+    /// listing the pinned org (any org when unpinned) means signed in; 2xx
+    /// without the pinned org means signed out (the org is gone, so Sign In
+    /// Again lets the user choose; background code never re-pins); anything
+    /// else is inconclusive.
+    func signInVerdict(status: Int, orgs: [OrgListResponse.Org]?) -> SignInVerdict {
+        if status == 401 || status == 403 { return .signedOut("organizations HTTP \(status)") }
+        guard (200..<300).contains(status), let orgs = orgs else { return .unknown }
+        if record.orgPinned, let pinned = record.orgUUID {
+            return orgs.contains { $0.uuid == pinned } ? .signedIn : .signedOut("pinned org no longer listed")
+        }
+        return orgs.isEmpty ? .signedOut("no organizations") : .signedIn
+    }
+
+    /// One /api/organizations call with this account's cookies (no windows,
+    /// no alerts), reported as a verdict.
+    func probeSignIn(_ completion: @escaping (SignInVerdict) -> Void) {
+        guard !signInProbeInFlight, !isTornDown else { return }
+        signInProbeInFlight = true
+        copyCookiesToSession(logCount: false) { [weak self] session in
+            guard let self = self else { session.finishTasksAndInvalidate(); return }
+            self.requestOrgList(session: session, context: "signInProbe", quiet: true) { [weak self] status, orgs in
+                session.finishTasksAndInvalidate()
+                guard let self = self, !self.isTornDown else { return }
+                self.signInProbeInFlight = false
+                completion(self.signInVerdict(status: status, orgs: orgs))
+            }
+        }
+    }
+
+    /// A secondary account is marked signed out only after the API agrees,
+    /// so one transient 403 or an odd page landing cannot sign it out.
+    func confirmSignedOut(reason: String) {
+        guard !isPrimary, !isSignedOut else { return }
+        probeSignIn { [weak self] verdict in
+            guard let self = self else { return }
+            switch verdict {
+            case .signedOut(let why):
+                self.setSignedOut(true, reason: "\(reason); \(why)")
+            case .signedIn:
+                NSLog("%@", "[ClaudeMeter] account \(self.id): \(reason), but organizations still answer; treating as transient")
+                // A page that wandered off the usage page: one reload later.
+                if !self.pageRetryUsed, self.webView.url?.absoluteString.contains("/settings/usage") != true {
+                    self.pageRetryUsed = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+                        guard let self = self, !self.isTornDown else { return }
+                        self.webView.load(URLRequest(url: AppDelegate.usageURL))
+                    }
+                }
+            case .unknown:
+                NSLog("%@", "[ClaudeMeter] account \(self.id): \(reason), sign-in check inconclusive; no change")
+            }
+        }
+    }
+
+    /// Slow re-check while a secondary account is signed out (every 15 min,
+    /// staggered; API only). A false "signed out" heals on its own.
+    private func startSignedOutProbe() {
+        signedOutProbeTimer?.invalidate()
+        signedOutProbeTimer = Timer.scheduledTimer(withTimeInterval: Self.signedOutProbeInterval, repeats: true) { [weak self] _ in
+            self?.runSignedOutProbe()
+        }
+        signedOutProbeTimer?.tolerance = 60
+        signedOutProbeTimer?.fireDate = Date().addingTimeInterval(Self.signedOutProbeInterval + Double(staggerIndex) * 30)
+    }
+
+    func runSignedOutProbe() {
+        guard isSignedOut, !isPrimary, loginWindow == nil else { return }
+        probeSignIn { [weak self] verdict in
+            guard let self = self, self.isSignedOut, case .signedIn = verdict else { return }
+            self.setSignedOut(false, reason: "background probe: organizations answer again")
+            self.webView.load(URLRequest(url: AppDelegate.usageURL))
+        }
     }
 
     // MARK: - Staggering
@@ -1310,6 +1461,8 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     func tearDown() {
         isTornDown = true
         stopRefreshTimer()
+        signedOutProbeTimer?.invalidate()
+        signedOutProbeTimer = nil
         loginCheckTimer?.invalidate()
         loginCheckTimer = nil
         onLoginWindowClosed = nil
@@ -1403,6 +1556,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         loginWebView = lw
         loginWindow = window
         loginSucceeded = false
+        lastLoginCheckStatus = nil
         loginCheckTimer?.invalidate()
         loginCheckTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
             self?.checkLoginSucceeded()
@@ -1420,14 +1574,30 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     func checkLoginSucceeded() {
         guard loginWindow != nil, !loginSucceeded, !loginCheckInFlight, !isTornDown else { return }
         loginCheckInFlight = true
-        copyCookiesToSession { [weak self] session in
-            guard let self = self else { return }
-            self.requestOrgList(session: session, context: "loginCheck") { [weak self] status, orgs in
+        copyCookiesToSession(logCount: false) { [weak self] session in
+            guard let self = self else { session.finishTasksAndInvalidate(); return }
+            self.requestOrgList(session: session, context: "loginCheck", quiet: true) { [weak self] status, orgs in
+                session.finishTasksAndInvalidate()
                 guard let self = self else { return }
                 self.loginCheckInFlight = false
-                guard self.loginWindow != nil, !self.loginSucceeded,
-                      status >= 200, status < 300, let orgs = orgs, !orgs.isEmpty else { return }
-                self.completeLogin(orgs: orgs)
+                // Log state changes only (this runs every 4s).
+                if status != self.lastLoginCheckStatus {
+                    self.lastLoginCheckStatus = status
+                    NSLog("%@", "[ClaudeMeter] loginCheck for account \(self.id): HTTP \(status), \(orgs?.count ?? 0) orgs")
+                }
+                guard self.loginWindow != nil, !self.loginSucceeded, (200..<300).contains(status) else { return }
+                let orgList = orgs ?? []
+                // The primary account also accepts a 2xx with an undecodable
+                // org list once the login page sits on a claude.ai non-login
+                // page, so a shape change cannot keep the window open forever.
+                let pageLooksSignedIn: Bool = {
+                    guard let url = self.loginWebView?.url, let host = url.host?.lowercased() else { return false }
+                    let onClaude = host == "claude.ai" || host.hasSuffix(".claude.ai")
+                    return onClaude && !self.isLoginURL(url.absoluteString)
+                }()
+                if !orgList.isEmpty || (self.isPrimary && pageLooksSignedIn) {
+                    self.completeLogin(orgs: orgList)
+                }
             }
         }
     }
@@ -1441,13 +1611,16 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         loginCheckTimer = nil
         NSLog("%@", "[ClaudeMeter] login verified for account \(id): \(orgs.count) org(s)")
         if !isPrimary {
+            // Several orgs: always ask, with the pinned org preselected. A
+            // pinned org that disappeared is never silently replaced: ask even
+            // if only one org is left. One org and nothing pinned: take it.
+            let pinned = record.orgPinned ? record.orgUUID : nil
+            let pinnedListed = pinned.map { p in orgs.contains { $0.uuid == p } } ?? false
             let chosen: OrgListResponse.Org
-            if record.orgPinned, let pinned = record.orgUUID, let match = orgs.first(where: { $0.uuid == pinned }) {
-                chosen = match
-            } else if orgs.count == 1 {
+            if orgs.count == 1 && (pinned == nil || pinnedListed) {
                 chosen = orgs[0]
             } else {
-                chosen = app.pickOrganization(orgs, for: self)
+                chosen = app.pickOrganization(orgs, for: self, preselect: pinnedListed ? pinned : nil)
             }
             updateRecord { r in
                 r.orgUUID = chosen.uuid
@@ -1468,14 +1641,18 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard let url = webView.url?.absoluteString else { return }
 
+        // Secondary accounts: a sign-in page or any page outside claude.ai
+        // (an SSO identity provider) is a hint only; the API confirms before
+        // the account is marked signed out. They never open a window on
+        // their own; the menu offers "Sign In Again to <name>" instead.
+        if webView === self.webView && !isPrimary && looksSignedOut(url) {
+            confirmSignedOut(reason: "background page left the usage page for a sign-in page")
+            return
+        }
+
         // Popover hit a login page → show login window (desktop import already attempted at startup)
         if webView === self.webView && isLoginURL(url) {
             setSignedOut(true, reason: "background page reached a sign-in page")
-            guard isPrimary else {
-                // Secondary accounts never open a window on their own; the
-                // menu offers "Sign In Again to <name>" instead.
-                return
-            }
             if !hasAttemptedDesktopImport {
                 hasAttemptedDesktopImport = true
                 importFromClaudeDesktop { [weak self] success in
@@ -1501,6 +1678,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         }
 
         if webView === self.webView {
+            pageRetryUsed = false
             lastRefreshDate = Date()
             usageView?.setStatusFresh(true)
             // Scrape immediately, then again after React renders
@@ -1727,16 +1905,16 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         return nil
     }
 
-    /// Background-page test for "this account is not signed in": a claude.ai
-    /// login or sign-in path, or any page outside claude.ai (an SSO identity
-    /// provider such as Okta, Microsoft Entra ID or Google). The background
-    /// page only ever loads claude.ai/settings/usage, so leaving claude.ai
-    /// means a sign-in redirect. Login-window success does not use this; it
-    /// is verified through /api/organizations.
+    /// v2.7.1's exact login-page test, used for the primary account.
     private func isLoginURL(_ url: String) -> Bool {
-        if url.contains("/login") || url.contains("/signin") || url.contains("accounts.google.com") {
-            return true
-        }
+        url.contains("/login") || url.contains("/signin") || url.contains("accounts.google.com")
+    }
+
+    /// Wider hint for secondary accounts: a login page, or any page outside
+    /// claude.ai (an SSO identity provider such as Okta or Microsoft Entra
+    /// ID). Only a hint: confirmSignedOut asks the API before acting.
+    private func looksSignedOut(_ url: String) -> Bool {
+        if isLoginURL(url) { return true }
         guard let host = URL(string: url)?.host?.lowercased(), !host.isEmpty else { return false }
         return host != "claude.ai" && !host.hasSuffix(".claude.ai")
     }
@@ -1758,7 +1936,10 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             jsonConsecutiveFailures = 0
             jsonCircuitOpenedAt = nil
         }
-        if forceDOM || jsonCircuitOpen {
+        // A pinned org is metered through the JSON path only: the DOM page
+        // could be showing a different org, so it never stands in.
+        let pinned = record.orgPinned
+        if !pinned && (forceDOM || jsonCircuitOpen) {
             let reason = forceDOM ? "forceDOMOnly=true" : "json circuit open"
             logFetchOutcome(path: "dom", outcome: "selected", detail: reason)
             scrapeViaDOM()
@@ -1769,7 +1950,10 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             guard let self = self else { return }
             switch result {
             case .success(let sections):
-                if sections.isEmpty {
+                if sections.isEmpty && pinned {
+                    self.logFetchOutcome(path: "json", outcome: "empty", detail: "n=0 pinned org, no DOM fallback")
+                    self.distributeFetchResult([], path: "json")
+                } else if sections.isEmpty {
                     // Empty means our permissive Codable couldn't pull any meters
                     // from the response (shape mismatch or auth-soft-fail).
                     // Treat as failure and fall through to DOM rather than
@@ -1788,10 +1972,16 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                     self.distributeFetchResult(sections, path: "json")
                 }
             case .failure(let err):
-                if case .http(let status) = err, [401, 403, 404].contains(status), self.record.orgPinned {
-                    // Pinned org rejected: signed out. No DOM fallback (the page
-                    // could show a different org) and no circuit-breaker count.
-                    self.logFetchOutcome(path: "json", outcome: "error", detail: "\(err) pinned org, treating account as signed out")
+                if pinned {
+                    // No DOM fallback and no circuit-breaker count for a pinned
+                    // org. Auth errors are confirmed in fetchViaJSON; other
+                    // errors keep the last data via the empty-streak gate.
+                    if case .http(let status) = err, [401, 403, 404].contains(status) {
+                        self.logFetchOutcome(path: "json", outcome: "error", detail: "\(err) pinned org, checking sign-in")
+                    } else {
+                        self.logFetchOutcome(path: "json", outcome: "error", detail: "\(err) pinned org, no DOM fallback")
+                        self.distributeFetchResult([], path: "json")
+                    }
                     return
                 }
                 self.jsonConsecutiveFailures += 1
@@ -1839,6 +2029,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// Shared distribution + empty-streak gate. Both JSON and DOM paths feed
     /// here so the popover and badge see a single source of truth.
     private func distributeFetchResult(_ sections: [UsageSection], path: String) {
+        guard !isTornDown else { return }
         if sections.isEmpty {
             // Transient empty — keep last-known data on screen. Only a
             // sustained streak (threshold) is treated as a real failure.
@@ -2034,6 +2225,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             self.discoverOrgUUID(session: session) { [weak self] uuid in
                 guard let self = self else { return }
                 guard let uuid = uuid else {
+                    session.finishTasksAndInvalidate()
                     self.jsonFetchInFlight = false
                     completion(.failure(.noOrg))
                     return
@@ -2041,6 +2233,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
 
                 let urlStr = "https://claude.ai" + String(format: AppDelegate.apiUsagePath, uuid)
                 guard let url = URL(string: urlStr) else {
+                    session.finishTasksAndInvalidate()
                     self.jsonFetchInFlight = false
                     completion(.failure(.noOrg))
                     return
@@ -2062,8 +2255,8 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                         if status == 401 || status == 403 || status == 404 {
                             if self.record.orgPinned {
                                 // Never silently swap a user-pinned org for another
-                                // one: keep the UUID and read as signed out.
-                                self.setSignedOut(true, reason: "usage API HTTP \(status) for pinned org")
+                                // one: keep the UUID; sign out only if the API agrees.
+                                self.confirmSignedOut(reason: "usage API HTTP \(status) for pinned org")
                             } else {
                                 // Cached UUID may be stale; clear so next attempt rediscovers.
                                 self.cachedOrgUUID = nil
@@ -2089,6 +2282,8 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                         }
                     }
                 }.resume()
+                // Last task on this per-call session: let it finish, then free it.
+                session.finishTasksAndInvalidate()
             }
         }
     }
@@ -2134,7 +2329,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// GET /api/organizations with this account's cookies. Calls back on the
     /// main queue with the HTTP status (0 on a transport error) and the
     /// decoded orgs (nil unless 2xx). Logs counts only.
-    func requestOrgList(session: URLSession, context: String,
+    func requestOrgList(session: URLSession, context: String, quiet: Bool = false,
                         completion: @escaping (Int, [OrgListResponse.Org]?) -> Void) {
         var req = URLRequest(url: AppDelegate.apiOrgsURL)
         req.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -2144,11 +2339,11 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             DispatchQueue.main.async {
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if let err = err {
-                    NSLog("%@", "[ClaudeMeter] \(context) transport error: \(err.localizedDescription)")
+                    if !quiet { NSLog("%@", "[ClaudeMeter] \(context) transport error: \(err.localizedDescription)") }
                     completion(0, nil); return
                 }
                 guard status >= 200, status < 300, let data = data else {
-                    NSLog("%@", "[ClaudeMeter] \(context) HTTP \(status), bytes=\(data?.count ?? 0)")
+                    if !quiet { NSLog("%@", "[ClaudeMeter] \(context) HTTP \(status), bytes=\(data?.count ?? 0)") }
                     completion(status, nil); return
                 }
                 var orgs: [OrgListResponse.Org] = []
@@ -2159,7 +2354,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                 } else {
                     NSLog("%@", "[ClaudeMeter] \(context) decode failed (\(data.count) bytes)")
                 }
-                NSLog("%@", "[ClaudeMeter] \(context) got \(orgs.count) orgs")
+                if !quiet { NSLog("%@", "[ClaudeMeter] \(context) got \(orgs.count) orgs") }
                 completion(status, orgs)
             }
         }.resume()
@@ -2170,14 +2365,16 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// works because /api/organizations is a different endpoint.
     func refreshPlanTierIfNeeded() {
         copyCookiesToSession { [weak self] session in
-            guard let self = self else { return }
-            self.discoverOrgUUID(session: session) { _ in }
+            guard let self = self else { session.finishTasksAndInvalidate(); return }
+            self.discoverOrgUUID(session: session) { _ in session.finishTasksAndInvalidate() }
         }
     }
 
     /// Snapshots all WKWebView cookies into a URLSession so the JSON request
     /// rides the same authenticated session as the page itself.
-    func copyCookiesToSession(completion: @escaping (URLSession) -> Void) {
+    /// The caller owns the returned per-call session and must call
+    /// finishTasksAndInvalidate() after creating its last task.
+    func copyCookiesToSession(logCount: Bool = true, completion: @escaping (URLSession) -> Void) {
         let store = webView.configuration.websiteDataStore.httpCookieStore
         store.getAllCookies { cookies in
             // ephemeral config already has its own in-memory HTTPCookieStorage.
@@ -2190,7 +2387,9 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             }
             config.httpShouldSetCookies = true
             config.httpCookieAcceptPolicy = .always
-            NSLog("%@", "[ClaudeMeter] copyCookiesToSession: attached \(cookies.count) cookies")
+            if logCount {
+                NSLog("%@", "[ClaudeMeter] copyCookiesToSession: attached \(cookies.count) cookies")
+            }
             let session = URLSession(configuration: config)
             DispatchQueue.main.async { completion(session) }
         }
@@ -2478,6 +2677,12 @@ enum AccountStore {
 
     static func load() -> [AccountRecord] {
         read().records
+    }
+
+    /// True when the saved list (if any) parsed and every record decoded.
+    static var isListFullyReadable: Bool {
+        let stored = read()
+        return stored.writable && stored.undecodable.isEmpty
     }
 
     static func save(_ records: [AccountRecord]) {
@@ -2999,6 +3204,17 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
             if let err = err {
                 NSLog("[ClaudeMeter] notif dispatch error: %@", err.localizedDescription)
             }
+        }
+    }
+
+    /// Removes delivered notifications that belong to one account.
+    func removeDeliveredNotifications(forAccount accountID: String) {
+        center.getDeliveredNotifications { [weak self] delivered in
+            let ids = delivered.filter {
+                ($0.request.content.userInfo["accountID"] as? String) == accountID
+            }.map { $0.request.identifier }
+            guard !ids.isEmpty else { return }
+            self?.center.removeDeliveredNotifications(withIdentifiers: ids)
         }
     }
 
