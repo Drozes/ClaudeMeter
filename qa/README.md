@@ -150,6 +150,22 @@ is exactly the failure mode that prompted this whole pipeline.
 
 Install as a launchd agent via [drift/com.claudemeter.qa.drift.plist](drift/com.claudemeter.qa.drift.plist).
 
+## Multi-account flow test ([multiaccount/run.sh](multiaccount/run.sh))
+
+Not part of `qa.sh` (about 45s, and it briefly opens two login windows).
+Builds `ClaudeMeter.swift` together with
+[multiaccount/testhooks.swift](multiaccount/testhooks.swift) using
+`-D CLAUDEMETER_TESTHOOKS` (release builds never include the hooks), into an
+isolated bundle `com.local.ClaudeMeter.qa.multi` with its own prefs domain,
+Application Support folder and WebKit stores. It seeds three accounts (the
+real primary plus two secondaries on empty isolated stores) and drives the
+real code paths: signed-out detection without auto-opened windows, the
+Accounts menu, staggered timers, rename, add, cancelled add, a requested
+login window, and removal (record, exact-ID keys, history file, WebKit
+store). It cleans up the test domain and folders afterwards (`--keep` leaves
+them). Like L0/L3, the primary account imports Claude Desktop cookies into
+the bundle's own store and fetches live usage.
+
 ## Environment variables
 
 | Var | Default | Effect |
