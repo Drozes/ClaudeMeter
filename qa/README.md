@@ -152,19 +152,33 @@ Install as a launchd agent via [drift/com.claudemeter.qa.drift.plist](drift/com.
 
 ## Multi-account flow test ([multiaccount/run.sh](multiaccount/run.sh))
 
-Not part of `qa.sh` (about 45s, and it briefly opens two login windows).
-Builds `ClaudeMeter.swift` together with
+Not part of `qa.sh` (about 2 minutes; it briefly opens login windows and the
+popover). Builds `ClaudeMeter.swift` together with
 [multiaccount/testhooks.swift](multiaccount/testhooks.swift) using
 `-D CLAUDEMETER_TESTHOOKS` (release builds never include the hooks), into an
 isolated bundle `com.local.ClaudeMeter.qa.multi` with its own prefs domain,
-Application Support folder and WebKit stores. It seeds three accounts (the
-real primary plus two secondaries on empty isolated stores) and drives the
-real code paths: signed-out detection without auto-opened windows, the
-Accounts menu, staggered timers, rename, add, cancelled add, a requested
-login window, and removal (record, exact-ID keys, history file, WebKit
-store). It cleans up the test domain and folders afterwards (`--keep` leaves
-them). Like L0/L3, the primary account imports Claude Desktop cookies into
-the bundle's own store and fetches live usage.
+Application Support folder and WebKit stores, and runs two scenarios through
+the real code paths:
+
+- **A, accounts:** three seeded accounts (the real primary plus two
+  secondaries on empty isolated stores): API-confirmed signed-out detection
+  without auto-opened windows, the Accounts menu (including Badge Position
+  and Badge Label), staggered timers, rename, add, cancelled add, a requested
+  login window, removal (record, exact-ID keys, history file, WebKit store),
+  and the orphaned-store sweep.
+- **B, badge and popover:** one account (`47%`, popover is the usage view
+  itself), two accounts (`P 47% | W --`, `P 47% | W 12%`), slot reassignment
+  moving the occupant to Hidden (`W 12%`), right-then-left order, both slots
+  hidden (falls back to the primary account), a custom label, a signed-out
+  side (`--`), three accounts stacked in the popover with the popover sized
+  to their sum, and back to one account.
+
+It cleans up the test domain and folders afterwards (`--keep` leaves them).
+Like L0/L3, the primary account imports Claude Desktop cookies into the
+bundle's own store and fetches live usage.
+
+The L3 smoke regex and the L4 OCR accept all three badge forms: `47%`,
+`W 47%` and `P 47% | W 12%` (a side may read `--`).
 
 ## Environment variables
 

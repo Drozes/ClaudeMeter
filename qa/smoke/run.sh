@@ -66,7 +66,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 5. Poll: tail stderr for "badge title: '...' -> '<digits>%'".
+# 5. Poll: tail stderr for "badge title: '...' -> '<badge>'" where <badge> is
+#    one of the three badge forms below. Labels are 1 to 3 characters.
+SIDE="([0-9]+%|--|$(printf '\342\200\224')%)"
+LABEL="[^ |']{1,3}"
+BADGE_FORM="([0-9]+%|${LABEL} ${SIDE}( \| ${LABEL} ${SIDE})?)"
 #    A real percentage (not "—%", not "") in the *target* of the transition
 #    proves the data pipeline reached the badge writer.
 log "watching stderr for ${TIMEOUT}s for a real percentage badge update"
@@ -86,14 +90,18 @@ while :; do
         exit 1
     fi
 
-    # Look for an arrow target that's a real percentage.
-    # Match: badge title: '<anything>' -> '<digits>%' (
+    # Look for an arrow target that is one of the three badge forms with at
+    # least one real percentage:
+    #   one account:            '47%'
+    #   one slot, 2+ accounts:  'W 47%'
+    #   both slots:             'P 47% | W 12%'   (a side may read '--' or '—%')
     # Transitions with reason "applyBadgeVisibility cached=" are excluded: they
     # restore a cached value at launch and prove nothing about fetching.
-    line=$(grep -E "badge title: '[^']*' -> '[0-9]+%'" "$STDERR" 2>/dev/null \
+    line=$(grep -E "badge title: '[^']*' -> '${BADGE_FORM}' \(" "$STDERR" 2>/dev/null \
+        | grep -E -e "-> '[^']*[0-9]+%" \
         | grep -v "(applyBadgeVisibility cached=" | tail -1)
     if [ -n "$line" ]; then
-        badge=$(echo "$line" | sed -E "s/.*-> '([0-9]+%)'.*/\1/")
+        badge=$(echo "$line" | sed -E "s/.*-> '([^']*)' \(.*/\1/")
         log "PASS: badge updated to $badge"
         log "  log line: $(echo "$line" | sed 's/.*\[ClaudeMeter\]/  [ClaudeMeter]/')"
 

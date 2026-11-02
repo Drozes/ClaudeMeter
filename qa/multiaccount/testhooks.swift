@@ -19,6 +19,15 @@
 //   seedKeys:<index>        write one synthetic key per per-account family
 //   keys:<index>            count that account's namespaced keys
 //   remove:<index>          remove through AppDelegate.removeAccount
+//   badge                   log the status-item title
+//   setSlot:<index>:<slot>  left | right | hidden (moves an occupant to hidden)
+//   setLabel:<index>:<txt>  badge label
+//   inject:<index>:<pct>    feed synthetic sections (session pct, weekly 30%)
+//   signOut:<index>         mark the account signed out
+//   openPopover / closePopover
+//   popover                 log popover mode, sections and heights
+//   makeOrphanStore         create an isolated store no account references
+//   sweep                   run the orphaned-store sweep now
 //   done                    log QA-DONE and quit
 
 import Cocoa
@@ -90,6 +99,49 @@ extension AppDelegate {
                 let stillSaved = AccountStore.load().contains { $0.id == id }
                 NSLog("%@", "QA-REMOVED id=\(id) keysLeft=\(qaKeyCount(id)) recordLeft=\(stillSaved) historyLeft=\(FileManager.default.fileExists(atPath: historyURL.path))")
             }
+        case "badge":
+            NSLog("%@", "QA-BADGE title='\(statusItem.button?.title ?? "")'")
+        case "setSlot":
+            if let a = qaAccount(parts), parts.count > 2 {
+                let slot: BadgeSlot = parts[2] == "left" ? .left : (parts[2] == "right" ? .right : .hidden)
+                setBadgeSlot(slot, for: a)
+            }
+        case "setLabel":
+            if let a = qaAccount(parts), parts.count > 2 { setBadgeLabel(parts[2], for: a) }
+        case "inject":
+            if let a = qaAccount(parts), parts.count > 2, let pct = Int(parts[2]) {
+                a.distributeFetchResult([
+                    UsageSection(title: "Session limit", meters: [UsageMeter(label: "Current session", percentage: pct, detail: "")]),
+                    UsageSection(title: "Weekly limit", meters: [UsageMeter(label: "Weekly usage", percentage: 30, detail: "")]),
+                ], path: "qa")
+            }
+        case "signOut":
+            qaAccount(parts)?.setSignedOut(true, reason: "qa")
+        case "openPopover":
+            if popover?.isShown != true { togglePopover() }
+            delay = 2.0
+        case "closePopover":
+            if popover?.isShown == true { popover.performClose(nil) }
+        case "popover":
+            let vc = popover?.contentViewController
+            if let multi = multiAccountView, vc?.view === multi {
+                let states = multi.sectionStates.map { "\($0.showsUsage ? "usage" : "signedOut"):\(Int($0.usageHeight))" }
+                NSLog("%@", "QA-POPOVER mode=multi sections=\(states.count) [\(states.joined(separator: ","))] total=\(Int(multi.contentHeight)) contentSize=\(Int(popover.contentSize.height)) shown=\(popover.isShown)")
+            } else {
+                NSLog("%@", "QA-POPOVER mode=single usageViewIsContent=\(vc?.view === usageView) contentSize=\(Int(popover?.contentSize.height ?? 0))")
+            }
+        case "makeOrphanStore":
+            if #available(macOS 14.0, *) {
+                let id = UUID()
+                let config = WKWebViewConfiguration()
+                config.websiteDataStore = WKWebsiteDataStore(forIdentifier: id)
+                var webView: WKWebView? = WKWebView(frame: .zero, configuration: config)
+                webView?.loadHTMLString("<p>qa</p>", baseURL: URL(string: "https://example.invalid/"))
+                NSLog("%@", "QA-ORPHAN id=\(id)")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { webView = nil }
+            }
+        case "sweep":
+            sweepOrphanedDataStores()
         case "done":
             NSLog("%@", "QA-DONE")
             NSApp.terminate(nil)

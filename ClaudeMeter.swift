@@ -27,6 +27,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var pendingAccounts: [AccountController] = []
     var signInMenuItem: NSMenuItem?
     var accountsMenuItems: [NSMenuItem] = []
+    // Two or more accounts: the stacked popover view, each secondary
+    // account's own usage view, and each badge side's last text.
+    var multiAccountView: MultiAccountUsageView?
+    var accountViews: [String: UsageContentView] = [:]
+    var badgeSideText: [String: String] = [:]
+    var badgeWasMulti = false
     var usageView: UsageContentView!
     var contextMenu: NSMenu!
 
@@ -81,12 +87,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         didSet {
             UserDefaults.standard.set(showBurnRate, forKey: Self.showBurnRateKey)
             usageView?.showBurnRate = showBurnRate
+            accountViews.values.forEach { $0.showBurnRate = showBurnRate }
         }
     }
     var showSparkline: Bool = AppDelegate.boolPref(key: AppDelegate.showSparklineKey, default: true) {
         didSet {
             UserDefaults.standard.set(showSparkline, forKey: Self.showSparklineKey)
             usageView?.showSparkline = showSparkline
+            accountViews.values.forEach { $0.showSparkline = showSparkline }
         }
     }
     private static func boolPref(key: String, default defaultValue: Bool) -> Bool {
@@ -317,10 +325,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // primary account first imports Claude Desktop cookies; secondary
         // accounts load from their own isolated store, staggered.
         accounts = makeAccountControllers()
+        normalizeBadgeSlots()
         let account = accounts[0]
         accounts.forEach { $0.start() }
-
-        rebuildAccountsMenu()
 
         // Native popover content, sized to skeleton, auto-resizes on content load.
         usageView = UsageContentView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
@@ -342,24 +349,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.animates = true
 
         usageView.onContentSizeChanged = { [weak self] height in
-            guard let self = self else { return }
-            // Use as much of the screen as macOS permits. NSPopover hard-caps
-            // around (visibleFrame - small margin) on its own; we just need to
-            // not under-clamp ahead of it. Floor at 1200 so smaller screens
-            // still get a generously tall popover.
-            let screenMax = (NSScreen.main?.visibleFrame.height ?? 1200) - 40
-            let ceiling = max(1200, screenMax)
-            let clamped = min(max(height, 120), ceiling)
-            let current = self.popover.contentSize.height
-            // Only animate if height changed meaningfully — sub-pixel layout
-            // rounding differences would otherwise cause the popover to flicker.
-            guard abs(clamped - current) > 2 else { return }
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.3
-                ctx.allowsImplicitAnimation = true
-                self.popover.contentSize = NSSize(width: 400, height: clamped)
-            }
+            self?.applyPopoverContentHeight(height)
         }
+
+        badgeWasMulti = accounts.count >= 2
+        rebuildAccountsMenu()
+        rebuildPopoverContent()
     }
 
     // MARK: - Claude Desktop Cookie Import
@@ -589,9 +584,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             popover.performClose(nil)
         } else {
             accounts.forEach { $0.stopRefreshTimer() }
-            // Only show skeleton on first open; subsequent opens display
-            // the last known data immediately while refreshing in the background.
-            if usageView?.hasContent != true {
+            if accounts.count >= 2 {
+                // Several accounts: skeleton per account without data yet,
+                // then size the popover to all sections.
+                rebuildPopoverContent()
+                for account in accounts where !account.isSignedOut {
+                    let view = usageView(for: account)
+                    if view.hasContent { view.setStatusLoading() } else { view.showLoadingSkeleton() }
+                }
+                if let multi = multiAccountView {
+                    let h = multi.contentHeight
+                    popover.contentSize = NSSize(width: 400, height: min(max(h, 120), max(1200, (NSScreen.main?.visibleFrame.height ?? 1200) - 40)))
+                }
+            } else if usageView?.hasContent != true {
+                // Only show skeleton on first open; subsequent opens display
+                // the last known data immediately while refreshing in the background.
                 usageView?.showLoadingSkeleton()
                 if let h = usageView?.skeletonHeight {
                     popover.contentSize = NSSize(width: 400, height: h)
@@ -602,9 +609,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             accounts.forEach { account in account.staggered { account.softReload() } }
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
-            usageView?.scrollToTop()
+            if let multi = multiAccountView, accounts.count >= 2 {
+                multi.scrollToTop()
+            } else {
+                usageView?.scrollToTop()
+            }
             accounts.forEach { $0.startRefreshTimer() }
-            usageView?.startCountdownTicker()
+            activeUsageViews.forEach { $0.startCountdownTicker() }
         }
     }
 
@@ -671,8 +682,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func popoverDidClose(_ notification: Notification) {
         NSLog("[ClaudeMeter] popoverDidClose")
         accounts.forEach { $0.stopRefreshTimer() }
-        usageView?.stopCountdownTicker()
+        activeUsageViews.forEach { $0.stopCountdownTicker() }
         accounts.forEach { $0.refreshCycleCount = 0 }
+        syncBadgeMode()
         updateBadgeFromModel()
         if showMenuBarBadge {
             NSLog("[ClaudeMeter] badge enabled, starting background refresh")
@@ -704,8 +716,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if showMenuBarBadge {
             statusItem.button?.imagePosition = .imageLeading
             // Restore cached value instantly, or show placeholder
-            let cached = accounts.first.map { UserDefaults.standard.integer(forKey: $0.lastBadgePercentageKey) } ?? 0
-            setBadgeTitle(cached > 0 ? "\(cached)%" : "\u{2014}%", reason: "applyBadgeVisibility cached=\(cached)")
+            restoreCachedBadge()
             updateBadgeFromModel()
             // Start background refresh if popover isn't open
             if popover?.isShown != true {
@@ -727,7 +738,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // Don't change badge while the popover is shown — resizing the status
         // item shifts the popover anchor and causes visible flicker.
         guard popover?.isShown != true else { return }
-        // Single account today: the badge mirrors the first account.
+        // Two or more accounts: the two-slot badge ("P 47% | W 12%").
+        if accounts.count >= 2 {
+            updateMultiAccountBadge()
+            return
+        }
+        // One account: the badge mirrors it exactly as in v2.7.1 ("47%").
         guard let account = accounts.first else { return }
 
         let badgeKey = account.lastBadgePercentageKey
@@ -760,6 +776,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// stale between fetches.
     func updateMenuBarTooltip() {
         guard let button = statusItem.button else { return }
+        if accounts.count >= 2 {
+            button.toolTip = multiAccountTooltip()
+            return
+        }
         let samples = accounts.first?.history.samples ?? []
         guard !samples.isEmpty else {
             button.toolTip = "ClaudeMeter — no usage data yet"
@@ -846,9 +866,21 @@ extension AppDelegate {
         return accounts.first { $0.id == id }
     }
 
-    /// Called by controllers whenever a record or signed-in state changes.
+    /// Called whenever an account is added or removed, or a record or
+    /// signed-in state changes. With one account only the menu is rebuilt,
+    /// so single-account badge and popover behavior stay exactly as before.
     func accountsDidChange() {
         rebuildAccountsMenu()
+        guard popover != nil else { return }
+        rebuildPopoverContent()
+        if (accounts.count >= 2) != badgeWasMulti {
+            syncBadgeMode()
+            updateBadgeFromModel()
+            updateMenuBarTooltip()
+        } else if accounts.count >= 2 {
+            updateBadgeFromModel()
+            updateMenuBarTooltip()
+        }
     }
 
     /// Restarts the running refresh timers of secondary accounts so offsets
@@ -947,6 +979,18 @@ extension AppDelegate {
                 }
                 accountMenu.addItem(accountMenuItem("Sign In Again\u{2026}", #selector(signInAgain(_:)), account))
                 accountMenu.addItem(accountMenuItem("Rename\u{2026}", #selector(renameAccount(_:)), account))
+                let position = NSMenuItem(title: "Badge Position", action: nil, keyEquivalent: "")
+                let positionMenu = NSMenu()
+                for (tag, slot) in [BadgeSlot.left, .right, .hidden].enumerated() {
+                    let title = slot == .left ? "Left" : (slot == .right ? "Right" : "Hidden")
+                    let item = accountMenuItem(title, #selector(setBadgeSlotFromMenu(_:)), account)
+                    item.tag = tag
+                    item.state = record.badgeSlot == slot ? .on : .off
+                    positionMenu.addItem(item)
+                }
+                position.submenu = positionMenu
+                accountMenu.addItem(position)
+                accountMenu.addItem(accountMenuItem("Badge Label (\(record.badgeLabel))\u{2026}", #selector(editBadgeLabel(_:)), account))
                 if !account.isPrimary {
                     accountMenu.addItem(accountMenuItem("Remove\u{2026}", #selector(removeAccountFromMenu(_:)), account))
                 }
@@ -976,7 +1020,7 @@ extension AppDelegate {
         accountsMenuItems = items
     }
 
-    private func accountMenuItem(_ title: String, _ action: Selector, _ account: AccountController) -> NSMenuItem {
+    func accountMenuItem(_ title: String, _ action: Selector, _ account: AccountController) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = self
         item.representedObject = account.id
@@ -1171,6 +1215,265 @@ extension AppDelegate {
     }
 }
 
+// MARK: - Accounts: combined badge and popover
+
+extension AppDelegate {
+    // MARK: Badge slots
+
+    /// At most one account per badge slot; extra claimants become Hidden.
+    func normalizeBadgeSlots() {
+        var taken = Set<BadgeSlot>()
+        for account in accounts {
+            let slot = account.record.badgeSlot
+            guard slot != .hidden else { continue }
+            if taken.contains(slot) {
+                account.updateRecord { $0.badgeSlot = .hidden }
+                NSLog("%@", "[ClaudeMeter] badge slot \(slot.rawValue) already taken; \(account.id) set to hidden")
+            } else {
+                taken.insert(slot)
+            }
+        }
+    }
+
+    /// Moves an account to a slot. A Left/Right slot holds one account: its
+    /// previous occupant moves to Hidden.
+    func setBadgeSlot(_ slot: BadgeSlot, for account: AccountController) {
+        if slot != .hidden {
+            for other in accounts where other !== account && other.record.badgeSlot == slot {
+                other.updateRecord { $0.badgeSlot = .hidden }
+            }
+        }
+        account.updateRecord { $0.badgeSlot = slot }
+        NSLog("%@", "[ClaudeMeter] badge slot: \(account.id) -> \(slot.rawValue)")
+    }
+
+    /// Sets a 1 to 3 character badge label (trimmed). Returns false if empty.
+    @discardableResult
+    func setBadgeLabel(_ text: String, for account: AccountController) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let label = String(trimmed.prefix(3))
+        account.updateRecord { $0.badgeLabel = label }
+        return true
+    }
+
+    /// Accounts shown in the badge, left then right. One account: that
+    /// account (no label). Several: the Left and Right slot holders; if both
+    /// slots are Hidden, the primary account as if it held Left, so the badge
+    /// never goes blank while "Show Usage in Menu Bar" is on.
+    func badgeAccounts() -> [AccountController] {
+        guard accounts.count >= 2 else { return Array(accounts.prefix(1)) }
+        let left = accounts.first { $0.record.badgeSlot == .left }
+        let right = accounts.first { $0.record.badgeSlot == .right }
+        let shown = [left, right].compactMap { $0 }
+        return shown.isEmpty ? [accounts[0]] : shown
+    }
+
+    func cachedBadgeSideText(for account: AccountController) -> String {
+        let cached = UserDefaults.standard.integer(forKey: account.lastBadgePercentageKey)
+        return cached > 0 ? "\(cached)%" : "\u{2014}%"
+    }
+
+    /// Two or more accounts: refresh each shown side from its own account's
+    /// model (or its own XPath fallback, never for a pinned org), keeping
+    /// that side's last value otherwise.
+    func updateMultiAccountBadge() {
+        for account in badgeAccounts() {
+            let id = account.id
+            if account.isSignedOut { continue }
+            if let pct = account.sessionPercentage(from: account.latestSections) {
+                badgeSideText[id] = "\(pct)%"
+                UserDefaults.standard.set(pct, forKey: account.lastBadgePercentageKey)
+                continue
+            }
+            if badgeSideText[id] == nil { badgeSideText[id] = cachedBadgeSideText(for: account) }
+            guard !account.record.orgPinned else { continue }
+            account.webView.evaluateJavaScript(Self.scrapeSessionPercentageJS) { [weak self, weak account] result, _ in
+                guard let self = self, let account = account, !account.isSignedOut,
+                      self.showMenuBarBadge, self.popover?.isShown != true,
+                      self.accounts.count >= 2, let pct = result as? Int else { return }
+                self.badgeSideText[account.id] = "\(pct)%"
+                UserDefaults.standard.set(pct, forKey: account.lastBadgePercentageKey)
+                self.renderMultiAccountBadge(reason: "XPath fallback scrape")
+            }
+        }
+        renderMultiAccountBadge(reason: "model meter labeled current session")
+    }
+
+    /// "W 47%" with one shown side, "P 47% | W 12%" with two (left first).
+    /// A signed-out side reads "W --".
+    func renderMultiAccountBadge(reason: String) {
+        let parts = badgeAccounts().map { account -> String in
+            let value = account.isSignedOut ? "--" : (badgeSideText[account.id] ?? cachedBadgeSideText(for: account))
+            return "\(account.record.badgeLabel) \(value)"
+        }
+        setBadgeTitle(parts.joined(separator: " | "), reason: reason)
+    }
+
+    /// Restores the badge from cached values (launch, badge re-enabled, or a
+    /// switch between one and several accounts).
+    func restoreCachedBadge() {
+        badgeWasMulti = accounts.count >= 2
+        if accounts.count >= 2 {
+            for account in badgeAccounts() { badgeSideText[account.id] = cachedBadgeSideText(for: account) }
+            renderMultiAccountBadge(reason: "applyBadgeVisibility cached=multi")
+        } else {
+            let cached = accounts.first.map { UserDefaults.standard.integer(forKey: $0.lastBadgePercentageKey) } ?? 0
+            setBadgeTitle(cached > 0 ? "\(cached)%" : "\u{2014}%", reason: "applyBadgeVisibility cached=\(cached)")
+        }
+    }
+
+    /// After the account count crosses between one and several, re-render
+    /// the badge in the matching form (not while the popover is open).
+    func syncBadgeMode() {
+        guard showMenuBarBadge, popover?.isShown != true, (accounts.count >= 2) != badgeWasMulti else { return }
+        restoreCachedBadge()
+    }
+
+    /// An account's empty-scrape streak reached the threshold: blank its side.
+    func badgeAccountFailed(_ account: AccountController, reason: String) {
+        if accounts.count >= 2 {
+            guard badgeAccounts().contains(where: { $0 === account }) else { return }
+            badgeSideText[account.id] = "\u{2014}%"
+            renderMultiAccountBadge(reason: reason)
+        } else if account === accounts.first {
+            setBadgeTitle("\u{2014}%", reason: reason)
+        }
+    }
+
+    /// Two or more accounts: one block per account in the menu-bar tooltip.
+    func multiAccountTooltip() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "h:mma"
+        f.amSymbol = "a"; f.pmSymbol = "p"
+        var lines: [String] = []
+        for account in accounts {
+            let name = account.record.displayName
+            if account.isSignedOut {
+                lines.append("\(name): signed out")
+                continue
+            }
+            var parts: [String] = []
+            if let s = account.sessionPercentage(from: account.latestSections) { parts.append("session \(s)%") }
+            if let w = account.weeklyPercentage(from: account.latestSections) { parts.append("weekly \(w)%") }
+            lines.append("\(name): " + (parts.isEmpty ? "no usage data yet" : parts.joined(separator: " · ")))
+            let samples = account.history.samples
+            if let peak = samples.max(by: { $0.s < $1.s }) {
+                let avg = Int((Double(samples.reduce(0) { $0 + $1.s }) / Double(samples.count)).rounded())
+                let peakTime = f.string(from: Date(timeIntervalSince1970: peak.t)).lowercased()
+                lines.append("  Peak: \(peak.s)% at \(peakTime) · 24h avg: \(avg)%")
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: Popover
+
+    /// Clamps and animates the popover to a content height.
+    func applyPopoverContentHeight(_ height: CGFloat) {
+        // Use as much of the screen as macOS permits. NSPopover hard-caps
+        // around (visibleFrame - small margin) on its own; we just need to
+        // not under-clamp ahead of it. Floor at 1200 so smaller screens
+        // still get a generously tall popover.
+        let screenMax = (NSScreen.main?.visibleFrame.height ?? 1200) - 40
+        let ceiling = max(1200, screenMax)
+        let clamped = min(max(height, 120), ceiling)
+        let current = popover.contentSize.height
+        // Only animate if the height changed meaningfully: sub-pixel layout
+        // rounding differences would otherwise cause the popover to flicker.
+        guard abs(clamped - current) > 2 else { return }
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.3
+            ctx.allowsImplicitAnimation = true
+            self.popover.contentSize = NSSize(width: 400, height: clamped)
+        }
+    }
+
+    /// Each account's own usage view. The primary account's is `usageView`
+    /// (the whole popover with one account); others are created on demand.
+    func usageView(for account: AccountController) -> UsageContentView {
+        if account.isPrimary, let view = usageView { return view }
+        if let view = accountViews[account.id] { return view }
+        let view = UsageContentView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        view.planTierDisplayName = Self.planTierDisplayName(slug: account.cachedPlanTier)
+        view.showBurnRate = showBurnRate
+        view.showSparkline = showSparkline
+        account.usageView = view
+        accountViews[account.id] = view
+        account.renderLatest()
+        return view
+    }
+
+    /// The usage views currently in the popover.
+    var activeUsageViews: [UsageContentView] {
+        guard accounts.count >= 2 else { return usageView.map { [$0] } ?? [] }
+        return accounts.map { usageView(for: $0) }
+    }
+
+    /// One account: the popover is exactly that account's usage view, as
+    /// before. Two or more: the stacked multi-account view.
+    func rebuildPopoverContent() {
+        guard let vc = popover?.contentViewController, let primaryView = usageView else { return }
+        if accounts.count >= 2 {
+            let multi: MultiAccountUsageView
+            if let existing = multiAccountView {
+                multi = existing
+            } else {
+                multi = MultiAccountUsageView(frame: NSRect(x: 0, y: 0, width: 400, height: popover.contentSize.height))
+                multi.onContentSizeChanged = { [weak self] height in self?.applyPopoverContentHeight(height) }
+                multi.onSignInAgain = { [weak self] id in
+                    guard let self = self, let account = self.account(withID: id) else { return }
+                    if self.popover.isShown { self.popover.performClose(nil) }
+                    account.showLoginWindow()
+                }
+                multiAccountView = multi
+            }
+            if vc.view !== multi { vc.view = multi }
+            let entries = accounts.map { account -> MultiAccountUsageView.Entry in
+                let record = account.record
+                let tier = Self.planTierDisplayName(slug: record.planTier)
+                let view = usageView(for: account)
+                view.planTierDisplayName = tier
+                let detail = [record.email ?? record.orgName, tier].compactMap { $0 }.joined(separator: " · ")
+                return MultiAccountUsageView.Entry(accountID: account.id, title: record.displayName,
+                                                   detail: detail.isEmpty ? nil : detail,
+                                                   signedOut: account.isSignedOut, usageView: view)
+            }
+            multi.reload(entries)
+        } else if let multi = multiAccountView {
+            multi.detachAll()
+            multiAccountView = nil
+            primaryView.isEmbedded = false
+            primaryView.isHidden = false
+            primaryView.translatesAutoresizingMaskIntoConstraints = true
+            primaryView.frame = NSRect(x: 0, y: 0, width: 400, height: popover.contentSize.height)
+            primaryView.onContentSizeChanged = { [weak self] height in self?.applyPopoverContentHeight(height) }
+            vc.view = primaryView
+            applyPopoverContentHeight(primaryView.skeletonHeight)
+        }
+        let live = Set(accounts.map { $0.id })
+        accountViews = accountViews.filter { live.contains($0.key) }
+    }
+
+    // MARK: Menu actions for the badge
+
+    @objc func setBadgeSlotFromMenu(_ sender: NSMenuItem) {
+        guard let account = account(withID: sender.representedObject as? String) else { return }
+        let slots: [BadgeSlot] = [.left, .right, .hidden]
+        guard slots.indices.contains(sender.tag) else { return }
+        setBadgeSlot(slots[sender.tag], for: account)
+    }
+
+    @objc func editBadgeLabel(_ sender: NSMenuItem) {
+        guard let account = account(withID: sender.representedObject as? String) else { return }
+        guard let text = promptForText(title: "Badge Label",
+                                       message: "One to three characters shown before this account's percentage in the menu bar.",
+                                       defaultValue: account.record.badgeLabel,
+                                       confirmTitle: "Save") else { return }
+        setBadgeLabel(text, for: account)
+    }
+}
+
 // MARK: - Account Controller
 
 /// Per-account metering engine. Owns one claude.ai session end to end: the
@@ -1206,6 +1509,10 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     var refreshCycleCount: Int = 0
     // v2.7: latest session forecast, read by the menu-bar tooltip.
     var lastSessionForecast: UsageForecast?
+    // Latest render inputs, replayed into a usage view created later.
+    var lastWeeklyForecast: UsageForecast?
+    var lastSessionResetAt: Date?
+    var lastWeeklyResetAt: Date?
 
     /// Persisted, non-secret description of this account (id, label, badge
     /// slot, org, plan tier, store identifier). Saved through AccountStore.
@@ -1435,6 +1742,18 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                 work()
             }
         }
+    }
+
+    /// Pushes the latest data into a usage view created after it arrived.
+    func renderLatest() {
+        guard let view = usageView, !latestSections.isEmpty else { return }
+        view.update(sections: latestSections,
+                    sessionForecast: lastSessionForecast,
+                    weeklyForecast: lastWeeklyForecast,
+                    sessionResetAt: lastSessionResetAt,
+                    weeklyResetAt: lastWeeklyResetAt,
+                    history: history)
+        view.setStatusFresh(true)
     }
 
     /// Import cookies and start loading. The primary account imports Claude
@@ -1889,10 +2208,6 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         }
     }
 
-    /// The menu-bar badge shows the first (primary) account until the
-    /// two-slot badge ships.
-    var drivesBadge: Bool { app.accounts.first === self }
-
     /// Extract the "Current session" percentage from the shared data store.
     func sessionPercentage(from sections: [UsageSection]) -> Int? {
         for section in sections {
@@ -2028,7 +2343,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
 
     /// Shared distribution + empty-streak gate. Both JSON and DOM paths feed
     /// here so the popover and badge see a single source of truth.
-    private func distributeFetchResult(_ sections: [UsageSection], path: String) {
+    func distributeFetchResult(_ sections: [UsageSection], path: String) {
         guard !isTornDown else { return }
         if sections.isEmpty {
             // Transient empty — keep last-known data on screen. Only a
@@ -2039,9 +2354,9 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                 NSLog("[ClaudeMeter] empty-scrape threshold reached, surfacing failure")
                 self.latestSections = []
                 self.usageView?.update(sections: [])
-                // Only the badge's account may reset the badge.
-                if self.drivesBadge && self.app.showMenuBarBadge && self.app.popover?.isShown != true {
-                    self.app.setBadgeTitle("\u{2014}%", reason: "empty-scrape streak \(self.consecutiveEmptyScrapes)")
+                // Each badge side resets on its own account's failure streak.
+                if self.app.showMenuBarBadge && self.app.popover?.isShown != true {
+                    self.app.badgeAccountFailed(self, reason: "empty-scrape streak \(self.consecutiveEmptyScrapes)")
                 }
             }
             return
@@ -2087,6 +2402,9 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         )
 
         self.lastSessionForecast = sessionForecast
+        self.lastWeeklyForecast = weeklyForecast
+        self.lastSessionResetAt = sessionReset
+        self.lastWeeklyResetAt = weeklyReset
         self.usageView?.update(
             sections: sections,
             sessionForecast: sessionForecast,
@@ -3534,8 +3852,246 @@ extension Date {
 
 // MARK: - Native Usage View
 
-class UsageContentView: NSView {
+// MARK: - Multi-Account Popover
+
+/// NSScrollView that hands scroll-wheel events to the enclosing scroll view
+/// when `passesScrollToParent` is set: a usage view embedded in the
+/// multi-account popover is pinned to its content height, so the outer view
+/// does the scrolling.
+final class PassthroughScrollView: NSScrollView {
+    var passesScrollToParent = false
+    override func scrollWheel(with event: NSEvent) {
+        if passesScrollToParent {
+            nextResponder?.scrollWheel(with: event)
+        } else {
+            super.scrollWheel(with: event)
+        }
+    }
+}
+
+/// Popover content for two or more accounts. One section per account: a
+/// header (name; org or email; plan tier) above that account's own
+/// UsageContentView, or a compact "Signed out" row with a Sign In Again
+/// button instead of stale numbers. Sections stack in one scroll view; each
+/// embedded usage view is pinned to its content height and the total is
+/// reported through onContentSizeChanged, so the popover fits every account.
+final class MultiAccountUsageView: NSView {
+    struct Entry {
+        let accountID: String
+        let title: String
+        let detail: String?
+        let signedOut: Bool
+        let usageView: UsageContentView
+    }
+
+    var onContentSizeChanged: ((CGFloat) -> Void)?
+    var onSignInAgain: ((String) -> Void)?
+
     private let scrollView = NSScrollView()
+    private let stack = NSStackView()
+    private var emitScheduled = false
+
+    private final class Section {
+        let accountID: String
+        let titleLabel: NSTextField
+        let detailLabel: NSTextField
+        let signedOutRow: NSView
+        let usageView: UsageContentView
+        let usageHeight: NSLayoutConstraint
+        var arranged: [NSView] = []
+        init(accountID: String, titleLabel: NSTextField, detailLabel: NSTextField,
+             signedOutRow: NSView, usageView: UsageContentView, usageHeight: NSLayoutConstraint) {
+            self.accountID = accountID
+            self.titleLabel = titleLabel
+            self.detailLabel = detailLabel
+            self.signedOutRow = signedOutRow
+            self.usageView = usageView
+            self.usageHeight = usageHeight
+        }
+    }
+    private var sections: [Section] = []
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(red: 0x1a/255.0, green: 0x1a/255.0, blue: 0x1a/255.0, alpha: 1).cgColor
+
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.drawsBackground = false
+        scrollView.scrollerStyle = .overlay
+        addSubview(scrollView)
+
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 0
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 4, right: 0)
+        scrollView.documentView = stack
+
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            stack.widthAnchor.constraint(equalTo: scrollView.widthAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// Total height of all sections at their content heights.
+    var contentHeight: CGFloat {
+        stack.layoutSubtreeIfNeeded()
+        return stack.fittingSize.height
+    }
+
+    /// Per-section state, read by the QA test hooks.
+    var sectionStates: [(accountID: String, showsUsage: Bool, usageHeight: CGFloat)] {
+        sections.map { ($0.accountID, !$0.usageView.isHidden, $0.usageHeight.constant) }
+    }
+
+    /// Same accounts in the same order: update headers and signed-out rows in
+    /// place. Otherwise rebuild the sections (embedded views are reused).
+    func reload(_ entries: [Entry]) {
+        if entries.map({ $0.accountID }) == sections.map({ $0.accountID }) {
+            for (section, entry) in zip(sections, entries) { apply(entry, to: section) }
+        } else {
+            rebuild(entries)
+        }
+        scheduleEmit()
+    }
+
+    /// Detaches every embedded usage view (before the popover goes back to
+    /// a single account's view).
+    func detachAll() {
+        rebuild([])
+    }
+
+    func scrollToTop() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let doc = self.scrollView.documentView else { return }
+            doc.scroll(NSPoint(x: 0, y: doc.bounds.height))
+            self.scrollView.reflectScrolledClipView(self.scrollView.contentView)
+        }
+    }
+
+    private func rebuild(_ entries: [Entry]) {
+        for section in sections {
+            section.usageHeight.isActive = false
+            section.usageView.onContentSizeChanged = nil
+        }
+        stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        sections.removeAll()
+
+        for (i, entry) in entries.enumerated() {
+            var arranged: [NSView] = []
+            if i > 0 {
+                let divider = NSView()
+                divider.wantsLayer = true
+                divider.layer?.backgroundColor = NSColor(white: 0.3, alpha: 1).cgColor
+                divider.translatesAutoresizingMaskIntoConstraints = false
+                divider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+                arranged.append(divider)
+            }
+
+            let title = label(entry.title, size: 13, weight: .semibold, color: .white)
+            let detail = label("", size: 11, weight: .regular, color: NSColor(white: 0.55, alpha: 1))
+            let header = NSStackView(views: [title, detail])
+            header.orientation = .vertical
+            header.alignment = .leading
+            header.spacing = 1
+            header.edgeInsets = NSEdgeInsets(top: 10, left: 16, bottom: 0, right: 28)
+            arranged.append(header)
+
+            let signedOutLabel = label("Signed out", size: 12, weight: .regular, color: NSColor(white: 0.7, alpha: 1))
+            let button = NSButton(title: "Sign In Again\u{2026}", target: self, action: #selector(signInAgainPressed(_:)))
+            button.bezelStyle = .rounded
+            button.controlSize = .small
+            button.identifier = NSUserInterfaceItemIdentifier(entry.accountID)
+            let spacer = NSView()
+            spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            let row = NSStackView(views: [signedOutLabel, spacer, button])
+            row.orientation = .horizontal
+            row.edgeInsets = NSEdgeInsets(top: 6, left: 16, bottom: 10, right: 16)
+            arranged.append(row)
+
+            let usage = entry.usageView
+            usage.removeFromSuperview()
+            usage.isEmbedded = true
+            usage.translatesAutoresizingMaskIntoConstraints = false
+            let height = usage.heightAnchor.constraint(equalToConstant: max(usage.skeletonHeight, 60))
+            height.isActive = true
+            arranged.append(usage)
+
+            for view in arranged {
+                stack.addArrangedSubview(view)
+                view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
+            let section = Section(accountID: entry.accountID, titleLabel: title, detailLabel: detail,
+                                  signedOutRow: row, usageView: usage, usageHeight: height)
+            section.arranged = arranged
+            usage.onContentSizeChanged = { [weak self, weak section] h in
+                guard let self = self, let section = section else { return }
+                if abs(section.usageHeight.constant - h) > 0.5 {
+                    section.usageHeight.constant = h
+                }
+                self.scheduleEmit()
+            }
+            sections.append(section)
+            apply(entry, to: section)
+        }
+    }
+
+    private func apply(_ entry: Entry, to section: Section) {
+        if section.titleLabel.stringValue != entry.title { section.titleLabel.stringValue = entry.title }
+        let detail = entry.detail ?? ""
+        if section.detailLabel.stringValue != detail { section.detailLabel.stringValue = detail }
+        section.detailLabel.isHidden = detail.isEmpty
+        section.signedOutRow.isHidden = !entry.signedOut
+        section.usageView.isHidden = entry.signedOut
+    }
+
+    /// Coalesces height reports from all sections into one callback.
+    private func scheduleEmit() {
+        guard !emitScheduled else { return }
+        emitScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.emitScheduled = false
+            let total = self.contentHeight
+            NSLog("%@", "[ClaudeMeter] popover sizing(multi): sections=\(self.sections.count) total=\(total)")
+            self.onContentSizeChanged?(total)
+        }
+    }
+
+    @objc private func signInAgainPressed(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue else { return }
+        onSignInAgain?(id)
+    }
+
+    private func label(_ text: String, size: CGFloat, weight: NSFont.Weight, color: NSColor) -> NSTextField {
+        let field = NSTextField(labelWithString: text)
+        field.font = NSFont.systemFont(ofSize: size, weight: weight)
+        field.textColor = color
+        field.lineBreakMode = .byTruncatingTail
+        return field
+    }
+}
+
+class UsageContentView: NSView {
+    private let scrollView = PassthroughScrollView()
+    /// True inside the multi-account popover: the view is pinned to its
+    /// content height, scrolling is left to the outer view and the vertical
+    /// scroller is hidden. False (the default) is the single-account popover.
+    var isEmbedded = false {
+        didSet {
+            guard oldValue != isEmbedded else { return }
+            scrollView.passesScrollToParent = isEmbedded
+            scrollView.hasVerticalScroller = !isEmbedded
+        }
+    }
     private let stackView = NSStackView()
     private let statusDot = NSView()
     var onContentSizeChanged: ((CGFloat) -> Void)?
