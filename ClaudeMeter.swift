@@ -15,10 +15,13 @@ struct ClaudeMeterApp {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate, NSPopoverDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
-    var webView: WKWebView!
+    // Per-account metering engines (WKWebView, timers, fetch state, history).
+    // Holds exactly one controller today: the default-store account that the
+    // Claude Desktop import feeds.
+    var accounts: [AccountController] = []
     var usageView: UsageContentView!
     var contextMenu: NSMenu!
 
@@ -32,8 +35,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         let saved = UserDefaults.standard.double(forKey: AppDelegate.refreshIntervalKey)
         return saved > 0 ? saved : 6.0
     }()
-    var refreshTimer: Timer?
-    var lastRefreshDate: Date?
 
     // Menu bar badge
     static let badgeIntervalKey = "badgeRefreshInterval"
@@ -44,8 +45,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         let saved = UserDefaults.standard.double(forKey: AppDelegate.badgeIntervalKey)
         return saved > 0 ? saved : 120.0
     }()
-    // v2.7 — track latest session forecast for the menu-bar tooltip.
-    var lastSessionForecast: UsageForecast?
+    // v2.7: refresh the menu-bar tooltip between scrapes.
     var tooltipRefreshTimer: Timer?
 
     // Update checking
@@ -54,35 +54,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     var checkForUpdatesMenuItem: NSMenuItem?
     var versionMenuItem: NSMenuItem?
     var updateBadgeDot: NSView?
-    var refreshCycleCount: Int = 0
 
-    // Shared data store — populated by every scrape, read by badge and popover
-    var latestSections: [UsageSection] = []
-    var history: UsageHistory = UsageHistory.loadFromDisk()
     var badgeIntervalMenuItem: NSMenuItem?
     var notifier: ThresholdNotifier!
     var notificationsEnabledMenuItem: NSMenuItem?
     var notificationThresholdMenuItems: [NSMenuItem] = []
-
-    // Empty-scrape streak. Transient empties happen during normal page renders
-    // (React mid-update), so a single empty must NOT clear the badge or popover.
-    // Only a sustained streak indicates a real failure (page DOM changed,
-    // network broke, scraper no longer matches).
-    var consecutiveEmptyScrapes: Int = 0
-    static let emptyScrapeFailureThreshold = 3
-
-    // JSON-primary fetch state
-    var cachedOrgUUID: String? = UserDefaults.standard.string(forKey: AppDelegate.cachedOrgUUIDKey)
-    var cachedPlanTier: String? = UserDefaults.standard.string(forKey: AppDelegate.cachedPlanTierKey)
-    var jsonFetchInFlight: Bool = false
-    var jsonConsecutiveFailures: Int = 0
-    var jsonCircuitOpen: Bool = false
-    var jsonCircuitOpenedAt: Date?
-    static let jsonFailureCircuitBreaker = 5
-    // Background WebView is process-suspended when the popover is closed, so a
-    // permanently-open JSON circuit means DOM scrapes return stale page data
-    // until the next ~hourly full reload. Auto-reset gives JSON another shot.
-    static let jsonCircuitResetInterval: TimeInterval = 30 * 60
 
     static let showBadgeKey = "showMenuBarBadge"
     var showMenuBarBadge: Bool = UserDefaults.standard.bool(forKey: AppDelegate.showBadgeKey) {
@@ -112,16 +88,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         if UserDefaults.standard.object(forKey: key) == nil { return defaultValue }
         return UserDefaults.standard.bool(forKey: key)
     }
-
-    // Fallback login window (email/magic-link in WKWebView)
-    var loginWindow: NSWindow?
-    var loginWebView: WKWebView?
-
-    // OAuth popup windows
-    var popupWindows: [NSWindow] = []
-
-    // Track whether we've already tried the desktop import for this launch
-    var hasAttemptedDesktopImport = false
 
     static let safariUA: String = {
         let v = ProcessInfo.processInfo.operatingSystemVersion
@@ -304,7 +270,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         // usage JSON path is circuit-broken. Wait long enough for cookies to
         // be imported and the WKWebView to attach them.
         DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
-            self?.refreshPlanTierIfNeeded()
+            self?.accounts.forEach { $0.refreshPlanTierIfNeeded() }
         }
 
         // Silent update check after 30s, then every 4 hours
@@ -324,25 +290,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     // MARK: - Popover
 
     func setupPopover() {
-        // WKWebView is kept off-screen for data scraping only
-        let config = WKWebViewConfiguration()
-        config.websiteDataStore = .default()
-
-        webView = WKWebView(frame: .zero, configuration: config)
-        webView.navigationDelegate = self
-        webView.uiDelegate = self
-        webView.customUserAgent = Self.safariUA
-
-        // Import cookies and start loading
-        hasAttemptedDesktopImport = true
-        importFromClaudeDesktop { [weak self] success in
-            guard let self = self else { return }
-            self.webView.load(URLRequest(url: Self.usageURL))
-        }
+        // One AccountController per metered account. It owns the off-screen
+        // WKWebView (data scraping only); start() imports Claude Desktop
+        // cookies and begins loading the usage page.
+        let account = AccountController(app: self, notifier: notifier)
+        accounts = [account]
+        account.start()
 
         // Native popover content, sized to skeleton, auto-resizes on content load.
         usageView = UsageContentView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-        usageView.planTierDisplayName = Self.planTierDisplayName(slug: cachedPlanTier)
+        account.usageView = usageView
+        usageView.planTierDisplayName = Self.planTierDisplayName(slug: account.cachedPlanTier)
         usageView.showBurnRate = showBurnRate
         usageView.showSparkline = showSparkline
         let skeletonH = usageView.skeletonHeight
@@ -382,10 +340,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     // MARK: - Claude Desktop Cookie Import
 
     @objc func importFromDesktop() {
-        importFromClaudeDesktop { [weak self] success in
-            guard let self = self else { return }
+        guard let account = accounts.first else { return }
+        account.importFromClaudeDesktop { [weak account] success in
+            guard let account = account else { return }
             if success {
-                self.webView.load(URLRequest(url: Self.usageURL))
+                account.webView.load(URLRequest(url: Self.usageURL))
             } else {
                 let alert = NSAlert()
                 alert.messageText = "Could not import session"
@@ -394,165 +353,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                 alert.runModal()
             }
         }
-    }
-
-    func importFromClaudeDesktop(completion: @escaping (Bool) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let cookies = ClaudeDesktopCookies.extract()
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self, let cookies = cookies, !cookies.isEmpty else {
-                    completion(false)
-                    return
-                }
-                self.injectCookies(cookies) { completion(true) }
-            }
-        }
-    }
-
-    func injectCookies(_ cookies: [HTTPCookie], completion: @escaping () -> Void) {
-        let store = webView.configuration.websiteDataStore.httpCookieStore
-        let group = DispatchGroup()
-        for cookie in cookies {
-            group.enter()
-            store.setCookie(cookie) { group.leave() }
-        }
-        group.notify(queue: .main, execute: completion)
-    }
-
-    // MARK: - Fallback Login Window (email/magic-link)
-
-    func showLoginWindow() {
-        if let window = loginWindow {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
-        }
-
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 640),
-            styleMask: [.titled, .closable, .resizable, .miniaturizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Sign in to Claude"
-        window.center()
-        window.isReleasedWhenClosed = false
-        window.delegate = self
-
-        let loginConfig = WKWebViewConfiguration()
-        loginConfig.websiteDataStore = .default()
-
-        let lw = WKWebView(frame: window.contentView!.bounds, configuration: loginConfig)
-        lw.autoresizingMask = [.width, .height]
-        lw.navigationDelegate = self
-        lw.uiDelegate = self
-        lw.customUserAgent = Self.safariUA
-        lw.load(URLRequest(url: Self.loginURL))
-
-        window.contentView?.addSubview(lw)
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-
-        loginWebView = lw
-        loginWindow = window
-    }
-
-    func closeLoginWindow() {
-        loginWindow?.close()
-        loginWindow = nil
-        loginWebView = nil
-        webView.load(URLRequest(url: Self.usageURL))
-    }
-
-    // MARK: - WKNavigationDelegate
-
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard let url = webView.url?.absoluteString else { return }
-
-        // Popover hit a login page → show login window (desktop import already attempted at startup)
-        if webView === self.webView && isLoginURL(url) {
-            if !hasAttemptedDesktopImport {
-                hasAttemptedDesktopImport = true
-                importFromClaudeDesktop { [weak self] success in
-                    guard let self = self else { return }
-                    if success {
-                        self.webView.load(URLRequest(url: Self.usageURL))
-                    } else {
-                        if self.popover.isShown { self.popover.performClose(nil) }
-                        self.showLoginWindow()
-                    }
-                }
-                return
-            }
-            if popover.isShown { popover.performClose(nil) }
-            showLoginWindow()
-            return
-        }
-
-        // Login WebView reached a non-login page → auth succeeded
-        if webView === loginWebView && url.contains("claude.ai") && !isLoginURL(url) {
-            closeLoginWindow()
-            return
-        }
-
-        if webView === self.webView {
-            lastRefreshDate = Date()
-            usageView?.setStatusFresh(true)
-            // Scrape immediately, then again after React renders
-            scrapeAndDistribute()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                guard let self = self else { return }
-                self.scrapeAndDistribute()
-                // Ensure refresh timer is running after initial page load
-                if self.refreshTimer == nil && (self.popover?.isShown == true || self.showMenuBarBadge) {
-                    self.startRefreshTimer()
-                }
-            }
-        }
-    }
-
-    // MARK: - WKUIDelegate (popup handling for OAuth)
-
-    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
-                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        let popupWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 600),
-            styleMask: [.titled, .closable, .resizable],
-            backing: .buffered, defer: false
-        )
-        popupWindow.title = "Sign In"
-        popupWindow.center()
-        popupWindow.isReleasedWhenClosed = false
-
-        let popupWebView = WKWebView(frame: popupWindow.contentView!.bounds, configuration: configuration)
-        popupWebView.autoresizingMask = [.width, .height]
-        popupWebView.navigationDelegate = self
-        popupWebView.uiDelegate = self
-        popupWebView.customUserAgent = Self.safariUA
-
-        popupWindow.contentView?.addSubview(popupWebView)
-        popupWindow.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        popupWindows.append(popupWindow)
-        return popupWebView
-    }
-
-    func webViewDidClose(_ webView: WKWebView) {
-        guard let window = webView.window else { return }
-        window.close()
-        popupWindows.removeAll { $0 === window }
-    }
-
-    // MARK: - NSWindowDelegate
-
-    func windowWillClose(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow else { return }
-        if window === loginWindow {
-            loginWindow = nil
-            loginWebView = nil
-            webView.load(URLRequest(url: Self.usageURL))
-        }
-        popupWindows.removeAll { $0 === window }
     }
 
     // MARK: - Menu
@@ -720,9 +520,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
         sender.state = .on
 
-        // Restart timer if active and popover is closed
-        if refreshTimer != nil && popover?.isShown != true {
-            startRefreshTimer()
+        // Restart timers that are active while the popover is closed
+        if popover?.isShown != true {
+            for account in accounts where account.refreshTimer != nil {
+                account.startRefreshTimer()
+            }
         }
     }
 
@@ -737,9 +539,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
         sender.state = .on
 
-        // Restart timer if active and popover is open
-        if refreshTimer != nil && popover?.isShown == true {
-            startRefreshTimer()
+        // Restart timers that are active while the popover is open
+        if popover?.isShown == true {
+            for account in accounts where account.refreshTimer != nil {
+                account.startRefreshTimer()
+            }
         }
     }
 
@@ -757,7 +561,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         if popover.isShown {
             popover.performClose(nil)
         } else {
-            stopRefreshTimer()
+            accounts.forEach { $0.stopRefreshTimer() }
             // Only show skeleton on first open; subsequent opens display
             // the last known data immediately while refreshing in the background.
             if usageView?.hasContent != true {
@@ -768,56 +572,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             } else {
                 usageView?.setStatusLoading()
             }
-            softReload()
+            accounts.forEach { $0.softReload() }
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
             usageView?.scrollToTop()
-            startRefreshTimer()
+            accounts.forEach { $0.startRefreshTimer() }
             usageView?.startCountdownTicker()
         }
     }
 
-    /// Soft reload: if already on the usage page, click the site's own refresh button.
-    /// Falls back to a full page reload if needed.
-    func softReload() {
-        guard let url = webView.url?.absoluteString, url.contains("/settings/usage") else {
-            gracefulReload()
-            return
-        }
-        usageView?.setStatusLoading()
-        let js = """
-        (function() {
-            var btns = document.querySelectorAll('button');
-            for (var b of btns) {
-                if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
-                    b.closest('[class*="text-xs"]')) {
-                    b.click();
-                    return 'clicked';
-                }
-            }
-            return 'not_found';
-        })()
-        """
-        webView.evaluateJavaScript(js) { [weak self] result, _ in
-            if (result as? String) == "clicked" {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    self?.lastRefreshDate = Date()
-                    self?.scrapeAndDistribute()
-                }
-            } else {
-                self?.gracefulReload()
-            }
-        }
-    }
-
-    /// Full page reload.
-    func gracefulReload() {
-        usageView?.setStatusLoading()
-        webView.load(URLRequest(url: Self.usageURL))
-    }
-
-    @objc func reload() { gracefulReload() }
-    @objc func openLogin() { showLoginWindow() }
+    @objc func reload() { accounts.forEach { $0.gracefulReload() } }
+    @objc func openLogin() { accounts.first?.showLoginWindow() }
     @objc func checkForUpdates() { AppUpdater.checkForUpdates() }
     @objc func quit() { NSApp.terminate(nil) }
 
@@ -876,100 +641,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         updateBadgeDot = dot
     }
 
-    // MARK: - Polling (Unified Adaptive Timer)
-
-    /// The effective refresh interval depends on popover state.
-    var activeRefreshInterval: TimeInterval {
-        if popover?.isShown == true {
-            return statusFreshnessInterval   // fast (6s default)
-        } else {
-            return badgeRefreshInterval       // slow (120s default)
-        }
-    }
-
-    func startRefreshTimer() {
-        refreshTimer?.invalidate()
-        let interval = activeRefreshInterval
-        NSLog("[ClaudeMeter] startRefreshTimer: interval=\(interval)s, popoverOpen=\(popover?.isShown == true)")
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            self?.unifiedRefresh()
-        }
-        refreshTimer?.tolerance = interval * 0.1
-    }
-
-    func stopRefreshTimer() {
-        refreshTimer?.invalidate()
-        refreshTimer = nil
-    }
-
-    /// Unified refresh: clicks the site's refresh button, then scrapes all data.
-    /// Adapts behavior based on whether the popover is open or closed.
-    func unifiedRefresh() {
-        guard let url = webView.url?.absoluteString, url.contains("/settings/usage") else { return }
-
-        let popoverOpen = popover?.isShown == true
-
-        // When popover is closed, only refresh if badge is enabled
-        if !popoverOpen && !showMenuBarBadge { return }
-
-        // Periodic full WebView reload to prevent unbounded memory growth
-        // (only relevant when running in background badge mode)
-        if !popoverOpen {
-            refreshCycleCount += 1
-            if refreshCycleCount >= 30 {
-                refreshCycleCount = 0
-                NSLog("[ClaudeMeter] unifiedRefresh: periodic full reload to reclaim WebView memory")
-                webView.load(URLRequest(url: Self.usageURL))
-                return
-            }
-        }
-
-        // Skip the in-page Refresh-button click when JSON is the active path:
-        // JSON hits Anthropic's API directly and doesn't depend on the page's
-        // own React state, so the click + 1.5s wait is dead weight (and the
-        // button selector is currently brittle, returning 'not_found').
-        let lastPath = UserDefaults.standard.string(forKey: Self.lastFetchPathKey) ?? ""
-        if lastPath == "json" && !jsonCircuitOpen {
-            lastRefreshDate = Date()
-            scrapeAndDistribute()
-            return
-        }
-
-        let js = """
-        (function() {
-            var btns = document.querySelectorAll('button');
-            for (var b of btns) {
-                if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
-                    b.closest('[class*="text-xs"]')) {
-                    b.click();
-                    return 'clicked';
-                }
-            }
-            return 'not_found';
-        })()
-        """
-        webView.evaluateJavaScript(js) { [weak self] result, error in
-            if let error = error {
-                NSLog("[ClaudeMeter] unifiedRefresh JS error: \(error.localizedDescription)")
-            } else {
-                NSLog("[ClaudeMeter] unifiedRefresh click result: \(result ?? "nil")")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    self?.lastRefreshDate = Date()
-                    self?.scrapeAndDistribute()
-                }
-            }
-        }
-    }
-
     func popoverDidClose(_ notification: Notification) {
         NSLog("[ClaudeMeter] popoverDidClose")
-        stopRefreshTimer()
+        accounts.forEach { $0.stopRefreshTimer() }
         usageView?.stopCountdownTicker()
-        refreshCycleCount = 0
+        accounts.forEach { $0.refreshCycleCount = 0 }
         updateBadgeFromModel()
         if showMenuBarBadge {
             NSLog("[ClaudeMeter] badge enabled, starting background refresh")
-            startRefreshTimer()
+            accounts.forEach { $0.startRefreshTimer() }
         }
     }
 
@@ -1002,12 +682,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             updateBadgeFromModel()
             // Start background refresh if popover isn't open
             if popover?.isShown != true {
-                startRefreshTimer()
+                accounts.forEach { $0.startRefreshTimer() }
             }
         } else {
             setBadgeTitle("", reason: "badge disabled")
             statusItem.button?.imagePosition = .imageOnly
-            stopRefreshTimer()
+            accounts.forEach { $0.stopRefreshTimer() }
         }
     }
 
@@ -1020,8 +700,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         // Don't change badge while the popover is shown — resizing the status
         // item shifts the popover anchor and causes visible flicker.
         guard popover?.isShown != true else { return }
+        // Single account today: the badge mirrors the first account.
+        guard let account = accounts.first else { return }
 
-        if let pct = sessionPercentage(from: latestSections) {
+        if let pct = account.sessionPercentage(from: account.latestSections) {
             setBadgeTitle("\(pct)%", reason: "model meter labeled current session")
             UserDefaults.standard.set(pct, forKey: "lastBadgePercentage")
             return
@@ -1029,7 +711,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
 
         // Fallback: direct XPath scrape (independent of structured scrape's labels).
         NSLog("[ClaudeMeter] updateBadgeFromModel: no 'current session' meter in model, falling back to XPath")
-        webView.evaluateJavaScript(Self.scrapeSessionPercentageJS) { [weak self] result, _ in
+        account.webView.evaluateJavaScript(Self.scrapeSessionPercentageJS) { [weak self] result, _ in
             guard let self = self else { return }
             // Re-check guards on the JS callback — popover state may have changed.
             guard self.showMenuBarBadge, self.popover?.isShown != true else { return }
@@ -1043,13 +725,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     }
 
     /// v2.7 — Menu-bar tooltip with today's peak / 24h avg / streak,
-    /// computed from `history`. Idempotent and cheap (linear scan over
+    /// computed from the account's `history`. Idempotent and cheap (linear scan over
     /// at most ~720 samples). Called after every successful scrape and
     /// from a 1-min refresh tick so the "at HH:MM" timestamp doesn't go
     /// stale between fetches.
     func updateMenuBarTooltip() {
         guard let button = statusItem.button else { return }
-        let samples = history.samples
+        let samples = accounts.first?.history.samples ?? []
         guard !samples.isEmpty else {
             button.toolTip = "ClaudeMeter — no usage data yet"
             return
@@ -1078,7 +760,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             lines.append("Streak under 90%: \(streak) samples")
         }
 
-        if let forecast = lastSessionForecast, case .ok = forecast.state, forecast.ratePerHour >= 0.05 {
+        if let forecast = accounts.first?.lastSessionForecast, case .ok = forecast.state, forecast.ratePerHour >= 0.05 {
             let rate = forecast.ratePerHour
             let formatted: String
             if rate >= 10 { formatted = String(format: "%.0f%%/h", rate) }
@@ -1087,6 +769,409 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
 
         button.toolTip = lines.joined(separator: "\n")
+    }
+
+    // MARK: - Peak Window
+
+    /// True when "now" lies inside the configured peak-hour window (Mon-Fri
+    /// 5-11 AM Pacific by default). DST handled automatically by TimeZone.
+    static func isInPeakWindow(now: Date = Date()) -> Bool {
+        guard let tz = TimeZone(identifier: peakWindow.timeZone) else { return false }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        let hour = cal.component(.hour, from: now)
+        let weekday = cal.component(.weekday, from: now)
+        if peakWindow.weekdaysOnly && !(2...6).contains(weekday) { return false }
+        return hour >= peakWindow.startHour && hour < peakWindow.endHour
+    }
+
+    /// Time remaining until the peak window closes today. Returns nil when not
+    /// currently in the peak window.
+    static func peakWindowRemaining(now: Date = Date()) -> TimeInterval? {
+        guard isInPeakWindow(now: now), let tz = TimeZone(identifier: peakWindow.timeZone) else {
+            return nil
+        }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        var comps = cal.dateComponents([.year, .month, .day], from: now)
+        comps.hour = peakWindow.endHour
+        comps.minute = 0
+        comps.second = 0
+        guard let endDate = cal.date(from: comps) else { return nil }
+        return max(0, endDate.timeIntervalSince(now))
+    }
+}
+
+// MARK: - Account Controller
+
+/// Per-account metering engine. Owns one claude.ai session end to end: the
+/// off-screen WKWebView and its cookie store, the fallback login window and
+/// OAuth popups, the refresh timer, the JSON circuit breaker and empty-scrape
+/// streak, the resolved org and plan tier, the latest sections, history and
+/// forecast. It is the navigation, UI and window delegate for every WebKit
+/// view and window it creates. App-wide UI (status item, popover, menu,
+/// preferences) stays on AppDelegate, reached through `app`.
+final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
+    /// AppDelegate owns every AccountController and lives for the whole
+    /// process, so this back-reference can never dangle.
+    unowned let app: AppDelegate
+    /// The single shared notifier (also the UNUserNotificationCenter delegate).
+    /// Stored non-optional so the notifier evaluate call keeps exactly one call site,
+    /// inside distributeFetchResult (static-audit check 16).
+    let notifier: ThresholdNotifier
+    /// The popover section this account renders into. Owned by the popover's
+    /// view controller.
+    weak var usageView: UsageContentView?
+
+    let webView: WKWebView
+    var refreshTimer: Timer?
+    var lastRefreshDate: Date?
+    // Counts background refreshes; every 30th does a full WebView reload.
+    var refreshCycleCount: Int = 0
+    // v2.7: latest session forecast, read by the menu-bar tooltip.
+    var lastSessionForecast: UsageForecast?
+
+    // Shared data store — populated by every scrape, read by badge and popover
+    var latestSections: [UsageSection] = []
+    var history: UsageHistory = UsageHistory.loadFromDisk()
+
+    // Empty-scrape streak. Transient empties happen during normal page renders
+    // (React mid-update), so a single empty must NOT clear the badge or popover.
+    // Only a sustained streak indicates a real failure (page DOM changed,
+    // network broke, scraper no longer matches).
+    var consecutiveEmptyScrapes: Int = 0
+    static let emptyScrapeFailureThreshold = 3
+
+    // JSON-primary fetch state
+    var cachedOrgUUID: String? = UserDefaults.standard.string(forKey: AppDelegate.cachedOrgUUIDKey)
+    var cachedPlanTier: String? = UserDefaults.standard.string(forKey: AppDelegate.cachedPlanTierKey)
+    var jsonFetchInFlight: Bool = false
+    var jsonConsecutiveFailures: Int = 0
+    var jsonCircuitOpen: Bool = false
+    var jsonCircuitOpenedAt: Date?
+    static let jsonFailureCircuitBreaker = 5
+    // Background WebView is process-suspended when the popover is closed, so a
+    // permanently-open JSON circuit means DOM scrapes return stale page data
+    // until the next ~hourly full reload. Auto-reset gives JSON another shot.
+    static let jsonCircuitResetInterval: TimeInterval = 30 * 60
+
+    // Fallback login window (email/magic-link in WKWebView)
+    var loginWindow: NSWindow?
+    var loginWebView: WKWebView?
+
+    // OAuth popup windows
+    var popupWindows: [NSWindow] = []
+
+    // Track whether we've already tried the desktop import for this launch
+    var hasAttemptedDesktopImport = false
+
+    init(app: AppDelegate, notifier: ThresholdNotifier) {
+        self.app = app
+        self.notifier = notifier
+        // WKWebView is kept off-screen for data scraping only
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default()
+        webView = WKWebView(frame: .zero, configuration: config)
+        super.init()
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        webView.customUserAgent = AppDelegate.safariUA
+    }
+
+    /// Import cookies and start loading. The usage page loads whether or not
+    /// the Claude Desktop import succeeded; a login page then routes to the
+    /// login window through didFinish.
+    func start() {
+        hasAttemptedDesktopImport = true
+        importFromClaudeDesktop { [weak self] success in
+            guard let self = self else { return }
+            self.webView.load(URLRequest(url: AppDelegate.usageURL))
+        }
+    }
+
+    // MARK: - Claude Desktop Cookie Import
+
+    func importFromClaudeDesktop(completion: @escaping (Bool) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let cookies = ClaudeDesktopCookies.extract()
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, let cookies = cookies, !cookies.isEmpty else {
+                    completion(false)
+                    return
+                }
+                self.injectCookies(cookies) { completion(true) }
+            }
+        }
+    }
+
+    func injectCookies(_ cookies: [HTTPCookie], completion: @escaping () -> Void) {
+        let store = webView.configuration.websiteDataStore.httpCookieStore
+        let group = DispatchGroup()
+        for cookie in cookies {
+            group.enter()
+            store.setCookie(cookie) { group.leave() }
+        }
+        group.notify(queue: .main, execute: completion)
+    }
+
+    // MARK: - Fallback Login Window (email/magic-link)
+
+    func showLoginWindow() {
+        if let window = loginWindow {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 640),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Sign in to Claude"
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+
+        let loginConfig = WKWebViewConfiguration()
+        loginConfig.websiteDataStore = .default()
+
+        let lw = WKWebView(frame: window.contentView!.bounds, configuration: loginConfig)
+        lw.autoresizingMask = [.width, .height]
+        lw.navigationDelegate = self
+        lw.uiDelegate = self
+        lw.customUserAgent = AppDelegate.safariUA
+        lw.load(URLRequest(url: AppDelegate.loginURL))
+
+        window.contentView?.addSubview(lw)
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        loginWebView = lw
+        loginWindow = window
+    }
+
+    func closeLoginWindow() {
+        loginWindow?.close()
+        loginWindow = nil
+        loginWebView = nil
+        webView.load(URLRequest(url: AppDelegate.usageURL))
+    }
+
+    // MARK: - WKNavigationDelegate
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard let url = webView.url?.absoluteString else { return }
+
+        // Popover hit a login page → show login window (desktop import already attempted at startup)
+        if webView === self.webView && isLoginURL(url) {
+            if !hasAttemptedDesktopImport {
+                hasAttemptedDesktopImport = true
+                importFromClaudeDesktop { [weak self] success in
+                    guard let self = self else { return }
+                    if success {
+                        self.webView.load(URLRequest(url: AppDelegate.usageURL))
+                    } else {
+                        if self.app.popover.isShown { self.app.popover.performClose(nil) }
+                        self.showLoginWindow()
+                    }
+                }
+                return
+            }
+            if app.popover.isShown { app.popover.performClose(nil) }
+            showLoginWindow()
+            return
+        }
+
+        // Login WebView reached a non-login page → auth succeeded
+        if webView === loginWebView && url.contains("claude.ai") && !isLoginURL(url) {
+            closeLoginWindow()
+            return
+        }
+
+        if webView === self.webView {
+            lastRefreshDate = Date()
+            usageView?.setStatusFresh(true)
+            // Scrape immediately, then again after React renders
+            scrapeAndDistribute()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                guard let self = self else { return }
+                self.scrapeAndDistribute()
+                // Ensure refresh timer is running after initial page load
+                if self.refreshTimer == nil && (self.app.popover?.isShown == true || self.app.showMenuBarBadge) {
+                    self.startRefreshTimer()
+                }
+            }
+        }
+    }
+
+    // MARK: - WKUIDelegate (popup handling for OAuth)
+
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        let popupWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 600),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered, defer: false
+        )
+        popupWindow.title = "Sign In"
+        popupWindow.center()
+        popupWindow.isReleasedWhenClosed = false
+
+        let popupWebView = WKWebView(frame: popupWindow.contentView!.bounds, configuration: configuration)
+        popupWebView.autoresizingMask = [.width, .height]
+        popupWebView.navigationDelegate = self
+        popupWebView.uiDelegate = self
+        popupWebView.customUserAgent = AppDelegate.safariUA
+
+        popupWindow.contentView?.addSubview(popupWebView)
+        popupWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        popupWindows.append(popupWindow)
+        return popupWebView
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+        guard let window = webView.window else { return }
+        window.close()
+        popupWindows.removeAll { $0 === window }
+    }
+
+    // MARK: - NSWindowDelegate
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        if window === loginWindow {
+            loginWindow = nil
+            loginWebView = nil
+            webView.load(URLRequest(url: AppDelegate.usageURL))
+        }
+        popupWindows.removeAll { $0 === window }
+    }
+
+    /// Soft reload: if already on the usage page, click the site's own refresh button.
+    /// Falls back to a full page reload if needed.
+    func softReload() {
+        guard let url = webView.url?.absoluteString, url.contains("/settings/usage") else {
+            gracefulReload()
+            return
+        }
+        usageView?.setStatusLoading()
+        let js = """
+        (function() {
+            var btns = document.querySelectorAll('button');
+            for (var b of btns) {
+                if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
+                    b.closest('[class*="text-xs"]')) {
+                    b.click();
+                    return 'clicked';
+                }
+            }
+            return 'not_found';
+        })()
+        """
+        webView.evaluateJavaScript(js) { [weak self] result, _ in
+            if (result as? String) == "clicked" {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    self?.lastRefreshDate = Date()
+                    self?.scrapeAndDistribute()
+                }
+            } else {
+                self?.gracefulReload()
+            }
+        }
+    }
+
+    /// Full page reload.
+    func gracefulReload() {
+        usageView?.setStatusLoading()
+        webView.load(URLRequest(url: AppDelegate.usageURL))
+    }
+
+    // MARK: - Polling (Unified Adaptive Timer)
+
+    /// The effective refresh interval depends on popover state.
+    var activeRefreshInterval: TimeInterval {
+        if app.popover?.isShown == true {
+            return app.statusFreshnessInterval   // fast (6s default)
+        } else {
+            return app.badgeRefreshInterval       // slow (120s default)
+        }
+    }
+
+    func startRefreshTimer() {
+        refreshTimer?.invalidate()
+        let interval = activeRefreshInterval
+        NSLog("[ClaudeMeter] startRefreshTimer: interval=\(interval)s, popoverOpen=\(app.popover?.isShown == true)")
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.unifiedRefresh()
+        }
+        refreshTimer?.tolerance = interval * 0.1
+    }
+
+    func stopRefreshTimer() {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+    }
+
+    /// Unified refresh: clicks the site's refresh button, then scrapes all data.
+    /// Adapts behavior based on whether the popover is open or closed.
+    func unifiedRefresh() {
+        guard let url = webView.url?.absoluteString, url.contains("/settings/usage") else { return }
+
+        let popoverOpen = app.popover?.isShown == true
+
+        // When popover is closed, only refresh if badge is enabled
+        if !popoverOpen && !app.showMenuBarBadge { return }
+
+        // Periodic full WebView reload to prevent unbounded memory growth
+        // (only relevant when running in background badge mode)
+        if !popoverOpen {
+            refreshCycleCount += 1
+            if refreshCycleCount >= 30 {
+                refreshCycleCount = 0
+                NSLog("[ClaudeMeter] unifiedRefresh: periodic full reload to reclaim WebView memory")
+                webView.load(URLRequest(url: AppDelegate.usageURL))
+                return
+            }
+        }
+
+        // Skip the in-page Refresh-button click when JSON is the active path:
+        // JSON hits Anthropic's API directly and doesn't depend on the page's
+        // own React state, so the click + 1.5s wait is dead weight (and the
+        // button selector is currently brittle, returning 'not_found').
+        let lastPath = UserDefaults.standard.string(forKey: AppDelegate.lastFetchPathKey) ?? ""
+        if lastPath == "json" && !jsonCircuitOpen {
+            lastRefreshDate = Date()
+            scrapeAndDistribute()
+            return
+        }
+
+        let js = """
+        (function() {
+            var btns = document.querySelectorAll('button');
+            for (var b of btns) {
+                if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
+                    b.closest('[class*="text-xs"]')) {
+                    b.click();
+                    return 'clicked';
+                }
+            }
+            return 'not_found';
+        })()
+        """
+        webView.evaluateJavaScript(js) { [weak self] result, error in
+            if let error = error {
+                NSLog("[ClaudeMeter] unifiedRefresh JS error: \(error.localizedDescription)")
+            } else {
+                NSLog("[ClaudeMeter] unifiedRefresh click result: \(result ?? "nil")")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    self?.lastRefreshDate = Date()
+                    self?.scrapeAndDistribute()
+                }
+            }
+        }
     }
 
     /// Extract the "Current session" percentage from the shared data store.
@@ -1112,7 +1197,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     /// Both paths funnel through the same empty-streak gate and badge/model updates,
     /// so callers see a uniform interface regardless of which path succeeded.
     func scrapeAndDistribute() {
-        let forceDOM = UserDefaults.standard.bool(forKey: Self.forceDOMOnlyKey)
+        let forceDOM = UserDefaults.standard.bool(forKey: AppDelegate.forceDOMOnlyKey)
         // Auto-reset a stale circuit so JSON gets periodic re-attempts. The
         // circuit re-opens on its own if 5 fresh failures recur.
         if jsonCircuitOpen, let openedAt = jsonCircuitOpenedAt,
@@ -1168,7 +1253,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     /// through the shared distribution gate. Kept as a working fallback because
     /// the JSON endpoint is undocumented and may rotate.
     private func scrapeViaDOM() {
-        webView.evaluateJavaScript(Self.scrapeUsageJS) { [weak self] result, error in
+        webView.evaluateJavaScript(AppDelegate.scrapeUsageJS) { [weak self] result, error in
             guard let self = self else { return }
 
             // A nil/non-string result or an empty string means the JS errored
@@ -1206,15 +1291,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                 NSLog("[ClaudeMeter] empty-scrape threshold reached, surfacing failure")
                 self.latestSections = []
                 self.usageView?.update(sections: [])
-                if self.showMenuBarBadge && self.popover?.isShown != true {
-                    self.setBadgeTitle("\u{2014}%", reason: "empty-scrape streak \(self.consecutiveEmptyScrapes)")
+                if self.app.showMenuBarBadge && self.app.popover?.isShown != true {
+                    self.app.setBadgeTitle("\u{2014}%", reason: "empty-scrape streak \(self.consecutiveEmptyScrapes)")
                 }
             }
             return
         }
 
         self.consecutiveEmptyScrapes = 0
-        UserDefaults.standard.set(path, forKey: Self.lastFetchPathKey)
+        UserDefaults.standard.set(path, forKey: AppDelegate.lastFetchPathKey)
         NSLog("[ClaudeMeter] distributed \(sections.count) sections via \(path)")
         let sections = self.applyResetEstimates(to: sections)
         self.latestSections = sections
@@ -1258,8 +1343,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             history: self.history
         )
         self.usageView?.setStatusFresh(true)
-        self.updateBadgeFromModel()
-        self.updateMenuBarTooltip()
+        self.app.updateBadgeFromModel()
+        self.app.updateMenuBarTooltip()
     }
 
     /// Extract the headline weekly percentage (the unscoped "Weekly" / "Weekly usage"
@@ -1369,36 +1454,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
     }
 
-    // MARK: - Peak Window
-
-    /// True when "now" lies inside the configured peak-hour window (Mon-Fri
-    /// 5-11 AM Pacific by default). DST handled automatically by TimeZone.
-    static func isInPeakWindow(now: Date = Date()) -> Bool {
-        guard let tz = TimeZone(identifier: peakWindow.timeZone) else { return false }
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = tz
-        let hour = cal.component(.hour, from: now)
-        let weekday = cal.component(.weekday, from: now)
-        if peakWindow.weekdaysOnly && !(2...6).contains(weekday) { return false }
-        return hour >= peakWindow.startHour && hour < peakWindow.endHour
-    }
-
-    /// Time remaining until the peak window closes today. Returns nil when not
-    /// currently in the peak window.
-    static func peakWindowRemaining(now: Date = Date()) -> TimeInterval? {
-        guard isInPeakWindow(now: now), let tz = TimeZone(identifier: peakWindow.timeZone) else {
-            return nil
-        }
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = tz
-        var comps = cal.dateComponents([.year, .month, .day], from: now)
-        comps.hour = peakWindow.endHour
-        comps.minute = 0
-        comps.second = 0
-        guard let endDate = cal.date(from: comps) else { return nil }
-        return max(0, endDate.timeIntervalSince(now))
-    }
-
     // MARK: - JSON Fetch Path
 
     /// JSON-primary fetch. Copies cookies from the WKWebView data store into a
@@ -1421,7 +1476,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                     return
                 }
 
-                let urlStr = "https://claude.ai" + String(format: Self.apiUsagePath, uuid)
+                let urlStr = "https://claude.ai" + String(format: AppDelegate.apiUsagePath, uuid)
                 guard let url = URL(string: urlStr) else {
                     self.jsonFetchInFlight = false
                     completion(.failure(.noOrg))
@@ -1430,7 +1485,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
 
                 var req = URLRequest(url: url)
                 req.setValue("application/json", forHTTPHeaderField: "Accept")
-                req.setValue(Self.safariUA, forHTTPHeaderField: "User-Agent")
+                req.setValue(AppDelegate.safariUA, forHTTPHeaderField: "User-Agent")
 
                 session.dataTask(with: req) { [weak self] data, response, error in
                     guard let self = self else { return }
@@ -1444,7 +1499,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                         if status == 401 || status == 403 || status == 404 {
                             // Cached UUID may be stale; clear so next attempt rediscovers.
                             self.cachedOrgUUID = nil
-                            UserDefaults.standard.removeObject(forKey: Self.cachedOrgUUIDKey)
+                            UserDefaults.standard.removeObject(forKey: AppDelegate.cachedOrgUUIDKey)
                             completion(.failure(.http(status)))
                             return
                         }
@@ -1479,9 +1534,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             completion(cached)
             return
         }
-        var req = URLRequest(url: Self.apiOrgsURL)
+        var req = URLRequest(url: AppDelegate.apiOrgsURL)
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.setValue(Self.safariUA, forHTTPHeaderField: "User-Agent")
+        req.setValue(AppDelegate.safariUA, forHTTPHeaderField: "User-Agent")
 
         session.dataTask(with: req) { [weak self] data, response, err in
             guard let self = self else { return }
@@ -1511,13 +1566,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                 let chosen = preferred ?? orgs.first
                 if let chosen = chosen {
                     self.cachedOrgUUID = chosen.uuid
-                    UserDefaults.standard.set(chosen.uuid, forKey: Self.cachedOrgUUIDKey)
+                    UserDefaults.standard.set(chosen.uuid, forKey: AppDelegate.cachedOrgUUIDKey)
                     if let tier = chosen.rate_limit_tier, !tier.isEmpty {
                         self.cachedPlanTier = tier
-                        UserDefaults.standard.set(tier, forKey: Self.cachedPlanTierKey)
+                        UserDefaults.standard.set(tier, forKey: AppDelegate.cachedPlanTierKey)
                         NSLog("%@", "[ClaudeMeter] plan tier resolved: \(tier)")
                     }
-                    self.usageView?.planTierDisplayName = Self.planTierDisplayName(slug: self.cachedPlanTier)
+                    self.usageView?.planTierDisplayName = AppDelegate.planTierDisplayName(slug: self.cachedPlanTier)
                 }
                 completion(chosen?.uuid)
             }
