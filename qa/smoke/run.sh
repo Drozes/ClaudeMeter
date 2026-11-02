@@ -48,13 +48,14 @@ sleep 0.5
 # 4. Launch with badge forced ON (NSArgumentDomain override).
 #    -declinedMoveToApplications YES suppresses the modal "Move to
 #    Applications?" alert that a bundled copy outside /Applications triggers.
-#    -lastBadgePercentage 0 blanks the cached badge value the QA bundle's own
-#    prefs domain kept from an earlier run, so the launch-time restore shows
-#    the placeholder instead of an old percentage.
+#    -lastBadgePercentage 0 and -lastBadgePercentage.primary 0 (the v2.7.1
+#    key and its per-account successor) blank the cached badge value the QA
+#    bundle's own prefs domain kept from an earlier run, so the launch-time
+#    restore shows the placeholder instead of an old percentage.
 log "launching $LAUNCH with -showMenuBarBadge YES"
 : > "$STDERR"
 "$LAUNCH" -showMenuBarBadge YES -declinedMoveToApplications YES \
-    -lastBadgePercentage 0 >"$STDOUT" 2>"$STDERR" &
+    -lastBadgePercentage 0 -lastBadgePercentage.primary 0 >"$STDOUT" 2>"$STDERR" &
 PID=$!
 
 cleanup() {

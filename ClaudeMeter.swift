@@ -112,9 +112,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     static let apiOrgsURL = URL(string: "https://claude.ai/api/organizations")!
     static let apiUsagePath = "/api/organizations/%@/usage"
     static let forceDOMOnlyKey = "forceDOMOnly"
+    // v2.7.1 global keys, now read only by AccountStore.migrateIfNeeded; the
+    // values live on AccountRecord (org UUID, plan tier).
     static let cachedOrgUUIDKey = "cachedOrgUUID"
     static let cachedPlanTierKey = "cachedPlanTier"
+    // Key families: per-account keys are "<family>.<accountId>" (AccountKeys).
     static let lastFetchPathKey = "lastFetchPath"
+    static let lastBadgePercentageKey = "lastBadgePercentage"
 
     static func planTierDisplayName(slug: String?) -> String? {
         guard let s = slug?.lowercased(), !s.isEmpty else { return nil }
@@ -255,6 +259,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
+        // Copy v2.7.1's global per-account state into the primary account's
+        // namespace once, before anything reads it.
+        AccountStore.migrateIfNeeded()
+
         setupMenu()
         notifier = ThresholdNotifier()
         UNUserNotificationCenter.current().delegate = notifier
@@ -292,8 +300,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func setupPopover() {
         // One AccountController per metered account. It owns the off-screen
         // WKWebView (data scraping only); start() imports Claude Desktop
-        // cookies and begins loading the usage page.
-        let account = AccountController(app: self, notifier: notifier)
+        // cookies and begins loading the usage page. Only the primary
+        // (default-store) account is metered until adding accounts ships.
+        let account = AccountController(app: self, notifier: notifier, record: AccountStore.primaryRecord())
         accounts = [account]
         account.start()
 
@@ -677,7 +686,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if showMenuBarBadge {
             statusItem.button?.imagePosition = .imageLeading
             // Restore cached value instantly, or show placeholder
-            let cached = UserDefaults.standard.integer(forKey: "lastBadgePercentage")
+            let cached = accounts.first.map { UserDefaults.standard.integer(forKey: $0.lastBadgePercentageKey) } ?? 0
             setBadgeTitle(cached > 0 ? "\(cached)%" : "\u{2014}%", reason: "applyBadgeVisibility cached=\(cached)")
             updateBadgeFromModel()
             // Start background refresh if popover isn't open
@@ -703,9 +712,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // Single account today: the badge mirrors the first account.
         guard let account = accounts.first else { return }
 
+        let badgeKey = account.lastBadgePercentageKey
+
         if let pct = account.sessionPercentage(from: account.latestSections) {
             setBadgeTitle("\(pct)%", reason: "model meter labeled current session")
-            UserDefaults.standard.set(pct, forKey: "lastBadgePercentage")
+            UserDefaults.standard.set(pct, forKey: badgeKey)
             return
         }
 
@@ -717,7 +728,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard self.showMenuBarBadge, self.popover?.isShown != true else { return }
             if let pct = result as? Int {
                 self.setBadgeTitle("\(pct)%", reason: "XPath fallback scrape")
-                UserDefaults.standard.set(pct, forKey: "lastBadgePercentage")
+                UserDefaults.standard.set(pct, forKey: badgeKey)
             } else if self.statusItem.button?.title.isEmpty == true {
                 self.setBadgeTitle("\u{2014}%", reason: "XPath fallback returned nil")
             }
@@ -833,9 +844,14 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     // v2.7: latest session forecast, read by the menu-bar tooltip.
     var lastSessionForecast: UsageForecast?
 
+    /// Persisted, non-secret description of this account (id, label, badge
+    /// slot, org, plan tier, store identifier). Saved through AccountStore.
+    private(set) var record: AccountRecord
+    var id: String { record.id }
+
     // Shared data store — populated by every scrape, read by badge and popover
     var latestSections: [UsageSection] = []
-    var history: UsageHistory = UsageHistory.loadFromDisk()
+    var history: UsageHistory
 
     // Empty-scrape streak. Transient empties happen during normal page renders
     // (React mid-update), so a single empty must NOT clear the badge or popover.
@@ -844,9 +860,15 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     var consecutiveEmptyScrapes: Int = 0
     static let emptyScrapeFailureThreshold = 3
 
-    // JSON-primary fetch state
-    var cachedOrgUUID: String? = UserDefaults.standard.string(forKey: AppDelegate.cachedOrgUUIDKey)
-    var cachedPlanTier: String? = UserDefaults.standard.string(forKey: AppDelegate.cachedPlanTierKey)
+    // JSON-primary fetch state. Org and tier live on the account record.
+    var cachedOrgUUID: String? {
+        get { record.orgUUID }
+        set { record.orgUUID = newValue }
+    }
+    var cachedPlanTier: String? {
+        get { record.planTier }
+        set { record.planTier = newValue }
+    }
     var jsonFetchInFlight: Bool = false
     var jsonConsecutiveFailures: Int = 0
     var jsonCircuitOpen: Bool = false
@@ -867,9 +889,11 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     // Track whether we've already tried the desktop import for this launch
     var hasAttemptedDesktopImport = false
 
-    init(app: AppDelegate, notifier: ThresholdNotifier) {
+    init(app: AppDelegate, notifier: ThresholdNotifier, record: AccountRecord) {
         self.app = app
         self.notifier = notifier
+        self.record = record
+        self.history = UsageHistory.loadFromDisk(accountID: record.id)
         // WKWebView is kept off-screen for data scraping only
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
@@ -878,6 +902,16 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.customUserAgent = AppDelegate.safariUA
+    }
+
+    // MARK: - Per-account keys
+
+    var lastFetchPathKey: String { AccountKeys.key(AppDelegate.lastFetchPathKey, id) }
+    var lastBadgePercentageKey: String { AccountKeys.key(AppDelegate.lastBadgePercentageKey, id) }
+
+    /// Saves this account's record (org, tier, labels) to UserDefaults.
+    func persistRecord() {
+        AccountStore.upsert(record)
     }
 
     /// Import cookies and start loading. The usage page loads whether or not
@@ -1143,7 +1177,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         // JSON hits Anthropic's API directly and doesn't depend on the page's
         // own React state, so the click + 1.5s wait is dead weight (and the
         // button selector is currently brittle, returning 'not_found').
-        let lastPath = UserDefaults.standard.string(forKey: AppDelegate.lastFetchPathKey) ?? ""
+        let lastPath = UserDefaults.standard.string(forKey: lastFetchPathKey) ?? ""
         if lastPath == "json" && !jsonCircuitOpen {
             lastRefreshDate = Date()
             scrapeAndDistribute()
@@ -1301,11 +1335,14 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         }
 
         self.consecutiveEmptyScrapes = 0
-        UserDefaults.standard.set(path, forKey: AppDelegate.lastFetchPathKey)
+        UserDefaults.standard.set(path, forKey: self.lastFetchPathKey)
         NSLog("[ClaudeMeter] distributed \(sections.count) sections via \(path)")
         let sections = self.applyResetEstimates(to: sections)
         self.latestSections = sections
-        self.notifier.evaluate(sections: sections)
+        // Name the account in notification titles only once a second account
+        // exists, so single-account titles stay exactly as before.
+        self.notifier.evaluate(sections: sections, accountID: self.id,
+                               accountLabel: self.app.accounts.count >= 2 ? self.record.displayName : nil)
 
         let sessionPct = self.sessionPercentage(from: sections) ?? 0
         let weeklyPct = self.weeklyPercentage(from: sections) ?? 0
@@ -1399,8 +1436,9 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
 
     // MARK: - Reset Estimation (DOM fallback)
 
-    static let firstSeenPrefix = "resetEstimate.firstSeen."
-    static let firstSeenPctPrefix = "resetEstimate.firstSeenPct."
+    // Key families; the account ID follows the family, the meter label is last.
+    static let firstSeenFamily = "resetEstimate.firstSeen"
+    static let firstSeenPctFamily = "resetEstimate.firstSeenPct"
 
     /// Fills missing UsageMeter.resetAt values with estimates. JSON path already
     /// populates resetAt directly; DOM path either parses from meter.detail or
@@ -1433,8 +1471,8 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                 let isWeekly = section.title.lowercased().contains("weekly") || key.contains("weekly")
                 guard isSession || isWeekly else { return meter }
 
-                let firstSeenKey = Self.firstSeenPrefix + key
-                let firstSeenPctKey = Self.firstSeenPctPrefix + key
+                let firstSeenKey = AccountKeys.key(Self.firstSeenFamily, self.id, key)
+                let firstSeenPctKey = AccountKeys.key(Self.firstSeenPctFamily, self.id, key)
                 let stored = defaults.double(forKey: firstSeenKey)
                 let storedPct = defaults.integer(forKey: firstSeenPctKey)
                 let windowSeconds: TimeInterval = isWeekly ? 7 * 24 * 3600 : 5 * 3600
@@ -1501,7 +1539,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                         if status == 401 || status == 403 || status == 404 {
                             // Cached UUID may be stale; clear so next attempt rediscovers.
                             self.cachedOrgUUID = nil
-                            UserDefaults.standard.removeObject(forKey: AppDelegate.cachedOrgUUIDKey)
+                            self.persistRecord()
                             completion(.failure(.http(status)))
                             return
                         }
@@ -1568,12 +1606,14 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                 let chosen = preferred ?? orgs.first
                 if let chosen = chosen {
                     self.cachedOrgUUID = chosen.uuid
-                    UserDefaults.standard.set(chosen.uuid, forKey: AppDelegate.cachedOrgUUIDKey)
+                    if let name = chosen.name, !name.isEmpty {
+                        self.record.orgName = name
+                    }
                     if let tier = chosen.rate_limit_tier, !tier.isEmpty {
                         self.cachedPlanTier = tier
-                        UserDefaults.standard.set(tier, forKey: AppDelegate.cachedPlanTierKey)
                         NSLog("%@", "[ClaudeMeter] plan tier resolved: \(tier)")
                     }
+                    self.persistRecord()
                     self.usageView?.planTierDisplayName = AppDelegate.planTierDisplayName(slug: self.cachedPlanTier)
                 }
                 completion(chosen?.uuid)
@@ -1720,6 +1760,193 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     }
 }
 
+// MARK: - Accounts (model, key namespacing, persistence, migration)
+
+/// Where an account appears in the two-slot menu-bar badge.
+enum BadgeSlot: String, Codable {
+    case left, right, hidden
+}
+
+/// Persisted, non-secret description of one metered claude.ai account.
+/// Cookies and tokens never live here: WebKit's website data store (the
+/// default store for the primary account, an identifier-keyed store for any
+/// other) is the only session persistence.
+struct AccountRecord: Codable, Equatable {
+    /// Fixed ID of the first account, the one Claude Desktop's cookie import
+    /// feeds and that lives in WKWebsiteDataStore.default().
+    static let primaryID = "primary"
+
+    let id: String
+    var displayName: String
+    /// 1 to 3 characters shown in the badge once two or more accounts exist.
+    var badgeLabel: String
+    var badgeSlot: BadgeSlot
+    var email: String?
+    var orgUUID: String?
+    var orgName: String?
+    var planTier: String?
+    /// Identifier for WKWebsiteDataStore(forIdentifier:); nil means the
+    /// default store (primary account only).
+    var storeIdentifier: String?
+
+    var isPrimary: Bool { id == Self.primaryID }
+
+    static func defaultBadgeLabel(for name: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.first.map { String($0).uppercased() } ?? "?"
+    }
+
+    static func makePrimary(orgUUID: String? = nil, planTier: String? = nil) -> AccountRecord {
+        let name = "Personal"
+        return AccountRecord(id: primaryID, displayName: name,
+                             badgeLabel: defaultBadgeLabel(for: name), badgeSlot: .left,
+                             email: nil, orgUUID: orgUUID, orgName: nil, planTier: planTier,
+                             storeIdentifier: nil)
+    }
+}
+
+/// Builds per-account UserDefaults keys. The account ID sits right after the
+/// key family and before any trailing component:
+///   lastFetchPath.<id>
+///   resetEstimate.firstSeen.<id>.<meter label>
+///   notif.fired.<id>.<scope>.<threshold>.<cycle>
+/// so ThresholdNotifier.pruneStaleKeys still reads the cycle timestamp as the
+/// last dot-separated component.
+enum AccountKeys {
+    static func key(_ family: String, _ accountID: String, _ rest: String? = nil) -> String {
+        guard let rest = rest, !rest.isEmpty else { return "\(family).\(accountID)" }
+        return "\(family).\(accountID).\(rest)"
+    }
+}
+
+/// Loads and saves the account list (a JSON string in UserDefaults) and runs
+/// the one-time migration of v2.7.1's global per-account state.
+enum AccountStore {
+    static let listKey = "accounts.list"
+    static let migrationVersionKey = "accounts.migrationVersion"
+    static let currentMigrationVersion = 1
+
+    static func load() -> [AccountRecord] {
+        guard let json = UserDefaults.standard.string(forKey: listKey),
+              let data = json.data(using: .utf8) else { return [] }
+        do {
+            return try JSONDecoder().decode([AccountRecord].self, from: data)
+        } catch {
+            // Keep the unreadable list (non-secret) before a later save
+            // replaces it, so a bad decode never silently loses accounts.
+            let backupKey = listKey + ".unreadable"
+            if UserDefaults.standard.object(forKey: backupKey) == nil {
+                UserDefaults.standard.set(json, forKey: backupKey)
+            }
+            NSLog("%@", "[ClaudeMeter] accounts: could not decode \(listKey) (\(error.localizedDescription)); raw value kept in \(backupKey)")
+            return []
+        }
+    }
+
+    static func save(_ records: [AccountRecord]) {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(records),
+              let json = String(data: data, encoding: .utf8) else { return }
+        UserDefaults.standard.set(json, forKey: listKey)
+    }
+
+    /// Inserts or replaces one record by ID, keeping every other record.
+    static func upsert(_ record: AccountRecord) {
+        var records = load()
+        if let i = records.firstIndex(where: { $0.id == record.id }) {
+            records[i] = record
+        } else {
+            records.insert(record, at: record.isPrimary ? 0 : records.count)
+        }
+        save(records)
+    }
+
+    /// The primary account's record, created and saved if missing.
+    static func primaryRecord() -> AccountRecord {
+        if let existing = load().first(where: { $0.isPrimary }) { return existing }
+        let record = AccountRecord.makePrimary()
+        upsert(record)
+        return record
+    }
+
+    /// One-time upgrade from v2.7.1. Copies the global per-account values and
+    /// history.json into the primary account's namespace, then records the
+    /// migration version. Copy-only: every legacy key and history.json stay in
+    /// place for one release as a rollback path, and a destination that
+    /// already exists is never overwritten, so re-running is harmless.
+    static func migrateIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard defaults.integer(forKey: migrationVersionKey) < currentMigrationVersion else { return }
+        let pid = AccountRecord.primaryID
+        var copied = 0
+
+        func copy(_ from: String, to: String) {
+            guard let value = defaults.object(forKey: from), defaults.object(forKey: to) == nil else { return }
+            defaults.set(value, forKey: to)
+            copied += 1
+        }
+
+        // Fixed keys.
+        copy(AppDelegate.lastFetchPathKey, to: AccountKeys.key(AppDelegate.lastFetchPathKey, pid))
+        copy(AppDelegate.lastBadgePercentageKey, to: AccountKeys.key(AppDelegate.lastBadgePercentageKey, pid))
+        for scope in ["session", "weekly"] {
+            copy("\(ThresholdNotifier.cycleStartFamily).\(scope)",
+                 to: AccountKeys.key(ThresholdNotifier.cycleStartFamily, pid, scope))
+        }
+
+        // Families with a trailing component. Notification keys qualify only
+        // when the component after the family is a scope, which excludes keys
+        // that are already namespaced; reset-estimate labels already under
+        // "primary." are skipped for the same reason.
+        let legacyKeys = Array(defaults.dictionaryRepresentation().keys)
+        let notifFamilies = [ThresholdNotifier.firedFamily, ThresholdNotifier.lastPctFamily,
+                             ThresholdNotifier.snoozedFamily]
+        let resetFamilies = [AccountController.firstSeenFamily, AccountController.firstSeenPctFamily]
+        for key in legacyKeys {
+            for family in notifFamilies where key.hasPrefix(family + ".") {
+                let rest = String(key.dropFirst(family.count + 1))
+                if rest.hasPrefix("session.") || rest.hasPrefix("weekly.") {
+                    copy(key, to: AccountKeys.key(family, pid, rest))
+                }
+            }
+            for family in resetFamilies where key.hasPrefix(family + ".") {
+                let rest = String(key.dropFirst(family.count + 1))
+                if !rest.isEmpty && !rest.hasPrefix(pid + ".") {
+                    copy(key, to: AccountKeys.key(family, pid, rest))
+                }
+            }
+        }
+
+        // Account record: org and tier from the v2.7.1 globals.
+        var record = load().first(where: { $0.isPrimary }) ?? AccountRecord.makePrimary()
+        if record.orgUUID == nil { record.orgUUID = defaults.string(forKey: AppDelegate.cachedOrgUUIDKey) }
+        if record.planTier == nil { record.planTier = defaults.string(forKey: AppDelegate.cachedPlanTierKey) }
+        upsert(record)
+
+        // History file.
+        let historyResult: String
+        let fm = FileManager.default
+        let legacy = UsageHistory.legacyFileURL
+        let target = UsageHistory.fileURL(accountID: pid)
+        if fm.fileExists(atPath: target.path) {
+            historyResult = "kept existing"
+        } else if fm.fileExists(atPath: legacy.path) {
+            do {
+                try fm.copyItem(at: legacy, to: target)
+                historyResult = "copied"
+            } catch {
+                historyResult = "copy failed (\(error.localizedDescription))"
+            }
+        } else {
+            historyResult = "none to copy"
+        }
+
+        defaults.set(currentMigrationVersion, forKey: migrationVersionKey)
+        NSLog("%@", "[ClaudeMeter] accounts migration v\(currentMigrationVersion): copied \(copied) keys into '\(pid)', history: \(historyResult)")
+    }
+}
+
 // MARK: - Usage Data Model
 
 struct UsageMeter: Equatable {
@@ -1782,6 +2009,7 @@ struct UsageAPIResponse: Decodable {
 struct OrgListResponse: Decodable {
     struct Org: Decodable {
         let uuid: String
+        let name: String?
         let capabilities: [String]?
         let rate_limit_tier: String?
     }
@@ -1836,15 +2064,26 @@ struct UsageHistory {
 
     private(set) var samples: [Sample] = []
     private var lastPersist: Date = .distantPast
+    /// Where this history persists; nil means in-memory only.
+    private(set) var fileURL: URL?
     private static let retentionSeconds: TimeInterval = 24 * 3600
     private static let persistThrottle: TimeInterval = 30
 
-    static var fileURL: URL {
+    /// v2.7.1 single-account file. Read only by the one-time migration and
+    /// left in place as a rollback path.
+    static var legacyFileURL: URL {
         AppPaths.supportDirectory.appendingPathComponent("history.json")
     }
 
-    static func loadFromDisk() -> UsageHistory {
+    /// Per-account file, e.g. history-primary.json.
+    static func fileURL(accountID: String) -> URL {
+        AppPaths.supportDirectory.appendingPathComponent("history-\(accountID).json")
+    }
+
+    static func loadFromDisk(accountID: String) -> UsageHistory {
         var h = UsageHistory()
+        let fileURL = Self.fileURL(accountID: accountID)
+        h.fileURL = fileURL
         guard let data = try? Data(contentsOf: fileURL),
               let envelope = try? JSONDecoder().decode(Envelope.self, from: data) else {
             return h
@@ -1864,11 +2103,11 @@ struct UsageHistory {
     }
 
     mutating func persistThrottled(now: Date = Date()) {
+        guard let url = fileURL else { return }
         guard now.timeIntervalSince(lastPersist) >= Self.persistThrottle else { return }
         lastPersist = now
         let envelope = Envelope(version: 1, samples: samples)
         guard let data = try? JSONEncoder().encode(envelope) else { return }
-        let url = Self.fileURL
         let dir = url.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try? data.write(to: url, options: .atomic)
@@ -1889,14 +2128,20 @@ struct UsageHistory {
 // MARK: - Threshold Notifier
 
 /// Fires macOS user notifications when session/weekly usage crosses 50/75/90%.
-/// Idempotent per cycle: each (scope, threshold, cycleKey) tuple fires at most
-/// once. Per-threshold mute toggles and a "Snooze rest of cycle" action let
-/// users opt out without disabling notifications globally.
+/// Idempotent per cycle: each (account, scope, threshold, cycleKey) tuple fires
+/// at most once. Per-threshold mute toggles (global, shared by all accounts)
+/// and a per-account "Snooze rest of cycle" action let users opt out without
+/// disabling notifications globally. One shared instance is the
+/// UNUserNotificationCenter delegate; all cycle, fired, last-percentage and
+/// snooze state is namespaced by account ID (see AccountKeys).
 final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
     static let enabledKey = "notif.enabled"
     static let authRequestedKey = "notif.authRequested"
-    static let cycleStartSessionKey = "notif.cycleStart.session"
-    static let cycleStartWeeklyKey = "notif.cycleStart.weekly"
+    // Per-account key families: "<family>.<accountId>.<rest>".
+    static let cycleStartFamily = "notif.cycleStart"
+    static let firedFamily = "notif.fired"
+    static let lastPctFamily = "notif.lastPct"
+    static let snoozedFamily = "notif.snoozed"
     static let categoryID = "CM_THRESHOLD"
     static let snoozeActionID = "CM_SNOOZE_CYCLE"
 
@@ -1929,7 +2174,9 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         center.setNotificationCategories([category])
     }
 
-    func evaluate(sections: [UsageSection]) {
+    /// `accountLabel` is non-nil only when two or more accounts exist; it is
+    /// then prefixed to notification titles.
+    func evaluate(sections: [UsageSection], accountID: String, accountLabel: String?) {
         guard UserDefaults.standard.bool(forKey: Self.enabledKey) else { return }
 
         let now = Date()
@@ -1939,17 +2186,20 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         let weeklyDetail = detail(in: sections, scope: .weekly)
 
         if let pct = sessionPct {
-            evaluateScope(.session, pct: pct, detail: sessionDetail, sections: sections, now: now)
+            evaluateScope(.session, pct: pct, detail: sessionDetail, sections: sections, now: now,
+                          accountID: accountID, accountLabel: accountLabel)
         }
         if let pct = weeklyPct {
-            evaluateScope(.weekly, pct: pct, detail: weeklyDetail, sections: sections, now: now)
+            evaluateScope(.weekly, pct: pct, detail: weeklyDetail, sections: sections, now: now,
+                          accountID: accountID, accountLabel: accountLabel)
         }
     }
 
-    private func evaluateScope(_ scope: Scope, pct: Int, detail: String, sections: [UsageSection], now: Date) {
-        let cycleKey = self.cycleKey(for: scope, sections: sections, now: now)
-        let lastPctKey = "notif.lastPct.\(scope.rawValue).\(cycleKey)"
-        let snoozedKey = "notif.snoozed.\(scope.rawValue).\(cycleKey)"
+    private func evaluateScope(_ scope: Scope, pct: Int, detail: String, sections: [UsageSection], now: Date,
+                               accountID: String, accountLabel: String?) {
+        let cycleKey = self.cycleKey(for: scope, accountID: accountID, sections: sections, now: now)
+        let lastPctKey = AccountKeys.key(Self.lastPctFamily, accountID, "\(scope.rawValue).\(cycleKey)")
+        let snoozedKey = AccountKeys.key(Self.snoozedFamily, accountID, "\(scope.rawValue).\(cycleKey)")
         let defaults = UserDefaults.standard
         let lastPct = defaults.integer(forKey: lastPctKey)
         let snoozed = defaults.bool(forKey: snoozedKey)
@@ -1957,13 +2207,14 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         if !snoozed {
             for threshold in thresholds {
                 let muteKey = "notif.mute.\(scope.rawValue).\(threshold)"
-                let firedKey = "notif.fired.\(scope.rawValue).\(threshold).\(cycleKey)"
+                let firedKey = AccountKeys.key(Self.firedFamily, accountID, "\(scope.rawValue).\(threshold).\(cycleKey)")
                 let muted = defaults.bool(forKey: muteKey)
                 let alreadyFired = defaults.bool(forKey: firedKey)
                 if lastPct < threshold && pct >= threshold && !muted && !alreadyFired {
                     // Set fired BEFORE dispatching so concurrent evaluates can't double-fire.
                     defaults.set(true, forKey: firedKey)
-                    fire(scope: scope, threshold: threshold, detail: detail, cycleKey: cycleKey)
+                    fire(scope: scope, threshold: threshold, detail: detail, cycleKey: cycleKey,
+                         accountID: accountID, accountLabel: accountLabel)
                 }
             }
         }
@@ -1979,7 +2230,8 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         let title = "ClaudeMeter test notification"
         let body = "If you can see this, alerts are wired up correctly."
         let dispatch = { [weak self] in
-            self?.dispatchNotification(title: title, body: body, scope: .session, cycleKey: "test")
+            self?.dispatchNotification(title: title, body: body, scope: .session, cycleKey: "test",
+                                       accountID: AccountRecord.primaryID)
         }
         if UserDefaults.standard.bool(forKey: Self.authRequestedKey) {
             dispatch()
@@ -1993,9 +2245,11 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    private func fire(scope: Scope, threshold: Int, detail: String, cycleKey: String) {
+    private func fire(scope: Scope, threshold: Int, detail: String, cycleKey: String,
+                      accountID: String, accountLabel: String?) {
         let scopeName = (scope == .session) ? "session" : "weekly"
-        let title = "Claude \(scopeName) at \(threshold)%"
+        let baseTitle = "Claude \(scopeName) at \(threshold)%"
+        let title = accountLabel.map { "\($0): \(baseTitle)" } ?? baseTitle
         let body: String
         if !detail.isEmpty {
             body = detail
@@ -2004,7 +2258,8 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         }
 
         let dispatch = { [weak self] in
-            self?.dispatchNotification(title: title, body: body, scope: scope, cycleKey: cycleKey)
+            self?.dispatchNotification(title: title, body: body, scope: scope, cycleKey: cycleKey,
+                                       accountID: accountID)
         }
 
         if UserDefaults.standard.bool(forKey: Self.authRequestedKey) {
@@ -2021,13 +2276,14 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    private func dispatchNotification(title: String, body: String, scope: Scope, cycleKey: String) {
+    private func dispatchNotification(title: String, body: String, scope: Scope, cycleKey: String,
+                                      accountID: String) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.categoryIdentifier = Self.categoryID
         content.interruptionLevel = .timeSensitive
-        content.userInfo = ["scope": scope.rawValue, "cycleKey": cycleKey]
+        content.userInfo = ["scope": scope.rawValue, "cycleKey": cycleKey, "accountID": accountID]
 
         let req = UNNotificationRequest(
             identifier: "CM_\(scope.rawValue)_\(cycleKey)_\(UUID().uuidString)",
@@ -2045,8 +2301,8 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     /// Stable identifier for the current cycle window. Prefer the parsed reset
     /// timestamp (rounded to seconds); fall back to a rolling anchor stored in
-    /// UserDefaults when the detail string isn't parseable.
-    func cycleKey(for scope: Scope, sections: [UsageSection], now: Date) -> String {
+    /// UserDefaults (per account) when the detail string isn't parseable.
+    func cycleKey(for scope: Scope, accountID: String, sections: [UsageSection], now: Date) -> String {
         let detailStr = detail(in: sections, scope: scope)
         if !detailStr.isEmpty, let resets = Date.parseClaudeReset(detailStr, now: now) {
             return String(Int(resets.timeIntervalSince1970))
@@ -2056,10 +2312,10 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         let windowSeconds: TimeInterval
         switch scope {
         case .session:
-            anchorKey = Self.cycleStartSessionKey
+            anchorKey = AccountKeys.key(Self.cycleStartFamily, accountID, "session")
             windowSeconds = 5 * 3600
         case .weekly:
-            anchorKey = Self.cycleStartWeeklyKey
+            anchorKey = AccountKeys.key(Self.cycleStartFamily, accountID, "weekly")
             windowSeconds = 7 * 24 * 3600
         }
         let stored = UserDefaults.standard.double(forKey: anchorKey)
@@ -2121,7 +2377,10 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     /// Drop notif.fired.* / notif.snoozed.* / notif.lastPct.* entries whose
     /// embedded cycle timestamp is more than 14 days old. Without this the
-    /// UserDefaults plist would grow unbounded over months.
+    /// UserDefaults plist would grow unbounded over months. Covers both the
+    /// v2.7.1 keys and the per-account keys: the account ID sits in the middle
+    /// ("notif.fired.<accountId>.session.50.<cycle>"), so the cycle timestamp
+    /// is still the trailing component.
     private func pruneStaleKeys() {
         let cutoff = Date().timeIntervalSince1970 - (14 * 24 * 3600)
         let defaults = UserDefaults.standard
@@ -2151,7 +2410,10 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         if response.actionIdentifier == Self.snoozeActionID {
             let info = response.notification.request.content.userInfo
             if let scope = info["scope"] as? String, let cycleKey = info["cycleKey"] as? String {
-                let key = "notif.snoozed.\(scope).\(cycleKey)"
+                // Notifications delivered by v2.7.1 carry no accountID; they
+                // can only belong to the primary account.
+                let accountID = info["accountID"] as? String ?? AccountRecord.primaryID
+                let key = AccountKeys.key(Self.snoozedFamily, accountID, "\(scope).\(cycleKey)")
                 UserDefaults.standard.set(true, forKey: key)
             }
         }

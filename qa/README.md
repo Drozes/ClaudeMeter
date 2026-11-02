@@ -95,7 +95,8 @@ Isolation from the installed app, and what L0 really touches:
 
 - **Preferences:** the QA bundle has its own domain (`com.local.ClaudeMeter.qa`),
   separate from the installed app's `com.local.ClaudeMeter`. Values persist in
-  that domain between QA runs; L3 passes `-lastBadgePercentage 0` so a cached
+  that domain between QA runs; L3 passes `-lastBadgePercentage 0` and
+  `-lastBadgePercentage.primary 0` (v2.7.1 key and per-account key) so a cached
   badge from an earlier run cannot be mistaken for a fresh fetch, and the L3
   pass regex ignores `applyBadgeVisibility cached=` transitions for the same
   reason.
