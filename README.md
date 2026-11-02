@@ -16,6 +16,7 @@ Authenticates automatically by importing your session from the Claude Desktop ap
 - **Auto-update** — check for updates from the menu bar with code signature verification
 - **Fallback login** — right-click → "Sign In..." for email/magic-link if Claude Desktop isn't available
 - **Multiple accounts** (v2.8): meter several claude.ai accounts side by side, for example personal and work. Each extra account signs in through ClaudeMeter's own login window into its own isolated session, so no account signs another out. The menu bar badge can show two accounts at once (`P 47% | W 12%`) and the popover stacks one section per account.
+- **Activity dot** (v2.8): a small dot under each percentage in the menu bar shows how fast that session is being used, in the same colours as the popover's burn-rate chip (green under 1%/h, gold under 5%/h, orange under 15%/h, red above). No dot when usage is idle. Right-click → Show Activity Dot turns it off.
 
 ## Peek In
 
@@ -75,6 +76,8 @@ Or open `ClaudeMeter.xcodeproj` in Xcode and hit **⌘R** for a proper `.app` bu
 | Choose what the badge shows | Right-click → Accounts → *account* → Badge Position → Left / Right / Hidden |
 | Change an account's badge label | Right-click → Accounts → *account* → Badge Label… (1 to 3 characters) |
 | Remove an account | Right-click → Accounts → *account* → Remove… (not available for the first account) |
+| Change an account's colour | Right-click → Accounts → *account* → Colour → pick one of 8 colours |
+| Show or hide the activity dot | Right-click → Show Activity Dot |
 | Check for updates | Right-click → Check for Updates… |
 | Quit | Right-click → Quit |
 
@@ -92,6 +95,12 @@ To add another account (macOS 14+), right-click → **Add Account…**, give it 
 | Two or more accounts, one badge position used | `W 47%` |
 | Both positions used (left first) | `P 47% \| W 12%` |
 | An account that is signed out | `W --` |
+
+With two or more accounts, "Import from Claude Desktop" and "Sign In…" move from the top of the menu into Accounts → (first account), next to Sign In Again… (⌘I and ⌘L work there while the menu is open).
+
+Each account has a colour (Blue, Purple, Indigo, Teal, Cyan, Magenta, Graphite or Brown; the first account starts Blue, each new account gets the next unused colour). It tints the account's badge label, marks its section header in the popover, and shows as a swatch in the Accounts menu. With one account the badge has no label, so nothing changes.
+
+Team and Enterprise seats show their plan as "Team" or "Enterprise" (or "Work plan" when claude.ai does not say which).
 
 Each account has a badge position (Left, Right or Hidden; a position holds one account, so choosing an occupied one moves the previous account to Hidden) and a 1 to 3 character label, by default the first letter of its name. A new account takes Right if it is free, otherwise Hidden. If no account has a position, the badge shows the first account. Hovering the badge lists every account.
 

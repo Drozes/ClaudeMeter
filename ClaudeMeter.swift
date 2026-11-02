@@ -26,6 +26,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // cancelled, but not metered or saved yet.
     var pendingAccounts: [AccountController] = []
     var signInMenuItem: NSMenuItem?
+    var importMenuItem: NSMenuItem?
     var accountsMenuItems: [NSMenuItem] = []
     // Saved accounts that cannot run (missing/invalid store identifier).
     var unavailableRecords: [AccountRecord] = []
@@ -35,6 +36,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var accountViews: [String: UsageContentView] = [:]
     var badgeSideText: [String: String] = [:]
     var badgeWasMulti = false
+    // Badge styling currently applied (nil = plain title) and its dot views.
+    var appliedBadgeStyle: BadgeStyle?
+    var badgeDotViews: [ColorDotView] = []
+    var badgeDotLayoutPending = false
+    var lastBadgeDotBounds: NSRect = .zero
     var usageView: UsageContentView!
     var contextMenu: NSMenu!
 
@@ -99,6 +105,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             accountViews.values.forEach { $0.showSparkline = showSparkline }
         }
     }
+    // Activity dot under each shown badge percentage (burn-rate band). Off
+    // means exactly the v2.8 badge.
+    static let showActivityDotKey = "showActivityDot"
+    var showActivityDot: Bool = AppDelegate.boolPref(key: AppDelegate.showActivityDotKey, default: true) {
+        didSet {
+            UserDefaults.standard.set(showActivityDot, forKey: Self.showActivityDotKey)
+            reapplyBadgeStyle(reason: "activity dot \(showActivityDot ? "on" : "off")")
+        }
+    }
     private static func boolPref(key: String, default defaultValue: Bool) -> Bool {
         if UserDefaults.standard.object(forKey: key) == nil { return defaultValue }
         return UserDefaults.standard.bool(forKey: key)
@@ -143,7 +158,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     static let lastFetchPathKey = "lastFetchPath"
     static let lastBadgePercentageKey = "lastBadgePercentage"
 
-    static func planTierDisplayName(slug: String?) -> String? {
+    static let knownPlanTierSlugs: Set<String> = [
+        "default_claude_free", "default_claude_pro", "default_claude_max_5x",
+        "default_claude_max_20x", "default_claude_team", "default_claude_enterprise",
+    ]
+
+    /// `variant` is the org's Team/Enterprise kind when known (its
+    /// raven_type, or derived from capabilities), used for "raven" tiers,
+    /// Anthropic's internal name for Team/Enterprise seats.
+    static func planTierDisplayName(slug: String?, variant: String? = nil) -> String? {
         guard let s = slug?.lowercased(), !s.isEmpty else { return nil }
         switch s {
         case "default_claude_free":         return "Free"
@@ -153,11 +176,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case "default_claude_team":         return "Team"
         case "default_claude_enterprise":   return "Enterprise"
         default:
-            // Titlecase the stem for unknown future tiers (e.g. max_50x).
-            let stripped = s.replacingOccurrences(of: "default_claude_", with: "")
-            guard !stripped.isEmpty else { return nil }
-            return stripped.prefix(1).uppercased() + stripped.dropFirst()
+            if s.contains("raven") {
+                let v = (variant ?? "").lowercased()
+                if v.contains("enterprise") { return "Enterprise" }
+                if v.contains("team") { return "Team" }
+                return "Work plan"
+            }
+            // Unknown future tiers: a tidy label, never the raw code
+            // ("default_claude_max_50x" -> "Max 50x").
+            var stem = s
+            for prefix in ["default_claude_", "default_", "claude_"] where stem.hasPrefix(prefix) {
+                stem = String(stem.dropFirst(prefix.count))
+            }
+            let words = stem.split(separator: "_").map { $0.prefix(1).uppercased() + $0.dropFirst() }
+            return words.isEmpty ? "Unknown plan" : words.joined(separator: " ")
         }
+    }
+
+    /// The Team/Enterprise kind of an org: its raven_type when present,
+    /// else "enterprise" / "team" when a capability names one, else nil.
+    static func planVariant(for org: OrgListResponse.Org) -> String? {
+        if let raven = org.raven_type, !raven.isEmpty { return raven.lowercased() }
+        let caps = (org.capabilities ?? []).map { $0.lowercased() }
+        if caps.contains(where: { $0.contains("enterprise") }) { return "enterprise" }
+        if caps.contains(where: { $0.contains("team") }) { return "team" }
+        return nil
+    }
+
+    /// Logs what an unmapped tier looks like (tier code, variant, capability
+    /// strings), never org names or emails.
+    static func logUnmappedTier(_ org: OrgListResponse.Org, context: String) {
+        let tier = (org.rate_limit_tier ?? "").lowercased()
+        guard !tier.isEmpty, !knownPlanTierSlugs.contains(tier) else { return }
+        NSLog("%@", "[ClaudeMeter] \(context): unmapped plan tier '\(tier)' raven_type=\(org.raven_type ?? "nil") capabilities=\(org.capabilities ?? []) -> '\(planTierDisplayName(slug: tier, variant: planVariant(for: org)) ?? "nil")'")
     }
 
     /// Direct XPath scrape for the "Current session" percentage. Independent
@@ -342,7 +393,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // Native popover content, sized to skeleton, auto-resizes on content load.
         usageView = UsageContentView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
         account.usageView = usageView
-        usageView.planTierDisplayName = Self.planTierDisplayName(slug: account.cachedPlanTier)
+        usageView.planTierDisplayName = account.planDisplayName
         usageView.showBurnRate = showBurnRate
         usageView.showSparkline = showSparkline
         let skeletonH = usageView.skeletonHeight
@@ -390,7 +441,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func setupMenu() {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Reload", action: #selector(reload), keyEquivalent: "r"))
-        menu.addItem(NSMenuItem(title: "Import from Claude Desktop", action: #selector(importFromDesktop), keyEquivalent: "i"))
+        let importItem = NSMenuItem(title: "Import from Claude Desktop", action: #selector(importFromDesktop), keyEquivalent: "i")
+        importMenuItem = importItem
+        menu.addItem(importItem)
         let signIn = NSMenuItem(title: "Sign In\u{2026}", action: #selector(openLogin), keyEquivalent: "l")
         signInMenuItem = signIn
         menu.addItem(signIn)
@@ -446,6 +499,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         sparklineItem.target = self
         sparklineItem.state = showSparkline ? .on : .off
         menu.addItem(sparklineItem)
+        let activityDotItem = NSMenuItem(title: "Show Activity Dot",
+                                          action: #selector(toggleActivityDot(_:)),
+                                          keyEquivalent: "")
+        activityDotItem.target = self
+        activityDotItem.state = showActivityDot ? .on : .off
+        menu.addItem(activityDotItem)
 
         let notificationsItem = NSMenuItem(title: "Notifications", action: nil, keyEquivalent: "")
         let notificationsSubmenu = NSMenu()
@@ -535,6 +594,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc func toggleBurnRate(_ sender: NSMenuItem) {
         showBurnRate.toggle()
         sender.state = showBurnRate ? .on : .off
+    }
+
+    @objc func toggleActivityDot(_ sender: NSMenuItem) {
+        showActivityDot.toggle()
+        sender.state = showActivityDot ? .on : .off
     }
 
     @objc func toggleSparkline(_ sender: NSMenuItem) {
@@ -708,16 +772,143 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// `reason` so the QA pipeline (and on-call operators) have a deterministic
     /// signal for whether the badge is updating, independent of OCR/screenshots.
     /// Skips the assignment if the value is unchanged to avoid layout churn.
-    func setBadgeTitle(_ title: String, reason: String) {
+    ///
+    /// `style` adds tinted account labels and activity dots. Without it (or
+    /// with an empty one) the plain title is set exactly as before. The
+    /// anti-flicker check compares text and style, so a dot change applies
+    /// even when the text is unchanged; that is logged as "badge style" so
+    /// the "badge title" lines stay text transitions only.
+    func setBadgeTitle(_ title: String, reason: String, style: BadgeStyle? = nil) {
         guard let button = statusItem.button else { return }
         let old = button.title
-        if old == title { return }
-        button.title = title
+        let newStyle = (style?.isEmpty ?? true) ? nil : style
+        if old == title && newStyle == appliedBadgeStyle { return }
+        if let newStyle = newStyle {
+            button.attributedTitle = attributedBadgeTitle(title, style: newStyle, font: button.font)
+        } else {
+            button.title = title
+        }
+        appliedBadgeStyle = newStyle
+        layoutBadgeDots()
         // NSLog treats its first argument as a printf format string. The badge
         // value contains '%' (e.g. "47%") which NSLog would otherwise consume
         // as a format specifier, mangling the output. Always pass user-data
         // strings through "%@" instead of inlining them in the format string.
-        NSLog("%@", "[ClaudeMeter] badge title: '\(old)' -> '\(title)' (\(reason))")
+        if old != title {
+            NSLog("%@", "[ClaudeMeter] badge title: '\(old)' -> '\(title)' (\(reason))")
+        } else {
+            let dots = newStyle?.dots.map { $0.band.rawValue } ?? []
+            NSLog("%@", "[ClaudeMeter] badge style: '\(title)' dots=\(dots) (\(reason))")
+        }
+    }
+
+    /// The badge text with account labels tinted. Other text keeps the
+    /// standard menu-bar text colour.
+    func attributedBadgeTitle(_ title: String, style: BadgeStyle, font: NSFont?) -> NSAttributedString {
+        let base = font ?? NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        // labelColor is dynamic: it resolves against the menu bar's own
+        // appearance (light, dark, Reduce Transparency) when drawn.
+        let text = NSMutableAttributedString(string: title, attributes: [.font: base, .foregroundColor: NSColor.labelColor])
+        let length = (title as NSString).length
+        for tint in style.tints where NSMaxRange(tint.range) <= length {
+            text.addAttribute(.foregroundColor, value: tint.color.color, range: tint.range)
+        }
+        return text
+    }
+
+    /// Places one activity dot under each styled percentage. Positions come
+    /// from the button cell's title rect and the measured text, recomputed
+    /// after the status item resizes; the text itself is never moved.
+    func layoutBadgeDots() {
+        badgeDotViews.forEach { $0.removeFromSuperview() }
+        badgeDotViews.removeAll()
+        guard let style = appliedBadgeStyle, !style.dots.isEmpty,
+              let button = statusItem.button, let cell = button.cell else { return }
+        let title = button.attributedTitle
+        let titleRect = cell.titleRect(forBounds: button.bounds)
+        let fullWidth = title.size().width
+        let originX = titleRect.minX + max(0, (titleRect.width - fullWidth) / 2)
+        let diameter: CGFloat = 4
+        let y: CGFloat = button.isFlipped ? button.bounds.height - diameter - 1.5 : 1.5
+        for dot in style.dots where NSMaxRange(dot.range) <= title.length {
+            let prefixWidth = title.attributedSubstring(from: NSRange(location: 0, length: dot.range.location)).size().width
+            let numberWidth = title.attributedSubstring(from: dot.range).size().width
+            let centerX = originX + prefixWidth + numberWidth / 2
+            let view = ColorDotView(frame: NSRect(x: (centerX - diameter / 2).rounded(), y: y,
+                                                  width: diameter, height: diameter))
+            view.color = dot.band.color
+            button.addSubview(view)
+            badgeDotViews.append(view)
+        }
+        // The status item resizes to the new title on the next pass; lay out
+        // again once it has.
+        if !badgeDotLayoutPending {
+            badgeDotLayoutPending = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.badgeDotLayoutPending = false
+                self.relayoutBadgeDotsIfNeeded()
+            }
+        }
+    }
+
+    private func relayoutBadgeDotsIfNeeded() {
+        guard let button = statusItem.button, appliedBadgeStyle?.dots.isEmpty == false else { return }
+        if button.bounds != lastBadgeDotBounds {
+            lastBadgeDotBounds = button.bounds
+            layoutBadgeDots()
+        }
+    }
+
+    /// Re-applies the current badge text with fresh styling (toggle, colour
+    /// or label changes). Respects the popover-open deferral.
+    func reapplyBadgeStyle(reason: String) {
+        guard showMenuBarBadge, popover?.isShown != true, let title = statusItem.button?.title else { return }
+        if accounts.count >= 2 {
+            renderMultiAccountBadge(reason: reason)
+        } else if let account = accounts.first {
+            setBadgeTitle(title, reason: reason, style: singleAccountBadgeStyle(for: account, text: title))
+        }
+    }
+
+    /// One account: no label, so the only styling is the activity dot.
+    func singleAccountBadgeStyle(for account: AccountController, text: String) -> BadgeStyle? {
+        guard let band = activityBand(for: account, value: text) else { return nil }
+        return BadgeStyle(tints: [], dots: [BadgeStyle.Dot(range: NSRange(location: 0, length: (text as NSString).length), band: band)])
+    }
+
+    /// The activity dot for one badge side: only with the toggle on, for a
+    /// signed-in account showing a real percentage, and only when its
+    /// session forecast has a burn-rate band (same rule as the chip).
+    func activityBand(for account: AccountController, value: String) -> BurnRateBand? {
+        guard showActivityDot, !account.isSignedOut,
+              value.range(of: "^[0-9]+%$", options: .regularExpression) != nil else { return nil }
+        return BurnRateBand.band(for: account.lastSessionForecast)
+    }
+
+    /// The account's colour: its saved key if it is a known palette colour;
+    /// otherwise Blue for the primary account and, for others, the first
+    /// palette colour no earlier account uses.
+    func accountColor(for account: AccountController) -> AccountColor {
+        if let key = account.record.colorKey, let color = AccountColor(rawValue: key) { return color }
+        if account.isPrimary { return .blue }
+        var used = Set<AccountColor>()
+        for other in accounts {
+            if other === account { break }
+            used.insert(accountColor(for: other))
+        }
+        return AccountColor.allCases.first { !used.contains($0) } ?? .blue
+    }
+
+    /// First palette colour not used by any running account.
+    func nextUnusedAccountColor() -> AccountColor {
+        let used = Set(accounts.map { accountColor(for: $0) })
+        return AccountColor.allCases.first { !used.contains($0) } ?? .blue
+    }
+
+    func setAccountColor(_ color: AccountColor, for account: AccountController) {
+        account.updateRecord { $0.colorKey = color.rawValue }
+        NSLog("%@", "[ClaudeMeter] account colour: \(account.id) -> \(color.rawValue)")
     }
 
     func applyBadgeVisibility() {
@@ -759,7 +950,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let badgeKey = account.lastBadgePercentageKey
 
         if let pct = account.sessionPercentage(from: account.latestSections) {
-            setBadgeTitle("\(pct)%", reason: "model meter labeled current session")
+            setBadgeTitle("\(pct)%", reason: "model meter labeled current session",
+                          style: singleAccountBadgeStyle(for: account, text: "\(pct)%"))
             UserDefaults.standard.set(pct, forKey: badgeKey)
             return
         }
@@ -771,7 +963,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // Re-check guards on the JS callback — popover state may have changed.
             guard self.showMenuBarBadge, self.popover?.isShown != true else { return }
             if let pct = result as? Int {
-                self.setBadgeTitle("\(pct)%", reason: "XPath fallback scrape")
+                self.setBadgeTitle("\(pct)%", reason: "XPath fallback scrape",
+                                   style: self.singleAccountBadgeStyle(for: account, text: "\(pct)%"))
                 UserDefaults.standard.set(pct, forKey: badgeKey)
             } else if self.statusItem.button?.title.isEmpty == true {
                 self.setBadgeTitle("\u{2014}%", reason: "XPath fallback returned nil")
@@ -970,20 +1163,28 @@ extension AppDelegate {
         }
         accountsMenuItems = []
 
+        // With an Accounts submenu, the primary-only top-level "Import from
+        // Claude Desktop" and "Sign In…" move into the primary account's
+        // submenu (with their shortcuts); with one account they stay as is.
+        let showsAccountsSubmenu = accounts.count + unavailableRecords.count >= 2
+        signInMenuItem?.isHidden = showsAccountsSubmenu
+        importMenuItem?.isHidden = showsAccountsSubmenu
+
         var items: [NSMenuItem] = []
         for account in accounts where !account.isPrimary && account.isSignedOut {
             items.append(accountMenuItem("Sign In Again to \(account.record.displayName)\u{2026}",
                                          #selector(signInAgain(_:)), account))
         }
-        if accounts.count + unavailableRecords.count >= 2 {
+        if showsAccountsSubmenu {
             let parent = NSMenuItem(title: "Accounts", action: nil, keyEquivalent: "")
             let submenu = NSMenu()
             for account in accounts {
                 let record = account.record
                 var title = record.displayName
-                if let tier = Self.planTierDisplayName(slug: record.planTier) { title += " (\(tier))" }
+                if let tier = account.planDisplayName { title += " (\(tier))" }
                 if account.isSignedOut { title += ", signed out" }
                 let accountItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                accountItem.image = accountColor(for: account).swatch
                 let accountMenu = NSMenu()
                 if let detail = record.email ?? record.orgName {
                     let info = NSMenuItem(title: detail, action: nil, keyEquivalent: "")
@@ -992,7 +1193,14 @@ extension AppDelegate {
                     accountMenu.addItem(info)
                     accountMenu.addItem(NSMenuItem.separator())
                 }
-                accountMenu.addItem(accountMenuItem("Sign In Again\u{2026}", #selector(signInAgain(_:)), account))
+                let signInAgainItem = accountMenuItem("Sign In Again\u{2026}", #selector(signInAgain(_:)), account)
+                accountMenu.addItem(signInAgainItem)
+                if account.isPrimary {
+                    signInAgainItem.keyEquivalent = "l"
+                    let importItem = NSMenuItem(title: "Import from Claude Desktop", action: #selector(importFromDesktop), keyEquivalent: "i")
+                    importItem.target = self
+                    accountMenu.addItem(importItem)
+                }
                 accountMenu.addItem(accountMenuItem("Rename\u{2026}", #selector(renameAccount(_:)), account))
                 let position = NSMenuItem(title: "Badge Position", action: nil, keyEquivalent: "")
                 let positionMenu = NSMenu()
@@ -1012,6 +1220,18 @@ extension AppDelegate {
                 position.submenu = positionMenu
                 accountMenu.addItem(position)
                 accountMenu.addItem(accountMenuItem("Badge Label (\(record.badgeLabel))\u{2026}", #selector(editBadgeLabel(_:)), account))
+                let colourItem = NSMenuItem(title: "Colour", action: nil, keyEquivalent: "")
+                let colourMenu = NSMenu()
+                let current = accountColor(for: account)
+                for (tag, color) in AccountColor.allCases.enumerated() {
+                    let item = accountMenuItem(color.title, #selector(setAccountColorFromMenu(_:)), account)
+                    item.tag = tag
+                    item.image = color.swatch
+                    item.state = color == current ? .on : .off
+                    colourMenu.addItem(item)
+                }
+                colourItem.submenu = colourMenu
+                accountMenu.addItem(colourItem)
                 if !account.isPrimary {
                     accountMenu.addItem(accountMenuItem("Remove\u{2026}", #selector(removeAccountFromMenu(_:)), account))
                 }
@@ -1162,7 +1382,11 @@ extension AppDelegate {
     func finishAddAccount(_ controller: AccountController) {
         // Slot decided now, not at start, so two adds can never both take Right.
         let rightTaken = accounts.contains { $0.record.badgeSlot == .right }
-        controller.updateRecord { $0.badgeSlot = rightTaken ? .hidden : .right }
+        let color = nextUnusedAccountColor()
+        controller.updateRecord {
+            $0.badgeSlot = rightTaken ? .hidden : .right
+            $0.colorKey = color.rawValue
+        }
         controller.isPendingAdd = false
         controller.persistRecord()
         accounts.append(controller)
@@ -1252,7 +1476,7 @@ extension AppDelegate {
         let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 26), pullsDown: false)
         for org in orgs {
             var title = org.name ?? "Organization"
-            if let tier = Self.planTierDisplayName(slug: org.rate_limit_tier) { title += " (\(tier))" }
+            if let tier = Self.planTierDisplayName(slug: org.rate_limit_tier, variant: Self.planVariant(for: org)) { title += " (\(tier))" }
             if let other = accounts.first(where: { $0 !== account && $0.record.orgUUID == org.uuid }) {
                 title += ", already metered as \(other.record.displayName)"
             }
@@ -1360,11 +1584,22 @@ extension AppDelegate {
     /// "W 47%" with one shown side, "P 47% | W 12%" with two (left first).
     /// A signed-out side reads "W --".
     func renderMultiAccountBadge(reason: String) {
-        let parts = badgeAccounts().map { account -> String in
+        var text = ""
+        var style = BadgeStyle()
+        for (i, account) in badgeAccounts().enumerated() {
+            if i > 0 { text += " | " }
             let value = account.isSignedOut ? "--" : (badgeSideText[account.id] ?? cachedBadgeSideText(for: account))
-            return "\(account.record.badgeLabel) \(value)"
+            let label = account.record.badgeLabel
+            let labelRange = NSRange(location: (text as NSString).length, length: (label as NSString).length)
+            text += label + " "
+            let valueRange = NSRange(location: (text as NSString).length, length: (value as NSString).length)
+            text += value
+            style.tints.append(BadgeStyle.Tint(range: labelRange, color: accountColor(for: account)))
+            if let band = activityBand(for: account, value: value) {
+                style.dots.append(BadgeStyle.Dot(range: valueRange, band: band))
+            }
         }
-        setBadgeTitle(parts.joined(separator: " | "), reason: reason)
+        setBadgeTitle(text, reason: reason, style: style)
     }
 
     /// Restores the badge from cached values (launch, badge re-enabled, or a
@@ -1452,7 +1687,7 @@ extension AppDelegate {
         if account.isPrimary, let view = usageView { return view }
         if let view = accountViews[account.id] { return view }
         let view = UsageContentView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-        view.planTierDisplayName = Self.planTierDisplayName(slug: account.cachedPlanTier)
+        view.planTierDisplayName = account.planDisplayName
         view.showBurnRate = showBurnRate
         view.showSparkline = showSparkline
         account.usageView = view
@@ -1488,13 +1723,14 @@ extension AppDelegate {
             if vc.view !== multi { vc.view = multi }
             let entries = accounts.map { account -> MultiAccountUsageView.Entry in
                 let record = account.record
-                let tier = Self.planTierDisplayName(slug: record.planTier)
+                let tier = account.planDisplayName
                 let view = usageView(for: account)
                 view.planTierDisplayName = tier
                 let detail = [record.email ?? record.orgName, tier].compactMap { $0 }.joined(separator: " · ")
                 return MultiAccountUsageView.Entry(accountID: account.id, title: record.displayName,
                                                    detail: detail.isEmpty ? nil : detail,
-                                                   signedOut: account.isSignedOut, usageView: view)
+                                                   signedOut: account.isSignedOut, usageView: view,
+                                                   color: accountColor(for: account).color)
             }
             multi.reload(entries)
             // A section added while the popover is open gets its countdown.
@@ -1522,6 +1758,12 @@ extension AppDelegate {
     }
 
     // MARK: Menu actions for the badge
+
+    @objc func setAccountColorFromMenu(_ sender: NSMenuItem) {
+        guard let account = account(withID: sender.representedObject as? String),
+              AccountColor.allCases.indices.contains(sender.tag) else { return }
+        setAccountColor(AccountColor.allCases[sender.tag], for: account)
+    }
 
     @objc func setBadgeSlotFromMenu(_ sender: NSMenuItem) {
         guard let account = account(withID: sender.representedObject as? String) else { return }
@@ -1641,6 +1883,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     private var signedOutProbeTimer: Timer?
     private var pageRetryUsed = false
     private var lastSignInConfirmAt: Date?
+    private var pinnedTierRefreshed = false
     static let signedOutProbeInterval: TimeInterval = 15 * 60
     /// Called once when the login window closes: true after a verified
     /// sign-in, false when the user closed it first.
@@ -1668,6 +1911,11 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     }
 
     // MARK: - Per-account keys
+
+    /// Friendly plan name ("Max 20x", "Team", "Work plan"...).
+    var planDisplayName: String? {
+        AppDelegate.planTierDisplayName(slug: record.planTier, variant: record.planVariant)
+    }
 
     var lastFetchPathKey: String { AccountKeys.key(AppDelegate.lastFetchPathKey, id) }
     var lastBadgePercentageKey: String { AccountKeys.key(AppDelegate.lastBadgePercentageKey, id) }
@@ -2032,8 +2280,10 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                 r.orgUUID = chosen.uuid
                 r.orgName = chosen.name ?? r.orgName
                 r.planTier = chosen.rate_limit_tier ?? r.planTier
+                r.planVariant = AppDelegate.planVariant(for: chosen)
                 r.orgPinned = true
             }
+            AppDelegate.logUnmappedTier(chosen, context: "login")
         }
         jsonConsecutiveFailures = 0
         jsonCircuitOpen = false
@@ -2750,8 +3000,10 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                     self.cachedPlanTier = tier
                     NSLog("%@", "[ClaudeMeter] plan tier resolved: \(tier)")
                 }
+                self.record.planVariant = AppDelegate.planVariant(for: chosen)
+                AppDelegate.logUnmappedTier(chosen, context: "discoverOrgUUID")
                 self.persistRecord()
-                self.usageView?.planTierDisplayName = AppDelegate.planTierDisplayName(slug: self.cachedPlanTier)
+                self.usageView?.planTierDisplayName = self.planDisplayName
             }
             completion(chosen?.uuid)
         }
@@ -2798,6 +3050,29 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// endpoint may be circuit-broken or shape-mismatched, but plan tier still
     /// works because /api/organizations is a different endpoint.
     func refreshPlanTierIfNeeded() {
+        // A pinned org never re-runs org selection. Refresh its tier and
+        // Team/Enterprise kind from the org list once per launch when they
+        // are missing or a "raven" tier has no kind yet; never re-pick.
+        if record.orgPinned {
+            let tier = (record.planTier ?? "").lowercased()
+            guard !pinnedTierRefreshed, tier.isEmpty || (tier.contains("raven") && record.planVariant == nil),
+                  let pinned = record.orgUUID else { return }
+            pinnedTierRefreshed = true
+            copyCookiesToSession(logCount: false) { [weak self] session in
+                guard let self = self else { session.finishTasksAndInvalidate(); return }
+                self.requestOrgList(session: session, context: "pinnedTierRefresh", quiet: true) { [weak self] _, orgs in
+                    session.finishTasksAndInvalidate()
+                    guard let self = self, let org = orgs?.first(where: { $0.uuid == pinned }) else { return }
+                    AppDelegate.logUnmappedTier(org, context: "pinnedTierRefresh")
+                    self.updateRecord { r in
+                        if let t = org.rate_limit_tier, !t.isEmpty { r.planTier = t }
+                        r.planVariant = AppDelegate.planVariant(for: org)
+                    }
+                    self.usageView?.planTierDisplayName = self.planDisplayName
+                }
+            }
+            return
+        }
         copyCookiesToSession { [weak self] session in
             guard let self = self else { session.finishTasksAndInvalidate(); return }
             self.discoverOrgUUID(session: session) { _ in session.finishTasksAndInvalidate() }
@@ -2969,9 +3244,15 @@ struct AccountRecord: Codable, Equatable {
     /// Identifier for WKWebsiteDataStore(forIdentifier:); nil means the
     /// default store (primary account only).
     var storeIdentifier: String?
+    /// AccountColor raw value as stored. Kept verbatim (an unknown key from
+    /// another build round-trips); AppDelegate.accountColor(for:) falls back
+    /// to the default when it is missing or unknown.
+    var colorKey: String? = nil
+    /// Team/Enterprise kind for "raven" plan tiers (see planVariant(for:)).
+    var planVariant: String? = nil
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case id, displayName, badgeLabel, badgeSlot, email, orgUUID, orgName, planTier, orgPinned, storeIdentifier
+        case id, displayName, badgeLabel, badgeSlot, email, orgUUID, orgName, planTier, orgPinned, storeIdentifier, colorKey, planVariant
     }
 
     var isPrimary: Bool { id == Self.primaryID }
@@ -3002,7 +3283,7 @@ struct AccountRecord: Codable, Equatable {
         return AccountRecord(id: primaryID, displayName: name,
                              badgeLabel: defaultBadgeLabel(for: name), badgeSlot: .left,
                              email: nil, orgUUID: orgUUID, orgName: nil, planTier: planTier,
-                             orgPinned: false, storeIdentifier: nil)
+                             orgPinned: false, storeIdentifier: nil, colorKey: AccountColor.blue.rawValue)
     }
 }
 
@@ -3039,7 +3320,9 @@ extension AccountRecord {
                   orgName: string(.orgName),
                   planTier: string(.planTier),
                   orgPinned: (try? c.decodeIfPresent(Bool.self, forKey: .orgPinned)) ?? false,
-                  storeIdentifier: string(.storeIdentifier))
+                  storeIdentifier: string(.storeIdentifier),
+                  colorKey: string(.colorKey),
+                  planVariant: string(.planVariant))
     }
 }
 
@@ -3359,6 +3642,8 @@ struct OrgListResponse: Decodable {
         let name: String?
         let capabilities: [String]?
         let rate_limit_tier: String?
+        /// Team/Enterprise kind for "raven" orgs, when the API sends it.
+        let raven_type: String?
     }
     let organizations: [Org]?
 }
@@ -3979,6 +4264,121 @@ extension Date {
 
 // MARK: - Native Usage View
 
+// MARK: - Burn-rate bands, account colours, badge styling
+
+/// Burn-rate bands shared by the popover's burn-rate chip and the menu-bar
+/// activity dot, so the two can never disagree.
+enum BurnRateBand: String {
+    case green, gold, amber, crimson
+
+    /// nil when there is no forecast or it is idle / has too little data.
+    static func band(for forecast: UsageForecast?) -> BurnRateBand? {
+        guard let f = forecast else { return nil }
+        switch f.state {
+        case .insufficientData, .idle:
+            return nil
+        case .ok, .willNotExhaust:
+            break
+        }
+        switch f.ratePerHour {
+        case ..<1.0:  return .green
+        case ..<5.0:  return .gold
+        case ..<15.0: return .amber
+        default:      return .crimson
+        }
+    }
+
+    var color: NSColor {
+        switch self {
+        case .green:   return NSColor(red: 0x2b/255.0, green: 0xa8/255.0, blue: 0x82/255.0, alpha: 1)
+        case .gold:    return NSColor(red: 0xc9/255.0, green: 0xa6/255.0, blue: 0x2c/255.0, alpha: 1)
+        case .amber:   return NSColor(red: 0xc0/255.0, green: 0x5e/255.0, blue: 0x1a/255.0, alpha: 1)
+        case .crimson: return NSColor(red: 0xc0/255.0, green: 0x3a/255.0, blue: 0x3a/255.0, alpha: 1)
+        }
+    }
+}
+
+/// Per-account colour palette. Stored on AccountRecord as the raw key, so a
+/// key from another build round-trips and simply reads as the default here.
+/// Dynamic colours, readable on light and dark menu bars, and kept away from
+/// the activity dot's green / gold / amber / crimson.
+enum AccountColor: String, CaseIterable {
+    case blue, purple, indigo, teal, cyan, magenta, graphite, brown
+
+    var title: String {
+        switch self {
+        case .blue: return "Blue"
+        case .purple: return "Purple"
+        case .indigo: return "Indigo"
+        case .teal: return "Teal"
+        case .cyan: return "Cyan"
+        case .magenta: return "Magenta"
+        case .graphite: return "Graphite"
+        case .brown: return "Brown"
+        }
+    }
+
+    var color: NSColor {
+        switch self {
+        case .blue: return .systemBlue
+        case .purple: return .systemPurple
+        case .indigo: return .systemIndigo
+        case .teal: return .systemTeal
+        case .cyan: return .systemCyan
+        case .magenta:
+            return NSColor(name: "ClaudeMeterMagenta") { appearance in
+                appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                    ? NSColor(red: 0xff/255.0, green: 0x6a/255.0, blue: 0xd5/255.0, alpha: 1)
+                    : NSColor(red: 0xb0/255.0, green: 0x1e/255.0, blue: 0x9a/255.0, alpha: 1)
+            }
+        case .graphite: return .systemGray
+        case .brown: return .systemBrown
+        }
+    }
+
+    /// A small round swatch for menus; drawn at render time, so dynamic
+    /// colours follow the menu's appearance.
+    var swatch: NSImage {
+        let image = NSImage(size: NSSize(width: 12, height: 12), flipped: false) { rect in
+            self.color.setFill()
+            NSBezierPath(ovalIn: rect.insetBy(dx: 1.5, dy: 1.5)).fill()
+            return true
+        }
+        image.accessibilityDescription = title
+        return image
+    }
+}
+
+/// Extra styling for the menu-bar badge: account labels tinted in their
+/// account colour and an activity dot under each percentage. nil or empty
+/// means the plain title, exactly as before.
+struct BadgeStyle: Equatable {
+    struct Tint: Equatable {
+        let range: NSRange
+        let color: AccountColor
+    }
+    struct Dot: Equatable {
+        let range: NSRange
+        let band: BurnRateBand
+    }
+    var tints: [Tint] = []
+    var dots: [Dot] = []
+    var isEmpty: Bool { tints.isEmpty && dots.isEmpty }
+}
+
+/// A small filled circle (activity dot under a badge percentage, and the
+/// colour dot in multi-account popover headers). Drawn in draw(_:) rather
+/// than as a layer, so snapshots and every appearance render it.
+final class ColorDotView: NSView {
+    var color: NSColor = .clear {
+        didSet { needsDisplay = true }
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        color.setFill()
+        NSBezierPath(ovalIn: bounds).fill()
+    }
+}
+
 // MARK: - Multi-Account Popover
 
 /// NSScrollView that hands scroll-wheel events to the enclosing scroll view
@@ -4009,6 +4409,7 @@ final class MultiAccountUsageView: NSView {
         let detail: String?
         let signedOut: Bool
         let usageView: UsageContentView
+        let color: NSColor
     }
 
     var onContentSizeChanged: ((CGFloat) -> Void)?
@@ -4023,6 +4424,7 @@ final class MultiAccountUsageView: NSView {
         let accountID: String
         let titleLabel: NSTextField
         let detailLabel: NSTextField
+        var headerDot: ColorDotView?
         let signedOutRow: NSView
         let usageView: UsageContentView
         let usageHeight: NSLayoutConstraint
@@ -4079,6 +4481,9 @@ final class MultiAccountUsageView: NSView {
     var sectionStates: [(accountID: String, showsUsage: Bool, usageHeight: CGFloat)] {
         sections.map { ($0.accountID, !$0.usageView.isHidden, $0.usageHeight.constant) }
     }
+
+    /// Header colour dot per section, read by the QA test hooks.
+    var headerColors: [NSColor?] { sections.map { $0.headerDot?.color } }
 
     /// Same accounts in the same order: update headers and signed-out rows in
     /// place. Otherwise rebuild the sections (embedded views are reused).
@@ -4141,7 +4546,15 @@ final class MultiAccountUsageView: NSView {
 
             let title = label(entry.title, size: 13, weight: .semibold, color: .white)
             let detail = label("", size: 11, weight: .regular, color: NSColor(white: 0.55, alpha: 1))
-            let header = NSStackView(views: [title, detail])
+            let dot = ColorDotView(frame: NSRect(x: 0, y: 0, width: 8, height: 8))
+            dot.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([dot.widthAnchor.constraint(equalToConstant: 8),
+                                         dot.heightAnchor.constraint(equalToConstant: 8)])
+            let titleRow = NSStackView(views: [dot, title])
+            titleRow.orientation = .horizontal
+            titleRow.alignment = .centerY
+            titleRow.spacing = 6
+            let header = NSStackView(views: [titleRow, detail])
             header.orientation = .vertical
             header.alignment = .leading
             header.spacing = 1
@@ -4174,6 +4587,7 @@ final class MultiAccountUsageView: NSView {
             }
             let section = Section(accountID: entry.accountID, titleLabel: title, detailLabel: detail,
                                   signedOutRow: row, usageView: usage, usageHeight: height)
+            section.headerDot = dot
             section.arranged = arranged
             usage.onContentSizeChanged = { [weak self, weak section] h in
                 guard let self = self, let section = section else { return }
@@ -4188,6 +4602,7 @@ final class MultiAccountUsageView: NSView {
     }
 
     private func apply(_ entry: Entry, to section: Section) {
+        section.headerDot?.color = entry.color
         if section.titleLabel.stringValue != entry.title { section.titleLabel.stringValue = entry.title }
         let detail = entry.detail ?? ""
         if section.detailLabel.stringValue != detail { section.detailLabel.stringValue = detail }
@@ -4956,16 +5371,11 @@ class UsageContentView: NSView {
     /// matching forecast (per-model windows currently), or when the
     /// forecast is in a noise-floor state (insufficientData / idle).
     private func applyBurnRateChip(label: NSTextField, forecast: UsageForecast?) {
-        guard showBurnRate, let f = forecast else {
+        // BurnRateBand is shared with the menu-bar activity dot: no band
+        // (no forecast, idle, too little data) means no chip.
+        guard showBurnRate, let f = forecast, let band = BurnRateBand.band(for: f) else {
             label.isHidden = true
             return
-        }
-        switch f.state {
-        case .insufficientData, .idle:
-            label.isHidden = true
-            return
-        case .ok, .willNotExhaust:
-            break
         }
         let rate = f.ratePerHour
         // Format: "+4.2%/h", with one decimal under 10 and zero decimals at
@@ -4976,15 +5386,8 @@ class UsageContentView: NSView {
         } else {
             formatted = String(format: "+%.1f%%/h", rate)
         }
-        let color: NSColor
-        switch rate {
-        case ..<1.0:   color = NSColor(red: 0x2b/255.0, green: 0xa8/255.0, blue: 0x82/255.0, alpha: 1) // green
-        case ..<5.0:   color = NSColor(red: 0xc9/255.0, green: 0xa6/255.0, blue: 0x2c/255.0, alpha: 1) // gold
-        case ..<15.0:  color = NSColor(red: 0xc0/255.0, green: 0x5e/255.0, blue: 0x1a/255.0, alpha: 1) // amber
-        default:       color = NSColor(red: 0xc0/255.0, green: 0x3a/255.0, blue: 0x3a/255.0, alpha: 1) // crimson
-        }
         if label.stringValue != formatted { label.stringValue = formatted }
-        label.textColor = color
+        label.textColor = band.color
         label.toolTip = "EWMA burn rate over recent samples"
         label.isHidden = false
     }

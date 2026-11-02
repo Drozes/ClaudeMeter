@@ -28,6 +28,8 @@ BUNDLE_ID="com.local.ClaudeMeter.qa.multi"
 OUT="${CLAUDEMETER_QA_MULTI_BIN:-/tmp/ClaudeMeter.qamulti}"
 APP="$OUT.app"
 LOGDIR="${CLAUDEMETER_QA_MULTI_LOGDIR:-/tmp}"
+SHOTDIR="${CLAUDEMETER_QA_MULTI_SHOTDIR:-/tmp/claudemeter.qa.multi.shots}"
+mkdir -p "$SHOTDIR"
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 
 log() { printf '[MA] %s\n' "$*" >&2; }
@@ -74,12 +76,23 @@ run_app() {
     # No Claude Desktop import (no Keychain prompt) and no auto-opened login
     # window: the primary account here has no session and shows signed out.
     "$APP/Contents/MacOS/$NAME" -declinedMoveToApplications YES -skipDesktopImport YES -suppressAutoLoginWindow YES \
-        -qa.actions "$actions" >/dev/null 2>"$logfile" &
+        -qa.shotDir "$SHOTDIR" -qa.actions "$actions" >/dev/null 2>"$logfile" &
     local pid=$!
-    for _ in $(seq 1 150); do
+    local shots=0
+    for _ in $(seq 1 300); do
         grep -q "QA-DONE" "$logfile" 2>/dev/null && break
         kill -0 "$pid" 2>/dev/null || break
-        sleep 1
+        # Capture the real menu bar for each "QA-SHOT name x y w h" request.
+        local n
+        n=$(grep -c "QA-SHOT " "$logfile" 2>/dev/null || true)
+        while [ "${n:-0}" -gt "$shots" ]; do
+            shots=$((shots + 1))
+            set -- $(grep "QA-SHOT " "$logfile" | sed -n "${shots}p" | sed -E 's/^.*QA-SHOT //')
+            if [ $# -ge 5 ]; then
+                screencapture -x -R "$(( $2 - 8 )),$3,$(( $4 + 16 )),$5" "$SHOTDIR/$1-menubar.png" 2>/dev/null || true
+            fi
+        done
+        sleep 0.5
     done
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -118,8 +131,9 @@ check "secondaries signed out (empty stores, confirmed by API)" \
 check "no window opened on its own" 'dump 2 | grep -q "QA-WINDOWS visible=\[\]"'
 check "menu offers Sign In Again to Work" 'dump 2 | grep "QA-MENU" | grep -q "Sign In Again to Work"'
 check "menu has Accounts submenu with Remove for secondaries" 'dump 2 | grep "QA-MENU" | grep -q "Accounts\[.*Remove"'
-check "menu has Badge Position and Badge Label per account" 'dump 2 | grep "QA-MENU" | grep -q "Badge Position\[Left | Right | Hidden\] | Badge Label (W)"'
+check "menu has Badge Position and Badge Label per account" 'dump 2 | grep "QA-MENU" | grep -qE "Badge Position\[Left[^]|]* \| Right[^]|]* \| Hidden[^]|]*\] \| Badge Label \(W\)"'
 check "record without a store is kept and listed as unavailable with Remove" 'dump 2 | grep "QA-MENU" | grep -q "Broken (unavailable)\[Remove…\]" && L | grep -q "unavailable: missing or invalid store identifier"'
+check "2+ accounts: top-level Import/Sign In hidden, moved into the primary's submenu" 'dump 2 | grep "QA-MENU" | grep -q "^QA-MENU Reload | Import from Claude Desktop{hidden} | Sign In…{hidden} |" && dump 2 | grep "QA-MENU" | grep -qE "Personal[^[]*\[[^]]*Sign In Again… \| Import from Claude Desktop \|"'
 check "primary has no Remove item" '! dump 2 | grep "QA-MENU" | grep -qE "Personal[^]]*\[[^]]*Remove"'
 check "timers staggered (offset logged for secondaries)" 'L | grep -q "startRefreshTimer: .*offset=[0-9]*s"'
 check "seeded keys counted" 'L | grep -q "QA-KEYS index=2 .* count=9"'
@@ -160,7 +174,7 @@ B="$B,signOut:1,badge"                                                   # badge
 B="$B,setLabel:1:w |%x,badge"                                            # badge 9
 B="$B,addSynthetic:Third,wait:10,openPopover,wait:10,inject:1:12,inject:2:33,inject:0:47,wait:3,popover" # popover 2
 B="$B,closePopover,wait:1,dump"                                          # dump 2
-B="$B,remove:2,remove:1,wait:3,badge,popover,done"                       # badge 10, popover 3
+B="$B,remove:2,remove:1,wait:3,badge,popover,dump,tiers,done"          # badge 10, popover 3, dump 3
 LOG="$LOGDIR/claudemeter.qa.multi.B.log"
 run_app "$LOG" "$B"
 log "log: $LOG"
@@ -177,7 +191,7 @@ check "right then left order: W 12% | P 47%" '[ "$(badge 5)" = "W 12% | P 47%" ]
 check "both hidden falls back to primary: P 47%" '[ "$(badge 6)" = "P 47%" ]'
 check "custom label: Me 47% | W 12%" '[ "$(badge 7)" = "Me 47% | W 12%" ]'
 check "signed-out side shows two hyphens: Me 47% | W --" '[ "$(badge 8)" = "Me 47% | W --" ]'
-check "both-hidden fallback noted in the primary's Badge Position menu" 'dump 1 | grep "QA-MENU" | grep -q "Personal[^[]*\[[^]]*Badge Position\[Left | Right | Hidden | Shown on badge: no account has a position\]"'
+check "both-hidden fallback noted in the primary's Badge Position menu" 'dump 1 | grep "QA-MENU" | grep -q "Personal[^[]*\[[^]]*Badge Position\[Left | Right | Hidden{on} | Shown on badge: no account has a position\]"'
 check "label sanitized (no spaces, | or %): Me 47% | wx --" '[ "$(badge 9)" = "Me 47% | wx --" ]'
 check "three accounts stacked in the popover, all with usage, measured while shown" 'nth popover 2 | grep -qE "mode=multi sections=3 \[usage:[0-9]+,usage:[0-9]+,usage:[0-9]+\] .* shown=true"'
 POP2=$(nth popover 2 | grep QA-POPOVER)
@@ -187,7 +201,63 @@ check "popover sized to the sum of the sections (total=$TOTAL contentSize=$CSIZE
 check "badge slot and label persisted" 'dump 2 | grep -q "name=Personal label=Me slot=left"'
 check "back to one account: plain percentage again" '[ "$(badge 10)" = "47%" ]'
 check "back to one account: popover is the usage view itself" 'nth popover 3 | grep -q "mode=single usageViewIsContent=true"'
+check "one account again: top-level Import and Sign In visible as in v2.8" 'dump 3 | grep "QA-MENU" | grep -q "^QA-MENU Reload | Import from Claude Desktop | Sign In… | Add Account…"'
+check "plan tiers: raven maps to Work plan/Team/Enterprise, unknown tiers tidy" 'L | grep -q "QA-TIER default_raven/nil -> Work plan" && L | grep -q "QA-TIER default_raven/team -> Team" && L | grep -q "QA-TIER default_raven/enterprise -> Enterprise" && L | grep -q "QA-TIER default_claude_max_50x/nil -> Max 50x" && L | grep -q "QA-TIER default_foo_bar/nil -> Foo Bar" && L | grep -q "QA-TIER default_/nil -> Unknown plan" && L | grep -q "QA-TIER default_claude_max_20x/nil -> Max 20x"'
 check "B: no secret-looking values logged" '! grep -qiE "sessionKey=|Bearer |@[a-z0-9.-]+\.[a-z]{2,}" "$LOG"'
+
+# ------------------------------------------------------------ scenario C
+log "scenario C: activity dot and account colours (shots: $SHOTDIR)"
+cleanup
+defaults write "$BUNDLE_ID" accounts.migrationVersion -int 1
+defaults write "$BUNDLE_ID" showMenuBarBadge -bool YES
+defaults write "$BUNDLE_ID" accounts.list -string '{"schema":1,"accounts":[{"id":"primary","displayName":"Personal","badgeLabel":"P","badgeSlot":"left","orgPinned":false}]}'
+C="wait:8,inject:0:47"
+C="$C,forecast:0:0.5,badge,shot:1acct-green"                                     # badge 1
+C="$C,forecast:0:3,badge,shot:1acct-gold"                                        # badge 2
+C="$C,forecast:0:10,badge,shot:1acct-amber"                                      # badge 3
+C="$C,forecast:0:20,badge,shot:1acct-crimson"                                    # badge 4
+C="$C,forecast:0:idle,badge,shot:1acct-idle"                                     # badge 5
+C="$C,forecast:0:3,dot:off,badge,shot:1acct-dot-off"                             # badge 6
+C="$C,dot:on,badge"                                                              # badge 7
+C="$C,addSynthetic:Work,wait:10,inject:1:12,forecast:0:3,forecast:1:20,badge,shot:2acct-gold-crimson"  # badge 8
+C="$C,signOut:1,badge,shot:2acct-signedout"                                      # badge 9
+C="$C,setColor:1:teal,inject:1:12,forecast:1:0.5,badge,shot:2acct-teal-green,popover"   # badge 10, popover 1
+C="$C,dot:off,badge,dot:on"                                                      # badge 11
+C="$C,setColor:0:chartreuse,dump,done"                                           # dump 1
+LOG="$LOGDIR/claudemeter.qa.multi.C.log"
+run_app "$LOG" "$C"
+log "log: $LOG"
+bstyle() { nth badge "$1" | grep QA-BADGESTYLE | sed -E 's/^QA-BADGESTYLE //'; }
+for i in 1 2 3 4 5 6 7 8 9 10 11; do log "  badge $i: '$(badge $i)'  $(bstyle $i)"; done
+check "C finished" 'grep -q QA-DONE "$LOG"'
+check "one account, green band: 47% with a green dot" '[ "$(badge 1)" = "47%" ] && bstyle 1 | grep -q "dots=\[\"green\"\] dotViews=1 tints=\[\]"'
+check "gold band" 'bstyle 2 | grep -q "dots=\[\"gold\"\] dotViews=1"'
+check "amber band" 'bstyle 3 | grep -q "dots=\[\"amber\"\] dotViews=1"'
+check "crimson band" 'bstyle 4 | grep -q "dots=\[\"crimson\"\] dotViews=1"'
+check "idle: no dot, plain title" '[ "$(badge 5)" = "47%" ] && bstyle 5 | grep -q "attributed=false dots=\[\] dotViews=0"'
+check "toggle off: exactly the v2.8 plain title" '[ "$(badge 6)" = "47%" ] && bstyle 6 | grep -q "attributed=false dots=\[\] dotViews=0 tints=\[\]"'
+check "toggle back on: dot returns" 'bstyle 7 | grep -q "dots=\[\"gold\"\] dotViews=1"'
+check "two sides, different bands, labels tinted Blue/Purple" '[ "$(badge 8)" = "P 47% | W 12%" ] && bstyle 8 | grep -q "dots=\[\"gold\", \"crimson\"\] dotViews=2 tints=\[\"blue\", \"purple\"\] tintOK=true"'
+check "signed-out side: no dot" '[ "$(badge 9)" = "P 47% | W --" ] && bstyle 9 | grep -q "dots=\[\"gold\"\] dotViews=1"'
+check "colour change re-tints the label" '[ "$(badge 10)" = "P 47% | W 12%" ] && bstyle 10 | grep -q "dots=\[\"gold\", \"green\"\] dotViews=2 tints=\[\"blue\", \"teal\"\] tintOK=true"'
+check "popover headers show account colours" 'nth popover 1 | grep -q "headers=\[\"blue\", \"teal\"\]"'
+check "two accounts, dot off: same text, labels still tinted, no dots" '[ "$(badge 11)" = "P 47% | W 12%" ] && bstyle 11 | grep -q "dots=\[\] dotViews=0 tints=\[\"blue\", \"teal\"\]"'
+check "dot-only change logged as badge style, not as a title transition" 'L | grep -q "badge style: .47%. dots="'
+check "menu: Colour submenu with swatches, current checked" 'dump 1 | grep "QA-MENU" | grep -q "Colour\[Blue{img} | Purple{img} | Indigo{img} | Teal{img}{on} | Cyan{img} | Magenta{img} | Graphite{img} | Brown{img}\]"'
+check "menu: account list items carry a colour swatch" 'dump 1 | grep "QA-MENU" | grep -qE "Personal(, signed out)?( \([^)]*\))?\{img\}\[" && dump 1 | grep "QA-MENU" | grep -qE "Work(, signed out)?( \([^)]*\))?\{img\}\["'
+check "unknown colour key reads as the default (Blue for primary), raw key kept" 'dump 1 | grep -q "name=Personal .* color=blue colorKey=chartreuse"'
+check "new account got the next unused colour, then Teal" 'dump 1 | grep -q "name=Work .* color=teal colorKey=teal"'
+for f in 1acct-green 1acct-gold 1acct-amber 1acct-crimson 1acct-idle 1acct-dot-off 2acct-gold-crimson 2acct-signedout 2acct-teal-green; do
+    check "renders $f (light/dark/current)" '[ -s "$SHOTDIR/'"$f"'-light.png" ] && [ -s "$SHOTDIR/'"$f"'-dark.png" ] && [ -s "$SHOTDIR/'"$f"'-current.png" ]'
+done
+check "C: no secret-looking values logged" '! grep -qiE "sessionKey=|Bearer |@[a-z0-9.-]+\.[a-z]{2,}" "$LOG"'
+
+log "scenario C2: relaunch keeps colours"
+LOG="$LOGDIR/claudemeter.qa.multi.C2.log"
+run_app "$LOG" "wait:4,dump,badge,done"
+check "C2: colours survive relaunch (unknown key still default, Teal kept)" \
+      'dump 1 | grep -q "name=Personal .* color=blue colorKey=chartreuse" && dump 1 | grep -q "name=Work .* color=teal colorKey=teal"'
+check "C2: badge labels tinted after relaunch" 'nth badge 1 | grep -q "tints=\[\"blue\", \"teal\"\] tintOK=true"'
 
 if [ "$KEEP" = 0 ]; then
     cleanup

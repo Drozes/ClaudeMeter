@@ -28,6 +28,14 @@
 //   popover                 log popover mode, sections and heights
 //   makeOrphanStore         create an isolated store no account references
 //   sweep                   run the orphaned-store sweep now
+//   forecast:<index>:<rate|idle>  set the session forecast (burn rate) and
+//                           refresh the badge
+//   dot:on|off              Show Activity Dot toggle
+//   setColor:<index>:<key>  account colour (palette key)
+//   shot:<name>             log the badge's screen rect (run.sh captures the
+//                           real menu bar) and write <name>-light.png /
+//                           <name>-dark.png renders of the button into the
+//                           directory given by -qa.shotDir
 //   done                    log QA-DONE and quit
 
 import Cocoa
@@ -100,7 +108,20 @@ extension AppDelegate {
                 NSLog("%@", "QA-REMOVED id=\(id) keysLeft=\(qaKeyCount(id)) recordLeft=\(stillSaved) historyLeft=\(FileManager.default.fileExists(atPath: historyURL.path))")
             }
         case "badge":
+            let style = appliedBadgeStyle
+            let dots = style?.dots.map { $0.band.rawValue } ?? []
+            let tints = style?.tints.map { $0.color.rawValue } ?? []
+            // Label tint really present in the attributed title?
+            var tintOK = true
+            if let button = statusItem.button, let style = style {
+                let attributed = button.attributedTitle
+                for tint in style.tints {
+                    let color = attributed.attribute(.foregroundColor, at: tint.range.location, effectiveRange: nil) as? NSColor
+                    if color != tint.color.color { tintOK = false }
+                }
+            }
             NSLog("%@", "QA-BADGE title='\(statusItem.button?.title ?? "")'")
+            NSLog("%@", "QA-BADGESTYLE attributed=\(style != nil) dots=\(dots) dotViews=\(badgeDotViews.count) tints=\(tints) tintOK=\(tintOK)")
         case "setSlot":
             if let a = qaAccount(parts), parts.count > 2 {
                 let slot: BadgeSlot = parts[2] == "left" ? .left : (parts[2] == "right" ? .right : .hidden)
@@ -130,7 +151,8 @@ extension AppDelegate {
             let vc = popover?.contentViewController
             if let multi = multiAccountView, vc?.view === multi {
                 let states = multi.sectionStates.map { "\($0.showsUsage ? "usage" : "signedOut"):\(Int($0.usageHeight))" }
-                NSLog("%@", "QA-POPOVER mode=multi sections=\(states.count) [\(states.joined(separator: ","))] total=\(Int(multi.contentHeight)) contentSize=\(Int(popover.contentSize.height)) shown=\(popover.isShown)")
+                let headers = multi.headerColors.map { c in AccountColor.allCases.first { $0.color == c }?.rawValue ?? "?" }
+                NSLog("%@", "QA-POPOVER mode=multi sections=\(states.count) [\(states.joined(separator: ","))] total=\(Int(multi.contentHeight)) contentSize=\(Int(popover.contentSize.height)) shown=\(popover.isShown) headers=\(headers)")
             } else {
                 NSLog("%@", "QA-POPOVER mode=single usageViewIsContent=\(vc?.view === usageView) contentSize=\(Int(popover?.contentSize.height ?? 0))")
             }
@@ -146,6 +168,35 @@ extension AppDelegate {
             }
         case "sweep":
             sweepOrphanedDataStores()
+        case "forecast":
+            if let a = qaAccount(parts), parts.count > 2 {
+                if parts[2] == "idle" {
+                    a.lastSessionForecast = UsageForecast(ratePerHour: 0, etaDate: nil, state: .idle)
+                } else if let rate = Double(parts[2]) {
+                    a.lastSessionForecast = UsageForecast(ratePerHour: rate, etaDate: nil, state: .ok)
+                }
+                updateBadgeFromModel()
+            }
+        case "dot":
+            showActivityDot = parts.count > 1 && parts[1] == "on"
+        case "setColor":
+            if let a = qaAccount(parts), parts.count > 2 {
+                a.updateRecord { $0.colorKey = parts[2] }
+            }
+        case "shot":
+            let name = parts.count > 1 ? parts[1] : "shot"
+            qaShot(name)
+            delay = 3.0
+        case "tiers":
+            // Plan-tier labels for representative inputs (no live data).
+            let cases: [(String?, String?)] = [
+                ("default_claude_max_20x", nil), ("default_raven", nil), ("default_raven", "team"),
+                ("default_raven", "enterprise"), ("default_claude_max_50x", nil), ("default_foo_bar", nil),
+                ("default_", nil), (nil, nil),
+            ]
+            for (slug, variant) in cases {
+                NSLog("%@", "QA-TIER \(slug ?? "nil")/\(variant ?? "nil") -> \(AppDelegate.planTierDisplayName(slug: slug, variant: variant) ?? "nil")")
+            }
         case "done":
             NSLog("%@", "QA-DONE")
             NSApp.terminate(nil)
@@ -155,6 +206,43 @@ extension AppDelegate {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             self?.qaRun(rest)
+        }
+    }
+
+    /// Logs the badge's screen rect (top-left origin, points) for run.sh's
+    /// screencapture, and renders the button under forced light and dark
+    /// appearance over menu-bar-like backgrounds.
+    private func qaShot(_ name: String) {
+        guard let button = statusItem.button, let window = button.window else { return }
+        let frame = window.convertToScreen(button.convert(button.bounds, to: nil))
+        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
+        let top = screenHeight - frame.maxY
+        NSLog("%@", "QA-SHOT \(name) \(Int(frame.minX)) \(Int(top)) \(Int(frame.width)) \(Int(frame.height))")
+        guard let dir = UserDefaults.standard.string(forKey: "qa.shotDir") else { return }
+        let variants: [(String, NSAppearance.Name?, NSColor)] = [
+            ("light", .aqua, NSColor(white: 0.93, alpha: 1)),
+            ("dark", .darkAqua, NSColor(white: 0.16, alpha: 1)),
+            ("current", nil, NSColor(white: 0.55, alpha: 1)),   // the menu bar's own appearance
+        ]
+        for (suffix, appearanceName, background) in variants {
+            let saved = button.appearance
+            if let appearanceName = appearanceName { button.appearance = NSAppearance(named: appearanceName) }
+            button.needsDisplay = true
+            button.subviews.forEach { $0.needsDisplay = true }
+            guard let rep = button.bitmapImageRepForCachingDisplay(in: button.bounds) else { continue }
+            button.cacheDisplay(in: button.bounds, to: rep)
+            button.appearance = saved
+            let size = NSSize(width: button.bounds.width * 3, height: button.bounds.height * 3)
+            let out = NSImage(size: size)
+            out.lockFocus()
+            background.setFill()
+            NSRect(origin: .zero, size: size).fill()
+            rep.draw(in: NSRect(origin: .zero, size: size))
+            out.unlockFocus()
+            if let tiff = out.tiffRepresentation, let bmp = NSBitmapImageRep(data: tiff),
+               let png = bmp.representation(using: .png, properties: [:]) {
+                try? png.write(to: URL(fileURLWithPath: dir).appendingPathComponent("\(name)-\(suffix).png"))
+            }
         }
     }
 
@@ -178,7 +266,7 @@ extension AppDelegate {
         for (i, a) in accounts.enumerated() {
             let r = a.record
             let next = a.refreshTimer.map { String(format: "%.0f", $0.fireDate.timeIntervalSince(now)) } ?? "none"
-            NSLog("%@", "QA-ACCOUNT \(i) id=\(r.id) name=\(r.displayName) label=\(r.badgeLabel) slot=\(r.badgeSlot.rawValue) primary=\(a.isPrimary) signedOut=\(a.isSignedOut) pinned=\(r.orgPinned) store=\(r.storeIdentifier == nil ? "default" : "isolated") timerNextFire=\(next)s")
+            NSLog("%@", "QA-ACCOUNT \(i) id=\(r.id) name=\(r.displayName) label=\(r.badgeLabel) slot=\(r.badgeSlot.rawValue) primary=\(a.isPrimary) signedOut=\(a.isSignedOut) pinned=\(r.orgPinned) store=\(r.storeIdentifier == nil ? "default" : "isolated") color=\(accountColor(for: a).rawValue) colorKey=\(r.colorKey ?? "nil") timerNextFire=\(next)s")
         }
         // Titled, visible app windows (the status item's own window excluded).
         let windows = NSApp.windows.filter {
@@ -192,7 +280,10 @@ extension AppDelegate {
 
     private func qaMenuTree(_ menu: NSMenu) -> String {
         menu.items.filter { !$0.isSeparatorItem }.map { item in
-            if let sub = item.submenu { return "\(item.title)[\(qaMenuTree(sub))]" }
+            let img = (item.image != nil ? "{img}" : "") + (item.isHidden ? "{hidden}" : "")
+            let on = item.state == .on ? "{on}" : ""
+            if let sub = item.submenu { return "\(item.title)\(img)[\(qaMenuTree(sub))]" }
+            if !img.isEmpty || !on.isEmpty { return "\(item.title)\(img)\(on)" }
             // Disabled items in account submenus show the email or org name,
             // which can contain an email address: never log them.
             if item.tag == AppDelegate.accountInfoMenuTag { return "<info>" }
