@@ -118,10 +118,14 @@ extension AppDelegate {
         case "signOut":
             qaAccount(parts)?.setSignedOut(true, reason: "qa")
         case "openPopover":
+            // A background test app loses focus at once, which closes a
+            // transient popover; keep it open until closePopover.
+            popover.behavior = .applicationDefined
             if popover?.isShown != true { togglePopover() }
             delay = 2.0
         case "closePopover":
             if popover?.isShown == true { popover.performClose(nil) }
+            popover.behavior = .transient
         case "popover":
             let vc = popover?.contentViewController
             if let multi = multiAccountView, vc?.view === multi {
@@ -191,7 +195,7 @@ extension AppDelegate {
             if let sub = item.submenu { return "\(item.title)[\(qaMenuTree(sub))]" }
             // Disabled items in account submenus show the email or org name,
             // which can contain an email address: never log them.
-            if !item.isEnabled && item.action == nil && item.menu !== contextMenu { return "<info>" }
+            if item.tag == AppDelegate.accountInfoMenuTag { return "<info>" }
             return item.title
         }.joined(separator: " | ")
     }

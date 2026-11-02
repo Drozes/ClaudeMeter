@@ -27,6 +27,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var pendingAccounts: [AccountController] = []
     var signInMenuItem: NSMenuItem?
     var accountsMenuItems: [NSMenuItem] = []
+    // Saved accounts that cannot run (missing/invalid store identifier).
+    var unavailableRecords: [AccountRecord] = []
     // Two or more accounts: the stacked popover view, each secondary
     // account's own usage view, and each badge side's last text.
     var multiAccountView: MultiAccountUsageView?
@@ -856,6 +858,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 extension AppDelegate {
     /// Adding accounts needs isolated WebKit stores (WKWebsiteDataStore
     /// forIdentifier:), which exist on macOS 14 and later only.
+    /// Tag of the disabled org/email line in each account's submenu (QA
+    /// redacts these when logging the menu; they can contain an email).
+    static let accountInfoMenuTag = 7_301
+
     var canAddAccounts: Bool {
         if #available(macOS 14.0, *) { return true }
         return false
@@ -920,6 +926,7 @@ extension AppDelegate {
     /// always exists and comes first; secondary accounts need macOS 14 for
     /// their isolated data store and are skipped (left saved) on macOS 13.
     func makeAccountControllers() -> [AccountController] {
+        unavailableRecords = []
         var result = [AccountController(app: self, notifier: notifier,
                                         record: AccountStore.primaryRecord(), dataStore: .default())]
         for record in AccountStore.load() where !record.isPrimary {
@@ -928,12 +935,11 @@ extension AppDelegate {
                 continue
             }
             guard let sid = record.storeIdentifier, let storeUUID = UUID(uuidString: sid) else {
-                // Unusable without its own store (it could never sign in), and
-                // invisible in the menu: drop it so nothing lingers.
-                AccountStore.remove(id: record.id)
-                AccountStore.removeKeys(forAccount: record.id)
-                try? FileManager.default.removeItem(at: UsageHistory.fileURL(accountID: record.id))
-                NSLog("%@", "[ClaudeMeter] account \(record.id) dropped: missing or invalid store identifier")
+                // Cannot run without its own store. Kept (record, keys,
+                // history) and listed in the Accounts menu as unavailable,
+                // where the user can remove it.
+                unavailableRecords.append(record)
+                NSLog("%@", "[ClaudeMeter] account \(record.id) unavailable: missing or invalid store identifier")
                 continue
             }
             result.append(AccountController(app: self, notifier: notifier, record: record,
@@ -961,7 +967,7 @@ extension AppDelegate {
             items.append(accountMenuItem("Sign In Again to \(account.record.displayName)\u{2026}",
                                          #selector(signInAgain(_:)), account))
         }
-        if accounts.count >= 2 {
+        if accounts.count + unavailableRecords.count >= 2 {
             let parent = NSMenuItem(title: "Accounts", action: nil, keyEquivalent: "")
             let submenu = NSMenu()
             for account in accounts {
@@ -974,6 +980,7 @@ extension AppDelegate {
                 if let detail = record.email ?? record.orgName {
                     let info = NSMenuItem(title: detail, action: nil, keyEquivalent: "")
                     info.isEnabled = false
+                    info.tag = AppDelegate.accountInfoMenuTag
                     accountMenu.addItem(info)
                     accountMenu.addItem(NSMenuItem.separator())
                 }
@@ -988,6 +995,12 @@ extension AppDelegate {
                     item.state = record.badgeSlot == slot ? .on : .off
                     positionMenu.addItem(item)
                 }
+                if account.isPrimary && !accounts.contains(where: { $0.record.badgeSlot != .hidden }) {
+                    positionMenu.addItem(NSMenuItem.separator())
+                    let note = NSMenuItem(title: "Shown on badge: no account has a position", action: nil, keyEquivalent: "")
+                    note.isEnabled = false
+                    positionMenu.addItem(note)
+                }
                 position.submenu = positionMenu
                 accountMenu.addItem(position)
                 accountMenu.addItem(accountMenuItem("Badge Label (\(record.badgeLabel))\u{2026}", #selector(editBadgeLabel(_:)), account))
@@ -996,6 +1009,16 @@ extension AppDelegate {
                 }
                 accountItem.submenu = accountMenu
                 submenu.addItem(accountItem)
+            }
+            for record in unavailableRecords {
+                let item = NSMenuItem(title: "\(record.displayName) (unavailable)", action: nil, keyEquivalent: "")
+                let menu = NSMenu()
+                let remove = NSMenuItem(title: "Remove\u{2026}", action: #selector(removeUnavailableAccount(_:)), keyEquivalent: "")
+                remove.target = self
+                remove.representedObject = record.id
+                menu.addItem(remove)
+                item.submenu = menu
+                submenu.addItem(item)
             }
             if canAddAccounts {
                 submenu.addItem(NSMenuItem.separator())
@@ -1055,6 +1078,26 @@ extension AppDelegate {
         alert.alertStyle = .warning
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         removeAccount(account)
+    }
+
+    /// Removes a saved account that could not run (no usable store).
+    @objc func removeUnavailableAccount(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let record = unavailableRecords.first(where: { $0.id == id }) else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Remove \(record.displayName)?"
+        alert.informativeText = "This account could not be loaded. ClaudeMeter deletes its saved settings and usage history."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        AccountStore.remove(id: id)
+        let keys = AccountStore.removeKeys(forAccount: id)
+        try? FileManager.default.removeItem(at: UsageHistory.fileURL(accountID: id))
+        unavailableRecords.removeAll { $0.id == id }
+        NSLog("%@", "[ClaudeMeter] unavailable account removed: \(id) keys=\(keys)")
+        rebuildAccountsMenu()
     }
 
     @objc func addAccount(_ sender: Any?) {
@@ -1247,12 +1290,11 @@ extension AppDelegate {
         NSLog("%@", "[ClaudeMeter] badge slot: \(account.id) -> \(slot.rawValue)")
     }
 
-    /// Sets a 1 to 3 character badge label (trimmed). Returns false if empty.
+    /// Sets a 1 to 3 character badge label (see sanitizeBadgeLabel).
+    /// Returns false if nothing usable is left.
     @discardableResult
     func setBadgeLabel(_ text: String, for account: AccountController) -> Bool {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
-        let label = String(trimmed.prefix(3))
+        guard let label = AccountRecord.sanitizeBadgeLabel(text) else { return false }
         account.updateRecord { $0.badgeLabel = label }
         return true
     }
@@ -1278,12 +1320,14 @@ extension AppDelegate {
     /// model (or its own XPath fallback, never for a pinned org), keeping
     /// that side's last value otherwise.
     func updateMultiAccountBadge() {
+        var freshSides = 0
         for account in badgeAccounts() {
             let id = account.id
             if account.isSignedOut { continue }
             if let pct = account.sessionPercentage(from: account.latestSections) {
                 badgeSideText[id] = "\(pct)%"
                 UserDefaults.standard.set(pct, forKey: account.lastBadgePercentageKey)
+                freshSides += 1
                 continue
             }
             if badgeSideText[id] == nil { badgeSideText[id] = cachedBadgeSideText(for: account) }
@@ -1297,7 +1341,10 @@ extension AppDelegate {
                 self.renderMultiAccountBadge(reason: "XPath fallback scrape")
             }
         }
-        renderMultiAccountBadge(reason: "model meter labeled current session")
+        // The reason says whether any side is fresh from the model this pass;
+        // QA (L3) ignores "cached sides only" transitions.
+        renderMultiAccountBadge(reason: freshSides > 0 ? "model meter labeled current session"
+                                                       : "multi: cached sides only")
     }
 
     /// "W 47%" with one shown side, "P 47% | W 12%" with two (left first).
@@ -1440,6 +1487,12 @@ extension AppDelegate {
                                                    signedOut: account.isSignedOut, usageView: view)
             }
             multi.reload(entries)
+            // A section added while the popover is open gets its countdown.
+            if popover.isShown {
+                for view in entries.map({ $0.usageView }) where !view.isCountdownTickerRunning {
+                    view.startCountdownTicker()
+                }
+            }
         } else if let multi = multiAccountView {
             multi.detachAll()
             multiAccountView = nil
@@ -1452,6 +1505,9 @@ extension AppDelegate {
             applyPopoverContentHeight(primaryView.skeletonHeight)
         }
         let live = Set(accounts.map { $0.id })
+        for (id, view) in accountViews where !live.contains(id) {
+            view.stopCountdownTicker()
+        }
         accountViews = accountViews.filter { live.contains($0.key) }
     }
 
@@ -1467,7 +1523,7 @@ extension AppDelegate {
     @objc func editBadgeLabel(_ sender: NSMenuItem) {
         guard let account = account(withID: sender.representedObject as? String) else { return }
         guard let text = promptForText(title: "Badge Label",
-                                       message: "One to three characters shown before this account's percentage in the menu bar.",
+                                       message: "One to three characters shown before this account's percentage in the menu bar (no spaces, \"|\", \"%\" or \"'\").",
                                        defaultValue: account.record.badgeLabel,
                                        confirmTitle: "Save") else { return }
         setBadgeLabel(text, for: account)
@@ -1574,6 +1630,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     private var signInProbeInFlight = false
     private var signedOutProbeTimer: Timer?
     private var pageRetryUsed = false
+    private var lastSignInConfirmAt: Date?
     static let signedOutProbeInterval: TimeInterval = 15 * 60
     /// Called once when the login window closes: true after a verified
     /// sign-in, false when the user closed it first.
@@ -1684,6 +1741,10 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// so one transient 403 or an odd page landing cannot sign it out.
     func confirmSignedOut(reason: String) {
         guard !isPrimary, !isSignedOut else { return }
+        // Back off: at most one confirmation per account per 15 minutes, so a
+        // usage endpoint that keeps failing does not double every request.
+        if let last = lastSignInConfirmAt, Date().timeIntervalSince(last) < Self.signedOutProbeInterval { return }
+        lastSignInConfirmAt = Date()
         probeSignIn { [weak self] verdict in
             guard let self = self else { return }
             switch verdict {
@@ -2152,6 +2213,14 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         // A signed-out secondary account stays idle until the user signs in
         // again (no repeated requests with a dead session).
         if isSignedOut && !isPrimary { return }
+        // A pinned org is metered through the JSON API only, so its page
+        // state does not matter.
+        if record.orgPinned {
+            if app.popover?.isShown != true && !app.showMenuBarBadge { return }
+            lastRefreshDate = Date()
+            scrapeAndDistribute()
+            return
+        }
         guard let url = webView.url?.absoluteString, url.contains("/settings/usage") else { return }
 
         let popoverOpen = app.popover?.isShown == true
@@ -2291,12 +2360,14 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                     // No DOM fallback and no circuit-breaker count for a pinned
                     // org. Auth errors are confirmed in fetchViaJSON; other
                     // errors keep the last data via the empty-streak gate.
+                    // Either way the empty-streak gate advances, so a side that
+                    // keeps failing clears to the placeholder after 3 tries.
                     if case .http(let status) = err, [401, 403, 404].contains(status) {
-                        self.logFetchOutcome(path: "json", outcome: "error", detail: "\(err) pinned org, checking sign-in")
+                        self.logFetchOutcome(path: "json", outcome: "error", detail: "\(err) pinned org, sign-in checked at most every 15 min")
                     } else {
                         self.logFetchOutcome(path: "json", outcome: "error", detail: "\(err) pinned org, no DOM fallback")
-                        self.distributeFetchResult([], path: "json")
                     }
+                    self.distributeFetchResult([], path: "json")
                     return
                 }
                 self.jsonConsecutiveFailures += 1
@@ -2646,7 +2717,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
 
     /// GET /api/organizations with this account's cookies. Calls back on the
     /// main queue with the HTTP status (0 on a transport error) and the
-    /// decoded orgs (nil unless 2xx). Logs counts only.
+    /// decoded orgs (nil unless 2xx with a readable list). Logs counts only.
     func requestOrgList(session: URLSession, context: String, quiet: Bool = false,
                         completion: @escaping (Int, [OrgListResponse.Org]?) -> Void) {
         var req = URLRequest(url: AppDelegate.apiOrgsURL)
@@ -2664,13 +2735,16 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                     if !quiet { NSLog("%@", "[ClaudeMeter] \(context) HTTP \(status), bytes=\(data?.count ?? 0)") }
                     completion(status, nil); return
                 }
-                var orgs: [OrgListResponse.Org] = []
+                let orgs: [OrgListResponse.Org]
                 if let arr = try? JSONDecoder().decode([OrgListResponse.Org].self, from: data) {
                     orgs = arr
                 } else if let env = try? JSONDecoder().decode(OrgListResponse.self, from: data) {
                     orgs = env.organizations ?? []
                 } else {
+                    // Unknown shape: report no list (inconclusive), never an
+                    // empty one that would read as "org no longer listed".
                     NSLog("%@", "[ClaudeMeter] \(context) decode failed (\(data.count) bytes)")
+                    completion(status, nil); return
                 }
                 if !quiet { NSLog("%@", "[ClaudeMeter] \(context) got \(orgs.count) orgs") }
                 completion(status, orgs)
@@ -2866,9 +2940,19 @@ struct AccountRecord: Codable, Equatable {
         id == primaryID || UUID(uuidString: id) != nil
     }
 
+    /// Badge labels: at most 3 characters, with no whitespace, "|", "%" or
+    /// "'" (they would blur the badge's "P 47% | W 12%" form and its QA
+    /// parsing). Returns nil if nothing usable is left.
+    static func sanitizeBadgeLabel(_ text: String) -> String? {
+        let banned: Set<Character> = ["|", "%", "'"]
+        let kept = text.filter { !$0.isWhitespace && !banned.contains($0) }
+        guard !kept.isEmpty else { return nil }
+        return String(kept.prefix(3))
+    }
+
     static func defaultBadgeLabel(for name: String) -> String {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.first.map { String($0).uppercased() } ?? "?"
+        return sanitizeBadgeLabel(trimmed.uppercased()).map { String($0.prefix(1)) } ?? "?"
     }
 
     static func makePrimary(orgUUID: String? = nil, planTier: String? = nil) -> AccountRecord {
@@ -2905,7 +2989,8 @@ extension AccountRecord {
         }
         self.init(id: id,
                   displayName: name,
-                  badgeLabel: string(.badgeLabel) ?? AccountRecord.defaultBadgeLabel(for: name),
+                  badgeLabel: string(.badgeLabel).flatMap(AccountRecord.sanitizeBadgeLabel)
+                      ?? AccountRecord.defaultBadgeLabel(for: name),
                   badgeSlot: slot,
                   email: string(.email),
                   orgUUID: string(.orgUUID),
@@ -3890,6 +3975,7 @@ final class MultiAccountUsageView: NSView {
     private let scrollView = NSScrollView()
     private let stack = NSStackView()
     private var emitScheduled = false
+    private var pendingScrollToTop = false
 
     private final class Section {
         let accountID: String
@@ -3969,12 +4055,22 @@ final class MultiAccountUsageView: NSView {
         rebuild([])
     }
 
+    /// Latched like UsageContentView.scrollToTop: applied on the next tick
+    /// and again after the next size report, so the popover's resize
+    /// animation cannot leave the view scrolled mid-content.
     func scrollToTop() {
+        pendingScrollToTop = true
         DispatchQueue.main.async { [weak self] in
-            guard let self = self, let doc = self.scrollView.documentView else { return }
-            doc.scroll(NSPoint(x: 0, y: doc.bounds.height))
-            self.scrollView.reflectScrolledClipView(self.scrollView.contentView)
+            self?.applyPendingScrollToTop(keepPending: true)
         }
+    }
+
+    private func applyPendingScrollToTop(keepPending: Bool = false) {
+        guard pendingScrollToTop, let doc = scrollView.documentView else { return }
+        if !keepPending { pendingScrollToTop = false }
+        doc.scroll(NSPoint(x: 0, y: doc.bounds.height))
+        scrollView.contentView.scrollToVisible(NSRect(x: 0, y: doc.bounds.height - 1, width: 1, height: 1))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
     private func rebuild(_ entries: [Entry]) {
@@ -4061,8 +4157,11 @@ final class MultiAccountUsageView: NSView {
             guard let self = self else { return }
             self.emitScheduled = false
             let total = self.contentHeight
-            NSLog("%@", "[ClaudeMeter] popover sizing(multi): sections=\(self.sections.count) total=\(total)")
+            if self.window?.isVisible == true {
+                NSLog("%@", "[ClaudeMeter] popover sizing(multi): sections=\(self.sections.count) total=\(total)")
+            }
             self.onContentSizeChanged?(total)
+            self.applyPendingScrollToTop()
         }
     }
 
@@ -4879,6 +4978,8 @@ class UsageContentView: NSView {
         countdownTicker.stop()
     }
 
+    var isCountdownTickerRunning: Bool { countdownTicker.isRunning }
+
     private func emitContentSize(label: String) {
         stackView.layoutSubtreeIfNeeded()
         let arranged = stackView.arrangedSubviews
@@ -5139,6 +5240,12 @@ final class CountdownTicker {
     private var entries: [Entry] = []
     private var flames: [Weak<NSImageView>] = []
     private var timer: Timer?
+
+    var isRunning: Bool { timer != nil }
+
+    deinit {
+        timer?.invalidate()
+    }
 
     private struct Weak<T: AnyObject> { weak var value: T? }
 

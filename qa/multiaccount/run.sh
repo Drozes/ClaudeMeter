@@ -92,13 +92,14 @@ badge() { nth badge "$1" | sed -n "s/^QA-BADGE title='\(.*\)'$/\1/p"; }
 # ------------------------------------------------------------ scenario A
 log "scenario A: account flows"
 cleanup
-U1=$(uuidgen); U2=$(uuidgen); S1=$(uuidgen); S2=$(uuidgen)
+U1=$(uuidgen); U2=$(uuidgen); U3=$(uuidgen); S1=$(uuidgen); S2=$(uuidgen)
 defaults write "$BUNDLE_ID" accounts.migrationVersion -int 1
 defaults write "$BUNDLE_ID" showMenuBarBadge -bool YES
 defaults write "$BUNDLE_ID" accounts.list -string "{\"schema\":1,\"accounts\":[
  {\"id\":\"primary\",\"displayName\":\"Personal\",\"badgeLabel\":\"P\",\"badgeSlot\":\"left\",\"orgPinned\":false},
  {\"id\":\"$U1\",\"displayName\":\"Work\",\"badgeLabel\":\"W\",\"badgeSlot\":\"right\",\"orgPinned\":true,\"orgUUID\":\"00000000-0000-0000-0000-000000000001\",\"storeIdentifier\":\"$S1\"},
- {\"id\":\"$U2\",\"displayName\":\"Side\",\"badgeLabel\":\"S\",\"badgeSlot\":\"hidden\",\"orgPinned\":false,\"storeIdentifier\":\"$S2\"}]}"
+ {\"id\":\"$U2\",\"displayName\":\"Side\",\"badgeLabel\":\"S\",\"badgeSlot\":\"hidden\",\"orgPinned\":false,\"storeIdentifier\":\"$S2\"},
+ {\"id\":\"$U3\",\"displayName\":\"Broken\",\"badgeLabel\":\"B\",\"badgeSlot\":\"hidden\",\"orgPinned\":false}]}"
 
 A="dump,wait:10,dump,seedKeys:1,seedKeys:2,keys:1,keys:2,rename:2:Consulting,addSynthetic:Fourth,wait:6,dump"
 A="$A,addThenCancel:Temp,wait:3,dump,signIn:1,wait:3,dump,closeLogin:1,wait:3"
@@ -115,19 +116,20 @@ check "no window opened on its own" 'dump 2 | grep -q "QA-WINDOWS visible=\[\]"'
 check "menu offers Sign In Again to Work" 'dump 2 | grep "QA-MENU" | grep -q "Sign In Again to Work"'
 check "menu has Accounts submenu with Remove for secondaries" 'dump 2 | grep "QA-MENU" | grep -q "Accounts\[.*Remove"'
 check "menu has Badge Position and Badge Label per account" 'dump 2 | grep "QA-MENU" | grep -q "Badge Position\[Left | Right | Hidden\] | Badge Label (W)"'
+check "record without a store is kept and listed as unavailable with Remove" 'dump 2 | grep "QA-MENU" | grep -q "Broken (unavailable)\[Remove…\]" && L | grep -q "unavailable: missing or invalid store identifier"'
 check "primary has no Remove item" '! dump 2 | grep "QA-MENU" | grep -qE "Personal[^]]*\[[^]]*Remove"'
 check "timers staggered (offset logged for secondaries)" 'L | grep -q "startRefreshTimer: .*offset=[0-9]*s"'
 check "seeded keys counted" 'L | grep -q "QA-KEYS index=2 .* count=9"'
 check "rename applied with default label" 'dump 3 | grep -q "name=Consulting label=C"'
 check "fourth account added, slot hidden (right taken)" 'dump 3 | grep -q "name=Fourth label=F slot=hidden"'
-check "four accounts after add" 'dump 3 | grep -q "QA-STATE accounts=4 pending=0 saved=4"'
+check "four accounts after add" 'dump 3 | grep -q "QA-STATE accounts=4 pending=0 saved=5"'
 check "cancelled add discarded" 'L | grep -q "add account cancelled before sign-in"'
-check "cancelled add left no account" 'dump 4 | grep -q "QA-STATE accounts=4 pending=0 saved=4"'
+check "cancelled add left no account" 'dump 4 | grep -q "QA-STATE accounts=4 pending=0 saved=5"'
 check "login window opens only on request" 'dump 5 | grep -q "QA-WINDOWS visible=\[\"Sign in to Claude: Work\"\]"'
 check "login check logs state changes only" '[ "$(L | grep -c "loginCheck for account")" -le 3 ]'
 check "removed: keys, record, history gone" 'L | grep -q "QA-REMOVED .* keysLeft=0 recordLeft=false historyLeft=false"'
 check "other account keys untouched" '[ "$(L | grep -c "QA-KEYS index=1 .* count=9")" = 2 ]'
-check "three accounts after remove" 'dump 6 | grep -q "QA-STATE accounts=3 pending=0 saved=3"'
+check "three accounts after remove" 'dump 6 | grep -q "QA-STATE accounts=3 pending=0 saved=4"'
 check "orphan store found and removed by sweep" 'L | grep -q "data store sweep: [0-9]* found, 1 orphaned"'
 check "data stores deleted (cancelled add, removed account, orphan)" '[ "$(L | grep -c "data store removed")" -ge 3 ]'
 SAVED_STORES=$(defaults read "$BUNDLE_ID" accounts.list 2>/dev/null | grep -oE '"storeIdentifier":"[0-9A-F-]+"' | grep -oE '[0-9A-F-]{36}' | tr '[:upper:]' '[:lower:]' | sort | tr '\n' ' ')
@@ -149,16 +151,17 @@ B="$B,addSynthetic:Work,wait:10,badge"                                   # badge
 B="$B,inject:1:12,badge"                                                 # badge 3
 B="$B,setSlot:1:left,badge"                                              # badge 4
 B="$B,setSlot:0:right,badge"                                             # badge 5
-B="$B,setSlot:1:hidden,setSlot:0:hidden,badge"                           # badge 6
+B="$B,setSlot:1:hidden,setSlot:0:hidden,badge,dump"                      # badge 6, dump 1
 B="$B,setSlot:0:left,setSlot:1:right,setLabel:0:Me,badge"                # badge 7
 B="$B,signOut:1,badge"                                                   # badge 8
+B="$B,setLabel:1:w |%x,badge"                                            # badge 9
 B="$B,addSynthetic:Third,wait:10,openPopover,wait:10,inject:1:12,inject:2:33,inject:0:47,wait:3,popover" # popover 2
-B="$B,closePopover,wait:1,dump"
-B="$B,remove:2,remove:1,wait:3,badge,popover,done"                       # badge 9, popover 3
+B="$B,closePopover,wait:1,dump"                                          # dump 2
+B="$B,remove:2,remove:1,wait:3,badge,popover,done"                       # badge 10, popover 3
 LOG="$LOGDIR/claudemeter.qa.multi.B.log"
 run_app "$LOG" "$B"
 log "log: $LOG"
-for i in 1 2 3 4 5 6 7 8 9; do log "  badge $i: '$(badge $i)'"; done
+for i in 1 2 3 4 5 6 7 8 9 10; do log "  badge $i: '$(badge $i)'"; done
 for i in 1 2 3; do log "  $(nth popover $i | grep QA-POPOVER)"; done
 
 check "B finished" 'grep -q QA-DONE "$LOG"'
@@ -171,13 +174,15 @@ check "right then left order: W 12% | P 47%" '[ "$(badge 5)" = "W 12% | P 47%" ]
 check "both hidden falls back to primary: P 47%" '[ "$(badge 6)" = "P 47%" ]'
 check "custom label: Me 47% | W 12%" '[ "$(badge 7)" = "Me 47% | W 12%" ]'
 check "signed-out side shows two hyphens: Me 47% | W --" '[ "$(badge 8)" = "Me 47% | W --" ]'
-check "three accounts stacked in the popover, all with usage" 'nth popover 2 | grep -qE "mode=multi sections=3 \[usage:[0-9]+,usage:[0-9]+,usage:[0-9]+\]"'
+check "both-hidden fallback noted in the primary's Badge Position menu" 'dump 1 | grep "QA-MENU" | grep -q "Personal[^[]*\[[^]]*Badge Position\[Left | Right | Hidden | Shown on badge: no account has a position\]"'
+check "label sanitized (no spaces, | or %): Me 47% | wx --" '[ "$(badge 9)" = "Me 47% | wx --" ]'
+check "three accounts stacked in the popover, all with usage, measured while shown" 'nth popover 2 | grep -qE "mode=multi sections=3 \[usage:[0-9]+,usage:[0-9]+,usage:[0-9]+\] .* shown=true"'
 POP2=$(nth popover 2 | grep QA-POPOVER)
 TOTAL=$(echo "$POP2" | sed -nE 's/.*total=([0-9]+).*/\1/p'); CSIZE=$(echo "$POP2" | sed -nE 's/.*contentSize=([0-9]+).*/\1/p')
 check "popover sized to the sum of the sections (total=$TOTAL contentSize=$CSIZE)" \
       '[ -n "$TOTAL" ] && [ -n "$CSIZE" ] && [ "$TOTAL" -gt 300 ] && { { [ $((CSIZE - TOTAL)) -le 3 ] && [ $((TOTAL - CSIZE)) -le 3 ]; } || [ "$CSIZE" -ge 1100 ]; }'
-check "badge slot and label persisted" 'dump 1 | grep -q "name=Personal label=Me slot=left"'
-check "back to one account: plain percentage again" '[ "$(badge 9)" = "47%" ]'
+check "badge slot and label persisted" 'dump 2 | grep -q "name=Personal label=Me slot=left"'
+check "back to one account: plain percentage again" '[ "$(badge 10)" = "47%" ]'
 check "back to one account: popover is the usage view itself" 'nth popover 3 | grep -q "mode=single usageViewIsContent=true"'
 check "B: no secret-looking values logged" '! grep -qiE "sessionKey=|Bearer |@[a-z0-9.-]+\.[a-z]{2,}" "$LOG"'
 

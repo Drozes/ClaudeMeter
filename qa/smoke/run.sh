@@ -67,7 +67,10 @@ cleanup() {
 trap cleanup EXIT
 
 # 5. Poll: tail stderr for "badge title: '...' -> '<badge>'" where <badge> is
-#    one of the three badge forms below. Labels are 1 to 3 characters.
+#    one of the three badge forms below. Badge labels are 1 to 3 characters
+#    with no whitespace, "|", "%" or "'" (the app enforces this; see
+#    AccountRecord.sanitizeBadgeLabel). Multi-code-point emoji labels may
+#    exceed {1,3}; L3 itself runs with one account (no label).
 SIDE="([0-9]+%|--|$(printf '\342\200\224')%)"
 LABEL="[^ |']{1,3}"
 BADGE_FORM="([0-9]+%|${LABEL} ${SIDE}( \| ${LABEL} ${SIDE})?)"
@@ -95,11 +98,12 @@ while :; do
     #   one account:            '47%'
     #   one slot, 2+ accounts:  'W 47%'
     #   both slots:             'P 47% | W 12%'   (a side may read '--' or '—%')
-    # Transitions with reason "applyBadgeVisibility cached=" are excluded: they
-    # restore a cached value at launch and prove nothing about fetching.
+    # Transitions with reason "applyBadgeVisibility cached=" (launch restore)
+    # or "multi: cached sides only" (no side fresh from the model) are
+    # excluded: they prove nothing about fetching.
     line=$(grep -E "badge title: '[^']*' -> '${BADGE_FORM}' \(" "$STDERR" 2>/dev/null \
         | grep -E -e "-> '[^']*[0-9]+%" \
-        | grep -v "(applyBadgeVisibility cached=" | tail -1)
+        | grep -v -e "(applyBadgeVisibility cached=" -e "(multi: cached sides only)" | tail -1)
     if [ -n "$line" ]; then
         badge=$(echo "$line" | sed -E "s/.*-> '([^']*)' \(.*/\1/")
         log "PASS: badge updated to $badge"
