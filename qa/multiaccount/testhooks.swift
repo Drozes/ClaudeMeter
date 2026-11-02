@@ -36,6 +36,9 @@
 //                           real menu bar) and write <name>-light.png /
 //                           <name>-dark.png renders of the button into the
 //                           directory given by -qa.shotDir
+//   injectWeekly:<index>:<pct>    feed a weekly-only fetch (no session window)
+//   forecastWeekly:<index>:<rate|idle>  set the weekly forecast
+//   renderPopover:<name>    render account 0's usage view to <name>-popover.png
 //   done                    log QA-DONE and quit
 
 import Cocoa
@@ -122,6 +125,8 @@ extension AppDelegate {
             }
             NSLog("%@", "QA-BADGE title='\(statusItem.button?.title ?? "")'")
             NSLog("%@", "QA-BADGESTYLE attributed=\(style != nil) dots=\(dots) dotViews=\(badgeDotViews.count) tints=\(tints) tintOK=\(tintOK)")
+            NSLog("%@", "QA-BADGEA11Y '\(statusItem.button?.accessibilityValue() as? String ?? "")'")
+            NSLog("%@", "QA-TOOLTIP '\((statusItem.button?.toolTip ?? "").replacingOccurrences(of: "\n", with: " / "))'")
         case "setSlot":
             if let a = qaAccount(parts), parts.count > 2 {
                 let slot: BadgeSlot = parts[2] == "left" ? .left : (parts[2] == "right" ? .right : .hidden)
@@ -168,6 +173,37 @@ extension AppDelegate {
             }
         case "sweep":
             sweepOrphanedDataStores()
+        case "injectWeekly":
+            if let a = qaAccount(parts), parts.count > 2, let pct = Int(parts[2]) {
+                a.distributeFetchResult([
+                    UsageSection(title: "Weekly limit", meters: [
+                        UsageMeter(label: "Weekly usage", percentage: pct, detail: ""),
+                        UsageMeter(label: "Weekly Sonnet usage", percentage: 3, detail: ""),
+                    ]),
+                ], path: "qa")
+            }
+        case "forecastWeekly":
+            if let a = qaAccount(parts), parts.count > 2 {
+                if parts[2] == "idle" {
+                    a.lastWeeklyForecast = UsageForecast(ratePerHour: 0, etaDate: nil, state: .idle)
+                } else if let rate = Double(parts[2]) {
+                    a.lastWeeklyForecast = UsageForecast(ratePerHour: rate, etaDate: nil, state: .ok)
+                }
+                updateBadgeFromModel()
+            }
+        case "renderPopover":
+            if let view = usageView, let dir = UserDefaults.standard.string(forKey: "qa.shotDir") {
+                let name = parts.count > 1 ? parts[1] : "popover"
+                view.frame = NSRect(x: 0, y: 0, width: 400, height: max(view.skeletonHeight, 120))
+                view.layoutSubtreeIfNeeded()
+                if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                    view.cacheDisplay(in: view.bounds, to: rep)
+                    try? rep.representation(using: .png, properties: [:])?
+                        .write(to: URL(fileURLWithPath: dir).appendingPathComponent("\(name)-popover.png"))
+                }
+                NSLog("%@", "QA-POPOVERVIEW \(name) height=\(Int(view.skeletonHeight))")
+            }
+            delay = 2.0
         case "forecast":
             if let a = qaAccount(parts), parts.count > 2 {
                 if parts[2] == "idle" {
@@ -266,7 +302,7 @@ extension AppDelegate {
         for (i, a) in accounts.enumerated() {
             let r = a.record
             let next = a.refreshTimer.map { String(format: "%.0f", $0.fireDate.timeIntervalSince(now)) } ?? "none"
-            NSLog("%@", "QA-ACCOUNT \(i) id=\(r.id) name=\(r.displayName) label=\(r.badgeLabel) slot=\(r.badgeSlot.rawValue) primary=\(a.isPrimary) signedOut=\(a.isSignedOut) pinned=\(r.orgPinned) store=\(r.storeIdentifier == nil ? "default" : "isolated") color=\(accountColor(for: a).rawValue) colorKey=\(r.colorKey ?? "nil") timerNextFire=\(next)s")
+            NSLog("%@", "QA-ACCOUNT \(i) id=\(r.id) name=\(r.displayName) label=\(r.badgeLabel) slot=\(r.badgeSlot.rawValue) primary=\(a.isPrimary) signedOut=\(a.isSignedOut) pinned=\(r.orgPinned) store=\(r.storeIdentifier == nil ? "default" : "isolated") color=\(accountColor(for: a).rawValue) colorKey=\(r.colorKey ?? "nil") cachedBadge=\(UserDefaults.standard.object(forKey: a.lastBadgePercentageKey).map { "\($0)" } ?? "nil") noSession=\(a.hasNoSessionWindow) timerNextFire=\(next)s")
         }
         // Titled, visible app windows (the status item's own window excluded).
         let windows = NSApp.windows.filter {

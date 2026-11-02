@@ -39,84 +39,118 @@ function fail(reasons) {
 // when the undocumented endpoint shifts shape.
 
 if (fixtureName === "json") {
-    const SAMPLE = path.join(here, "fixtures", "usage-api.sample.json");
-    const EXPECTED = path.join(here, "fixtures", "usage-api.expected.json");
-    if (!fs.existsSync(SAMPLE)) fail([`fixture not found: ${SAMPLE}`]);
-    if (!fs.existsSync(EXPECTED)) fail([`fixture not found: ${EXPECTED}`]);
-
-    const sample = JSON.parse(fs.readFileSync(SAMPLE, "utf8"));
-    const expectedJson = JSON.parse(fs.readFileSync(EXPECTED, "utf8"));
+    // Every qa/fixtures/usage-api*.sample.json with a matching
+    // *.expected.json is checked (current schema and legacy keys).
+    const dir = path.join(here, "fixtures");
+    const samples = fs.readdirSync(dir).filter((f) => /^usage-api.*\.sample\.json$/.test(f)).sort();
+    if (!samples.length) fail([`no usage-api*.sample.json fixtures in ${dir}`]);
 
     // Mirror Swift normalizeJSONResponse. Keep behavior in lockstep with the
     // Swift implementation so this validator catches normalization drift.
+    // utilization is a percentage (0-100) since v2.6.1; no fraction scaling.
     const pct = (w) => {
         if (typeof w.percent_used === "number") return w.percent_used;
-        if (typeof w.utilization === "number") {
-            const scaled = w.utilization <= 1.0 ? w.utilization * 100 : w.utilization;
-            return Math.round(scaled);
-        }
+        if (typeof w.utilization === "number") return Math.round(w.utilization);
         return 0;
     };
     const detail = (w) => (w.resets_at ? `Resets ${w.resets_at}` : "");
-    const meters = [];
-    if (sample.session) {
-        meters.push({
-            label: sample.session.label || "Current session",
-            percentage: pct(sample.session),
-            detail: detail(sample.session),
-        });
-    }
-    if (sample.weekly) {
-        meters.push({
-            label: sample.weekly.label || "Weekly usage",
-            percentage: pct(sample.weekly),
-            detail: detail(sample.weekly),
-        });
-    }
-    if (Array.isArray(sample.per_model)) {
-        for (const w of sample.per_model) {
-            const model = w.model || "";
-            const baseLabel = w.label || (model ? `Weekly ${model} usage` : "Weekly");
-            meters.push({ label: baseLabel, percentage: pct(w), detail: detail(w) });
+    const normalize = (r) => {
+        const session = [];
+        const weekly = [];
+        const s = r.five_hour || r.session;
+        if (s) session.push({ label: s.label || "Current session", percentage: pct(s), detail: detail(s) });
+        const w = r.seven_day || r.weekly;
+        if (w) weekly.push({ label: w.label || "Weekly usage", percentage: pct(w), detail: detail(w) });
+        for (const [model, win] of [["Opus", r.seven_day_opus], ["Sonnet", r.seven_day_sonnet]]) {
+            if (win) weekly.push({ label: `Weekly ${model} usage`, percentage: pct(win), detail: detail(win) });
         }
-    }
-
-    const reasons = [];
-    const u = expectedJson.normalizeJSONResponse || {};
-    if (typeof u.minMeters === "number" && meters.length < u.minMeters) {
-        reasons.push(`normalizeJSONResponse: expected >=${u.minMeters} meters, got ${meters.length}`);
-    }
-    if (Array.isArray(u.requireLabels)) {
-        const lower = meters.map((m) => String(m.label || "").toLowerCase());
-        for (const needle of u.requireLabels) {
-            const hit = lower.some((l) => l.includes(needle.toLowerCase()));
-            if (!hit) {
-                reasons.push(
-                    `normalizeJSONResponse: no meter label contains "${needle}" (got: ${JSON.stringify(meters.map((m) => m.label))})`,
-                );
+        if (Array.isArray(r.per_model)) {
+            for (const pm of r.per_model) {
+                const model = pm.model || "";
+                const baseLabel = pm.label || (model ? `Weekly ${model} usage` : "Weekly");
+                weekly.push({ label: baseLabel, percentage: pct(pm), detail: detail(pm) });
             }
         }
-    }
-    if (Array.isArray(u.requirePercentages)) {
+        const sections = [];
+        if (session.length) sections.push({ title: "Session limit", meters: session });
+        if (weekly.length) sections.push({ title: "Weekly limit", meters: weekly });
+        return sections;
+    };
+    // Mirror AccountController.badgeReading: the session window when the
+    // fetch has one, else (plans without a session limit) the weekly window.
+    const badgeChoice = (sections) => {
+        for (const sec of sections) {
+            for (const m of sec.meters) {
+                if (m.label.toLowerCase().includes("current session")) return { source: "session", percentage: m.percentage };
+            }
+        }
+        for (const sec of sections.filter((x) => x.title.toLowerCase().includes("weekly"))) {
+            const hit = sec.meters.find((m) => {
+                const l = m.label.toLowerCase();
+                return l === "weekly" || l === "weekly usage" || l.startsWith("weekly usage");
+            });
+            if (hit) return { source: "weekly", percentage: hit.percentage };
+            if (sec.meters.length) return { source: "weekly", percentage: sec.meters[0].percentage };
+        }
+        return null;
+    };
+
+    let failures = [];
+    for (const sampleName of samples) {
+        const base = sampleName.replace(/\.sample\.json$/, "");
+        const expectedPath = path.join(dir, `${base}.expected.json`);
+        if (!fs.existsSync(expectedPath)) { failures.push(`${base}: missing ${base}.expected.json`); continue; }
+        const sample = JSON.parse(fs.readFileSync(path.join(dir, sampleName), "utf8"));
+        const expectedJson = JSON.parse(fs.readFileSync(expectedPath, "utf8"));
+        const sections = normalize(sample);
+        const meters = sections.flatMap((x) => x.meters);
+        const reasons = [];
+        const u = expectedJson.normalizeJSONResponse || {};
+        if (typeof u.minMeters === "number" && meters.length < u.minMeters) {
+            reasons.push(`normalizeJSONResponse: expected >=${u.minMeters} meters, got ${meters.length}`);
+        }
+        const lower = meters.map((m) => String(m.label || "").toLowerCase());
+        for (const needle of u.requireLabels || []) {
+            if (!lower.some((l) => l.includes(needle.toLowerCase()))) {
+                reasons.push(`normalizeJSONResponse: no meter label contains "${needle}" (got: ${JSON.stringify(meters.map((m) => m.label))})`);
+            }
+        }
+        for (const needle of u.forbidLabels || []) {
+            if (lower.some((l) => l.includes(needle.toLowerCase()))) {
+                reasons.push(`normalizeJSONResponse: unexpected meter label containing "${needle}"`);
+            }
+        }
+        if (Array.isArray(u.requireSectionTitles)) {
+            const titles = sections.map((x) => x.title);
+            if (JSON.stringify(titles) !== JSON.stringify(u.requireSectionTitles)) {
+                reasons.push(`normalizeJSONResponse: sections ${JSON.stringify(titles)}, expected ${JSON.stringify(u.requireSectionTitles)}`);
+            }
+        }
         const got = new Set(meters.map((m) => m.percentage));
-        for (const p of u.requirePercentages) {
+        for (const p of u.requirePercentages || []) {
             if (!got.has(p)) reasons.push(`normalizeJSONResponse: missing percentage ${p}`);
         }
-    }
-    const f = expectedJson.sessionPercentageFromModel || {};
-    if (typeof f.expected === "number") {
-        const needle = String(f.matchLabelContains || "current session").toLowerCase();
-        const hit = meters.find((m) => String(m.label || "").toLowerCase().includes(needle));
-        if (!hit) {
-            reasons.push(`sessionPercentageFromModel: no meter label contains "${needle}"`);
-        } else if (hit.percentage !== f.expected) {
-            reasons.push(`sessionPercentageFromModel: expected ${f.expected}, got ${hit.percentage} from label "${hit.label}"`);
+        const f = expectedJson.sessionPercentageFromModel || {};
+        if (typeof f.expected === "number") {
+            const needle = String(f.matchLabelContains || "current session").toLowerCase();
+            const hit = meters.find((m) => String(m.label || "").toLowerCase().includes(needle));
+            if (!hit) reasons.push(`sessionPercentageFromModel: no meter label contains "${needle}"`);
+            else if (hit.percentage !== f.expected) reasons.push(`sessionPercentageFromModel: expected ${f.expected}, got ${hit.percentage}`);
+        }
+        if (expectedJson.badgeChoice) {
+            const choice = badgeChoice(sections);
+            if (JSON.stringify(choice) !== JSON.stringify(expectedJson.badgeChoice)) {
+                reasons.push(`badgeChoice: expected ${JSON.stringify(expectedJson.badgeChoice)}, got ${JSON.stringify(choice)}`);
+            }
+        }
+        if (reasons.length) {
+            failures = failures.concat(reasons.map((r) => `${base}: ${r}`));
+        } else {
+            log(`PASS fixture=${base} meters=${meters.length} badge=${JSON.stringify(badgeChoice(sections))}`);
+            log(`  meters: ${meters.map((m) => `[${m.label}=${m.percentage}%]`).join(" ")}`);
         }
     }
-
-    if (reasons.length) fail(reasons);
-    log(`PASS — fixture=json meters=${meters.length}`);
-    log(`  meters: ${meters.map((m) => `[${m.label}=${m.percentage}%]`).join(" ")}`);
+    if (failures.length) fail(failures);
     process.exit(0);
 }
 

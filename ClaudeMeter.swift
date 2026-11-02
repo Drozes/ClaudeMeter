@@ -915,8 +915,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let prefix = name.map { "\($0) " } ?? "Claude usage "
             if value == "--" { return prefix + "signed out" }
             guard value.hasSuffix("%"), let number = Int(value.dropLast()) else { return prefix + "no data yet" }
-            var text = prefix + "\(number) percent"
-            if let account = account, let band = BurnRateBand.band(for: account.lastSessionForecast) {
+            let weekly = account?.hasNoSessionWindow == true
+            var text = prefix + (weekly ? "weekly " : "") + "\(number) percent"
+            if weekly { text += ", no session limit on this plan" }
+            if let account = account, let band = BurnRateBand.band(for: account.badgeForecast) {
                 text += ", " + band.spokenTrend
             }
             return text
@@ -945,7 +947,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func activityBand(for account: AccountController, value: String) -> BurnRateBand? {
         guard showActivityDot, !account.isSignedOut,
               value.range(of: "^[0-9]+%$", options: .regularExpression) != nil else { return nil }
-        return BurnRateBand.band(for: account.lastSessionForecast)
+        return BurnRateBand.band(for: account.badgeForecast)
     }
 
     /// The account's colour: its saved key if it is a known palette colour;
@@ -1027,6 +1029,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
 
+        // The latest successful fetch has no session window (plans without a
+        // five-hour limit): show the weekly window and replace the cached
+        // value, so an old session percentage can never linger. The XPath
+        // session scrape is skipped: it could only resurrect a stale value.
+        if account.hasNoSessionWindow {
+            if let reading = account.badgeReading() {
+                let text = "\(reading.percentage)%"
+                setBadgeTitle(text, reason: "model weekly (no session window)",
+                              style: singleAccountBadgeStyle(for: account, text: text))
+                UserDefaults.standard.set(reading.percentage, forKey: badgeKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: badgeKey)
+                setBadgeTitle("\u{2014}%", reason: "no session or weekly window in model")
+            }
+            return
+        }
+
         // Fallback: direct XPath scrape (independent of structured scrape's labels).
         NSLog("[ClaudeMeter] updateBadgeFromModel: no 'current session' meter in model, falling back to XPath")
         account.webView.evaluateJavaScript(Self.scrapeSessionPercentageJS) { [weak self] result, _ in
@@ -1052,6 +1071,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let button = statusItem.button else { return }
         if accounts.count >= 2 {
             button.toolTip = multiAccountTooltip()
+            return
+        }
+        // A plan without a session window: say so, with weekly figures.
+        if let account = accounts.first, account.hasNoSessionWindow {
+            button.toolTip = weeklyOnlyTooltipLines(for: account, name: nil).joined(separator: "\n")
             return
         }
         let samples = accounts.first?.history.samples ?? []
@@ -1624,13 +1648,22 @@ extension AppDelegate {
     /// that side's last value otherwise.
     func updateMultiAccountBadge() {
         var freshSides = 0
+        var weeklySides = 0
         for account in badgeAccounts() {
             let id = account.id
             if account.isSignedOut { continue }
-            if let pct = account.sessionPercentage(from: account.latestSections) {
-                badgeSideText[id] = "\(pct)%"
-                UserDefaults.standard.set(pct, forKey: account.lastBadgePercentageKey)
+            if let reading = account.badgeReading() {
+                badgeSideText[id] = "\(reading.percentage)%"
+                UserDefaults.standard.set(reading.percentage, forKey: account.lastBadgePercentageKey)
                 freshSides += 1
+                if reading.source == .weekly { weeklySides += 1 }
+                continue
+            }
+            // No session and no weekly window in a successful fetch: never
+            // keep (or scrape back) an old session value.
+            if account.hasNoSessionWindow {
+                badgeSideText[id] = "\u{2014}%"
+                UserDefaults.standard.removeObject(forKey: account.lastBadgePercentageKey)
                 continue
             }
             if badgeSideText[id] == nil { badgeSideText[id] = cachedBadgeSideText(for: account) }
@@ -1648,8 +1681,17 @@ extension AppDelegate {
         // sections in this call (not necessarily a fetch that just happened);
         // with none, every side shows a cached value and the reason says so.
         // QA (L3) ignores "cached sides only" transitions.
-        renderMultiAccountBadge(reason: freshSides > 0 ? "model meter labeled current session"
-                                                       : "multi: cached sides only")
+        let reason: String
+        if freshSides == 0 {
+            reason = "multi: cached sides only"
+        } else if weeklySides == freshSides {
+            reason = "model weekly (no session window)"
+        } else if weeklySides > 0 {
+            reason = "model meter labeled current session; weekly for sides with no session window"
+        } else {
+            reason = "model meter labeled current session"
+        }
+        renderMultiAccountBadge(reason: reason)
     }
 
     /// "W 47%" with one shown side, "P 47% | W 12%" with two (left first).
@@ -1704,6 +1746,34 @@ extension AppDelegate {
         }
     }
 
+    /// Tooltip lines for an account whose plan has no session window: its
+    /// weekly percentage, a note, the weekly peak / average, and the weekly
+    /// burn rate.
+    func weeklyOnlyTooltipLines(for account: AccountController, name: String?) -> [String] {
+        let prefix = name.map { "\($0): " } ?? ""
+        var lines: [String] = []
+        if let weekly = account.weeklyPercentage(from: account.latestSections) {
+            var line = "\(prefix)weekly \(weekly)% · no session limit on this plan"
+            if let f = account.lastWeeklyForecast, BurnRateBand.band(for: f) != nil {
+                line += f.ratePerHour >= 10 ? String(format: " · +%.0f%%/h", f.ratePerHour)
+                                            : String(format: " · +%.1f%%/h", f.ratePerHour)
+            }
+            lines.append(line)
+        } else {
+            lines.append("\(prefix)no session limit on this plan")
+        }
+        let samples = account.history.samples
+        if let peak = samples.max(by: { $0.w < $1.w }) {
+            let f = DateFormatter()
+            f.dateFormat = "h:mma"
+            f.amSymbol = "a"; f.pmSymbol = "p"
+            let avg = Int((Double(samples.reduce(0) { $0 + $1.w }) / Double(samples.count)).rounded())
+            let peakTime = f.string(from: Date(timeIntervalSince1970: peak.t)).lowercased()
+            lines.append("\(name == nil ? "" : "  ")Weekly peak: \(peak.w)% at \(peakTime) · 24h avg: \(avg)%")
+        }
+        return lines
+    }
+
     /// Two or more accounts: one block per account in the menu-bar tooltip.
     func multiAccountTooltip() -> String {
         let f = DateFormatter()
@@ -1714,6 +1784,10 @@ extension AppDelegate {
             let name = account.record.displayName
             if account.isSignedOut {
                 lines.append("\(name): signed out")
+                continue
+            }
+            if account.hasNoSessionWindow {
+                lines.append(contentsOf: weeklyOnlyTooltipLines(for: account, name: name))
                 continue
             }
             var parts: [String] = []
@@ -2642,6 +2716,30 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                 }
             }
         }
+    }
+
+    /// Which window the badge shows for this account.
+    enum BadgeSource { case session, weekly }
+
+    /// True when the latest successful fetch (latestSections only changes on
+    /// success) has no session window, as on plans without a five-hour
+    /// limit. Failed fetches never change this.
+    var hasNoSessionWindow: Bool {
+        !latestSections.isEmpty && sessionPercentage(from: latestSections) == nil
+    }
+
+    /// The badge reading from the latest successful fetch: the session
+    /// window, or, when that fetch had none, the weekly window.
+    func badgeReading() -> (percentage: Int, source: BadgeSource)? {
+        if let session = sessionPercentage(from: latestSections) { return (session, .session) }
+        if hasNoSessionWindow, let weekly = weeklyPercentage(from: latestSections) { return (weekly, .weekly) }
+        return nil
+    }
+
+    /// Forecast behind the activity dot: the weekly forecast when the badge
+    /// shows the weekly window, else the session forecast.
+    var badgeForecast: UsageForecast? {
+        hasNoSessionWindow ? lastWeeklyForecast : lastSessionForecast
     }
 
     /// Extract the "Current session" percentage from the shared data store.
@@ -5099,7 +5197,14 @@ class UsageContentView: NSView {
         // or session limit. Old DOM-scraped pages used "Plan limits"; the
         // current JSON normalizer emits "Session limit" — both qualify.
         let lower = section.title.lowercased()
-        let isPlanSection = lower.contains("plan") || lower.contains("session")
+        var isPlanSection = lower.contains("plan") || lower.contains("session")
+        // Plans without a session window send only weekly sections; carry the
+        // tier on the first section instead of dropping it.
+        let hasPlanSection = lastSections.contains { s in
+            let t = s.title.lowercased()
+            return t.contains("plan") || t.contains("session")
+        }
+        if !hasPlanSection, lastSections.first?.title == section.title { isPlanSection = true }
         if isPlanSection, let tier = planTierDisplayName, !tier.isEmpty {
             return "\(upper) - \(tier.uppercased())"
         }
