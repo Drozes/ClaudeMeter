@@ -34,6 +34,12 @@ log "compiled: $OUT ($(stat -f%z "$OUT") bytes)"
 # app's preferences domain. L3 (smoke/run.sh) launches the same bundled copy.
 NAME="$(basename "$OUT")"
 APP="$OUT.app"
+# Guard the rm -rf below: never touch an installed app.
+case "$APP" in
+    /Applications/*|"$HOME"/Applications/*|*/ClaudeMeter.app|ClaudeMeter.app)
+        log "FAIL: refusing to replace $APP (looks like an installed app); set CLAUDEMETER_QA_BIN elsewhere"
+        exit 1 ;;
+esac
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp "$OUT" "$APP/Contents/MacOS/$NAME"

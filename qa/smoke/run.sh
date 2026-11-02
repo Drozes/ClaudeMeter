@@ -27,7 +27,8 @@ log() { printf '[L3] %s\n' "$*" >&2; }
 # 1. Make sure binary is built and current. L0 also wraps it in a minimal
 #    .app bundle (UNUserNotificationCenter needs one); launch that copy.
 LAUNCH="$BIN.app/Contents/MacOS/$(basename "$BIN")"
-if [ ! -x "$BIN" ] || [ ! -x "$LAUNCH" ] || [ "$QA_DIR/../ClaudeMeter.swift" -nt "$BIN" ]; then
+if [ ! -x "$BIN" ] || [ ! -x "$LAUNCH" ] || [ "$QA_DIR/../ClaudeMeter.swift" -nt "$BIN" ] \
+    || [ "$BIN" -nt "$LAUNCH" ]; then
     log "binary stale or missing — rebuilding via L0"
     "$QA_DIR/build.sh" >/dev/null || { log "FAIL: L0 build failed"; exit 1; }
 fi
@@ -47,9 +48,13 @@ sleep 0.5
 # 4. Launch with badge forced ON (NSArgumentDomain override).
 #    -declinedMoveToApplications YES suppresses the modal "Move to
 #    Applications?" alert that a bundled copy outside /Applications triggers.
+#    -lastBadgePercentage 0 blanks the cached badge value the QA bundle's own
+#    prefs domain kept from an earlier run, so the launch-time restore shows
+#    the placeholder instead of an old percentage.
 log "launching $LAUNCH with -showMenuBarBadge YES"
 : > "$STDERR"
-"$LAUNCH" -showMenuBarBadge YES -declinedMoveToApplications YES >"$STDOUT" 2>"$STDERR" &
+"$LAUNCH" -showMenuBarBadge YES -declinedMoveToApplications YES \
+    -lastBadgePercentage 0 >"$STDOUT" 2>"$STDERR" &
 PID=$!
 
 cleanup() {
@@ -82,8 +87,11 @@ while :; do
 
     # Look for an arrow target that's a real percentage.
     # Match: badge title: '<anything>' -> '<digits>%' (
-    if grep -qE "badge title: '[^']*' -> '[0-9]+%'" "$STDERR" 2>/dev/null; then
-        line=$(grep -E "badge title: '[^']*' -> '[0-9]+%'" "$STDERR" | tail -1)
+    # Transitions with reason "applyBadgeVisibility cached=" are excluded: they
+    # restore a cached value at launch and prove nothing about fetching.
+    line=$(grep -E "badge title: '[^']*' -> '[0-9]+%'" "$STDERR" 2>/dev/null \
+        | grep -v "(applyBadgeVisibility cached=" | tail -1)
+    if [ -n "$line" ]; then
         badge=$(echo "$line" | sed -E "s/.*-> '([0-9]+%)'.*/\1/")
         log "PASS: badge updated to $badge"
         log "  log line: $(echo "$line" | sed 's/.*\[ClaudeMeter\]/  [ClaudeMeter]/')"
