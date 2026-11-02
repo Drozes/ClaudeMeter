@@ -81,6 +81,16 @@ Compiles `ClaudeMeter.swift` with `swiftc`, launches the binary, waits 4s, and
 verifies the process is still alive. Catches compile errors and crash-on-launch
 regressions (e.g., a force-unwrap on a nil cookie).
 
+The binary is launched from a minimal `.app` bundle written next to it
+(`$CLAUDEMETER_QA_BIN.app`, bundle ID `com.local.ClaudeMeter.qa`). Since v2.4
+the app calls `UNUserNotificationCenter.current()` at launch, which throws
+`bundleProxyForCurrentProcess is nil` for an unbundled executable. The distinct
+bundle ID keeps QA runs out of the installed app's preferences domain. Both
+L0 and L3 pass `-declinedMoveToApplications YES` so a bundled copy outside
+`/Applications` never shows the modal "Move to Applications?" alert (which
+would block the main thread and, if accepted, copy the QA bundle into
+`/Applications`). L3 launches the same bundled copy.
+
 ### L1 Static audit ([static-audit.sh](static-audit.sh))
 Greps the Swift source for known fragile patterns. Specifically enforces:
 - Both `scrapeUsageJS` and `scrapeSessionPercentageJS` exist (defense in depth)

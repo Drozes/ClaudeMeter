@@ -24,8 +24,10 @@ TIMEOUT="${CLAUDEMETER_QA_TIMEOUT:-45}"
 
 log() { printf '[L3] %s\n' "$*" >&2; }
 
-# 1. Make sure binary is built and current.
-if [ ! -x "$BIN" ] || [ "$QA_DIR/../ClaudeMeter.swift" -nt "$BIN" ]; then
+# 1. Make sure binary is built and current. L0 also wraps it in a minimal
+#    .app bundle (UNUserNotificationCenter needs one); launch that copy.
+LAUNCH="$BIN.app/Contents/MacOS/$(basename "$BIN")"
+if [ ! -x "$BIN" ] || [ ! -x "$LAUNCH" ] || [ "$QA_DIR/../ClaudeMeter.swift" -nt "$BIN" ]; then
     log "binary stale or missing — rebuilding via L0"
     "$QA_DIR/build.sh" >/dev/null || { log "FAIL: L0 build failed"; exit 1; }
 fi
@@ -43,9 +45,11 @@ pkill -f "$(basename "$BIN")" 2>/dev/null || true
 sleep 0.5
 
 # 4. Launch with badge forced ON (NSArgumentDomain override).
-log "launching $BIN with -showMenuBarBadge YES"
+#    -declinedMoveToApplications YES suppresses the modal "Move to
+#    Applications?" alert that a bundled copy outside /Applications triggers.
+log "launching $LAUNCH with -showMenuBarBadge YES"
 : > "$STDERR"
-"$BIN" -showMenuBarBadge YES >"$STDOUT" 2>"$STDERR" &
+"$LAUNCH" -showMenuBarBadge YES -declinedMoveToApplications YES >"$STDOUT" 2>"$STDERR" &
 PID=$!
 
 cleanup() {
