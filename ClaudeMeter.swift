@@ -808,9 +808,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 /// off-screen WKWebView and its cookie store, the fallback login window and
 /// OAuth popups, the refresh timer, the JSON circuit breaker and empty-scrape
 /// streak, the resolved org and plan tier, the latest sections, history and
-/// forecast. It is the navigation, UI and window delegate for every WebKit
-/// view and window it creates. App-wide UI (status item, popover, menu,
-/// preferences) stays on AppDelegate, reached through `app`.
+/// forecast. It is the navigation and UI delegate for every web view it
+/// creates (background, login and OAuth popups) and the window delegate for
+/// its login window; OAuth popup windows have no window delegate. App-wide UI
+/// (status item, popover, menu, preferences) stays on AppDelegate, reached
+/// through `app`.
 final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
     /// AppDelegate owns every AccountController and lives for the whole
     /// process, so this back-reference can never dangle.
@@ -1794,6 +1796,31 @@ enum FetchError: Error {
     case transport(Error)
 }
 
+// MARK: - App Paths
+
+/// Application Support folder for this build. The shipping app
+/// (com.local.ClaudeMeter) and unbundled binaries keep the historical
+/// "ClaudeMeter" folder, so real-app paths never change. Any other bundle ID
+/// (for example the QA bundle, com.local.ClaudeMeter.qa) gets a folder named
+/// after its bundle ID, so test runs never read, migrate or overwrite the
+/// installed app's history files.
+enum AppPaths {
+    static let shippingBundleID = "com.local.ClaudeMeter"
+
+    static var supportDirectory: URL {
+        let fm = FileManager.default
+        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        let folder: String
+        if let id = Bundle.main.bundleIdentifier, !id.isEmpty, id != shippingBundleID {
+            folder = id
+        } else {
+            folder = "ClaudeMeter"
+        }
+        return base.appendingPathComponent(folder, isDirectory: true)
+    }
+}
+
 // MARK: - Usage History (ring buffer + disk persistence)
 
 /// Bounded sample buffer for burn-rate / ETA computation. Capped at 24h on
@@ -1813,10 +1840,7 @@ struct UsageHistory {
     private static let persistThrottle: TimeInterval = 30
 
     static var fileURL: URL {
-        let fm = FileManager.default
-        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
-        return base.appendingPathComponent("ClaudeMeter/history.json")
+        AppPaths.supportDirectory.appendingPathComponent("history.json")
     }
 
     static func loadFromDisk() -> UsageHistory {

@@ -91,6 +91,27 @@ L0 and L3 pass `-declinedMoveToApplications YES` so a bundled copy outside
 would block the main thread and, if accepted, copy the QA bundle into
 `/Applications`). L3 launches the same bundled copy.
 
+Isolation from the installed app, and what L0 really touches:
+
+- **Preferences:** the QA bundle has its own domain (`com.local.ClaudeMeter.qa`),
+  separate from the installed app's `com.local.ClaudeMeter`. Values persist in
+  that domain between QA runs; L3 passes `-lastBadgePercentage 0` so a cached
+  badge from an earlier run cannot be mistaken for a fresh fetch, and the L3
+  pass regex ignores `applyBadgeVisibility cached=` transitions for the same
+  reason.
+- **Application Support:** the app derives its support subfolder from its
+  bundle ID. The installed app (and unbundled binaries) keep
+  `~/Library/Application Support/ClaudeMeter/`; the QA bundle uses
+  `~/Library/Application Support/com.local.ClaudeMeter.qa/`, so QA runs never
+  read, migrate or overwrite the real history files.
+- **Real side effects:** even the 4s L0 launch is a real app run. It reads the
+  Claude Desktop "Claude Safe Storage" Keychain item to decrypt Claude Desktop's
+  cookies, makes real requests to claude.ai with them, and persists cookies in
+  the QA bundle's own WebKit website data store. It never touches any
+  `Claude Code-credentials*` Keychain item.
+- `build.sh` refuses to replace a bundle under `/Applications` or
+  `~/Applications`, or one named `ClaudeMeter.app`.
+
 ### L1 Static audit ([static-audit.sh](static-audit.sh))
 Greps the Swift source for known fragile patterns. Specifically enforces:
 - Both `scrapeUsageJS` and `scrapeSessionPercentageJS` exist (defense in depth)
