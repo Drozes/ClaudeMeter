@@ -1349,7 +1349,9 @@ extension AppDelegate {
                 self.renderMultiAccountBadge(reason: "XPath fallback scrape")
             }
         }
-        // The reason says whether any side is fresh from the model this pass;
+        // freshSides counts sides read from their account's latest fetched
+        // sections in this call (not necessarily a fetch that just happened);
+        // with none, every side shows a cached value and the reason says so.
         // QA (L3) ignores "cached sides only" transitions.
         renderMultiAccountBadge(reason: freshSides > 0 ? "model meter labeled current session"
                                                        : "multi: cached sides only")
@@ -1702,6 +1704,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         guard signedOut != isSignedOut else { return }
         isSignedOut = signedOut
         NSLog("%@", "[ClaudeMeter] account \(id) \(signedOut ? "signed out" : "signed in") (\(reason))")
+        if !signedOut { lastSignInConfirmAt = nil }
         if signedOut && !isPrimary {
             startSignedOutProbe()
         } else {
@@ -1731,8 +1734,10 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
 
     /// One /api/organizations call with this account's cookies (no windows,
     /// no alerts), reported as a verdict.
-    func probeSignIn(_ completion: @escaping (SignInVerdict) -> Void) {
-        guard !signInProbeInFlight, !isTornDown else { return }
+    /// Returns false (and does nothing) when a probe is already in flight.
+    @discardableResult
+    func probeSignIn(_ completion: @escaping (SignInVerdict) -> Void) -> Bool {
+        guard !signInProbeInFlight, !isTornDown else { return false }
         signInProbeInFlight = true
         copyCookiesToSession(logCount: false) { [weak self] session in
             guard let self = self else { session.finishTasksAndInvalidate(); return }
@@ -1743,17 +1748,20 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                 completion(self.signInVerdict(status: status, orgs: orgs))
             }
         }
+        return true
     }
 
     /// A secondary account is marked signed out only after the API agrees,
     /// so one transient 403 or an odd page landing cannot sign it out.
-    func confirmSignedOut(reason: String) {
+    /// `throttled` (the pinned usage-API failure path only): at most one
+    /// confirmation per account per 15 minutes, so a usage endpoint that
+    /// keeps failing does not double every request. Page-based hints are
+    /// rare and always checked.
+    func confirmSignedOut(reason: String, throttled: Bool = false) {
         guard !isPrimary, !isSignedOut else { return }
-        // Back off: at most one confirmation per account per 15 minutes, so a
-        // usage endpoint that keeps failing does not double every request.
-        if let last = lastSignInConfirmAt, Date().timeIntervalSince(last) < Self.signedOutProbeInterval { return }
-        lastSignInConfirmAt = Date()
-        probeSignIn { [weak self] verdict in
+        if throttled, let last = lastSignInConfirmAt,
+           Date().timeIntervalSince(last) < Self.signedOutProbeInterval { return }
+        let started = probeSignIn { [weak self] verdict in
             guard let self = self else { return }
             switch verdict {
             case .signedOut(let why):
@@ -1772,6 +1780,8 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                 NSLog("%@", "[ClaudeMeter] account \(self.id): \(reason), sign-in check inconclusive; no change")
             }
         }
+        // Stamp only when a probe actually started (not when one was in flight).
+        if started && throttled { lastSignInConfirmAt = Date() }
     }
 
     /// Slow re-check while a secondary account is signed out (every 15 min,
@@ -2028,6 +2038,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         jsonConsecutiveFailures = 0
         jsonCircuitOpen = false
         jsonCircuitOpenedAt = nil
+        lastSignInConfirmAt = nil
         setSignedOut(false, reason: "login verified")
         loginWindow?.close()
     }
@@ -2236,7 +2247,18 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         // A pinned org is metered through the JSON API only, so its page
         // state does not matter.
         if record.orgPinned {
-            if app.popover?.isShown != true && !app.showMenuBarBadge { return }
+            let popoverOpen = app.popover?.isShown == true
+            if !popoverOpen && !app.showMenuBarBadge { return }
+            // Same periodic full reload as other accounts, to reclaim WebView
+            // memory (the page itself is not used for metering).
+            if !popoverOpen {
+                refreshCycleCount += 1
+                if refreshCycleCount >= 30 {
+                    refreshCycleCount = 0
+                    NSLog("[ClaudeMeter] unifiedRefresh: periodic full reload to reclaim WebView memory")
+                    webView.load(URLRequest(url: AppDelegate.usageURL))
+                }
+            }
             lastRefreshDate = Date()
             scrapeAndDistribute()
             return
@@ -2665,7 +2687,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                             if self.record.orgPinned {
                                 // Never silently swap a user-pinned org for another
                                 // one: keep the UUID; sign out only if the API agrees.
-                                self.confirmSignedOut(reason: "usage API HTTP \(status) for pinned org")
+                                self.confirmSignedOut(reason: "usage API HTTP \(status) for pinned org", throttled: true)
                             } else {
                                 // Cached UUID may be stale; clear so next attempt rediscovers.
                                 self.cachedOrgUUID = nil
@@ -4082,6 +4104,11 @@ final class MultiAccountUsageView: NSView {
         pendingScrollToTop = true
         DispatchQueue.main.async { [weak self] in
             self?.applyPendingScrollToTop(keepPending: true)
+        }
+        // The latch only covers the open-and-resize moment; expire it so a
+        // later size report cannot jump the view back to the top.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.pendingScrollToTop = false
         }
     }
 

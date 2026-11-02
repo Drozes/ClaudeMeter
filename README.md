@@ -117,8 +117,8 @@ The app is a single Swift file (`ClaudeMeter.swift`) with no dependencies beyond
 ## Privacy
 
 - Sign-in cookies live only in WebKit's own website data stores: the default store for the first account and one isolated store per added account. ClaudeMeter never writes cookies or tokens to its preferences, its files or its logs; logs carry cookie counts, never values.
-- The only Keychain item ClaudeMeter reads is Claude Desktop's "Claude Safe Storage" key, to import the first account's session. It never reads, writes or deletes any Claude Code credentials (`Claude Code-credentials*`) and never touches Claude Code's configuration.
-- Saved per-account settings are non-secret: a name, badge label and position, organization ID and name, and plan tier. Usage history is kept in `~/Library/Application Support/ClaudeMeter/history-<account>.json` (24 hours).
+- The only Keychain item ClaudeMeter reads is Claude Desktop's "Claude Safe Storage" key, to import the first account's session. To read Claude Desktop's (encrypted) cookie database, the import briefly copies it to a temporary file and deletes that copy as soon as it is read. ClaudeMeter never reads, writes or deletes any Claude Code credentials (`Claude Code-credentials*`) and never touches Claude Code's configuration.
+- Saved per-account settings are non-secret: a name, badge label and position, organization ID and name, and plan tier. Usage history is kept in `~/Library/Application Support/ClaudeMeter/history-<account>.json` (24 hours). The v2.7.1 `history.json` is left in place after the upgrade (copied, not moved) as a rollback path.
 
 ## Troubleshooting
 

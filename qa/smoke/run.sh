@@ -42,8 +42,10 @@ if [ ! -x "$OCR" ] || [ "$SMOKE_DIR/ocr.swift" -nt "$OCR" ]; then
         || log "warn: OCR helper compile failed (supplementary check will be skipped)"
 fi
 
-# 3. Tear down any prior ClaudeMeter so we're observing OUR process.
-pkill -x ClaudeMeter 2>/dev/null || true
+# 3. Tear down any prior QA instance so we're observing OUR process. Only the
+#    QA binary (ClaudeMeter.qa) is stopped: the installed ClaudeMeter keeps
+#    running (its own bundle ID, prefs and support folder; the badge check
+#    reads this process's stderr). The EXIT trap stops our own process.
 pkill -f "$(basename "$BIN")" 2>/dev/null || true
 sleep 0.5
 
