@@ -102,6 +102,8 @@ Each account has a colour (Blue, Purple, Indigo, Teal, Cyan, Magenta, Graphite o
 
 Team and Enterprise seats show their plan as "Team" or "Enterprise" (or "Work plan" when claude.ai does not say which).
 
+**Plans without a session limit**: some plans (for example Max) currently report only a weekly window. For such an account the badge shows its weekly percentage instead of a session percentage, the tooltip (and VoiceOver) says "weekly … no session limit on this plan", and the activity dot follows the weekly burn rate. If a session window comes back, the badge returns to it straight away.
+
 Each account has a badge position (Left, Right or Hidden; a position holds one account, so choosing an occupied one moves the previous account to Hidden) and a 1 to 3 character label, by default the first letter of its name. A new account takes Right if it is free, otherwise Hidden. If no account has a position, the badge shows the first account. Hovering the badge lists every account.
 
 **Popover**: with two or more accounts, the popover shows one section per account under a header with its name, organization and plan. An account whose session has expired shows a compact "Signed out" row with a **Sign In Again…** button instead of old numbers.
@@ -127,7 +129,7 @@ The app is a single Swift file (`ClaudeMeter.swift`) with no dependencies beyond
 
 - Sign-in cookies live only in WebKit's own website data stores: the default store for the first account and one isolated store per added account. ClaudeMeter never writes cookies or tokens to its preferences, its files or its logs; logs carry cookie counts, never values.
 - The only Keychain item ClaudeMeter reads is Claude Desktop's "Claude Safe Storage" key, to import the first account's session. To read Claude Desktop's (encrypted) cookie database, the import briefly copies it to a temporary file and deletes that copy as soon as it is read. ClaudeMeter never reads, writes or deletes any Claude Code credentials (`Claude Code-credentials*`) and never touches Claude Code's configuration.
-- Saved per-account settings are non-secret: a name, badge label and position, organization ID and name, and plan tier. Usage history is kept in `~/Library/Application Support/ClaudeMeter/history-<account>.json` (24 hours). The v2.7.1 `history.json` is left in place after the upgrade (copied, not moved) as a rollback path.
+- Saved per-account settings are non-secret and live in ClaudeMeter's preferences: the account's display name, email (if known), organization ID and name, plan tier, colour, and badge label and position. No cookies or tokens are stored there. Usage history is kept in `~/Library/Application Support/ClaudeMeter/history-<account>.json` (24 hours). The v2.7.1 `history.json` is left in place after the upgrade (copied, not moved) as a rollback path.
 
 ## Troubleshooting
 

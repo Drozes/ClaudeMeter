@@ -139,7 +139,7 @@ extension AppDelegate {
                 a.distributeFetchResult([
                     UsageSection(title: "Session limit", meters: [UsageMeter(label: "Current session", percentage: pct, detail: "")]),
                     UsageSection(title: "Weekly limit", meters: [UsageMeter(label: "Weekly usage", percentage: 30, detail: "")]),
-                ], path: "qa")
+                ], path: "json")
             }
         case "signOut":
             qaAccount(parts)?.setSignedOut(true, reason: "qa")
@@ -173,14 +173,27 @@ extension AppDelegate {
             }
         case "sweep":
             sweepOrphanedDataStores()
-        case "injectWeekly":
+        case "injectWeekly", "injectWeeklyDOM":
+            // A weekly-only fetch through the JSON path (authoritative) or
+            // the DOM path (XPath session scrape first).
             if let a = qaAccount(parts), parts.count > 2, let pct = Int(parts[2]) {
                 a.distributeFetchResult([
                     UsageSection(title: "Weekly limit", meters: [
                         UsageMeter(label: "Weekly usage", percentage: pct, detail: ""),
                         UsageMeter(label: "Weekly Sonnet usage", percentage: 3, detail: ""),
                     ]),
-                ], path: "qa")
+                ], path: parts[0] == "injectWeeklyDOM" ? "dom" : "json")
+            }
+            delay = 1.5
+        case "waitSignedOut":
+            // Poll (0.5s) until the account is signed out, at most N seconds:
+            // robust against slow page loads and API answers under load.
+            if let a = qaAccount(parts) {
+                let limit = Date().addingTimeInterval(TimeInterval(parts.count > 2 ? parts[2] : "45") ?? 45)
+                qaPoll(until: { a.isSignedOut }, deadline: limit, label: action) { [weak self] in
+                    self?.qaRun(rest)
+                }
+                return
             }
         case "forecastWeekly":
             if let a = qaAccount(parts), parts.count > 2 {
@@ -282,6 +295,18 @@ extension AppDelegate {
         }
     }
 
+    private func qaPoll(until condition: @escaping () -> Bool, deadline: Date, label: String,
+                        then next: @escaping () -> Void) {
+        if condition() || Date() >= deadline {
+            NSLog("%@", "QA-WAIT \(label) met=\(condition())")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { next() }
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.qaPoll(until: condition, deadline: deadline, label: label, then: next)
+        }
+    }
+
     private func qaAccount(_ parts: [String]) -> AccountController? {
         guard parts.count > 1, let i = Int(parts[1]), accounts.indices.contains(i) else {
             NSLog("%@", "QA-NOACCOUNT \(parts)")
@@ -302,7 +327,7 @@ extension AppDelegate {
         for (i, a) in accounts.enumerated() {
             let r = a.record
             let next = a.refreshTimer.map { String(format: "%.0f", $0.fireDate.timeIntervalSince(now)) } ?? "none"
-            NSLog("%@", "QA-ACCOUNT \(i) id=\(r.id) name=\(r.displayName) label=\(r.badgeLabel) slot=\(r.badgeSlot.rawValue) primary=\(a.isPrimary) signedOut=\(a.isSignedOut) pinned=\(r.orgPinned) store=\(r.storeIdentifier == nil ? "default" : "isolated") color=\(accountColor(for: a).rawValue) colorKey=\(r.colorKey ?? "nil") cachedBadge=\(UserDefaults.standard.object(forKey: a.lastBadgePercentageKey).map { "\($0)" } ?? "nil") noSession=\(a.hasNoSessionWindow) timerNextFire=\(next)s")
+            NSLog("%@", "QA-ACCOUNT \(i) id=\(r.id) name=\(r.displayName) label=\(r.badgeLabel) slot=\(r.badgeSlot.rawValue) primary=\(a.isPrimary) signedOut=\(a.isSignedOut) pinned=\(r.orgPinned) store=\(r.storeIdentifier == nil ? "default" : "isolated") color=\(accountColor(for: a).rawValue) colorKey=\(r.colorKey ?? "nil") cachedBadge=\(UserDefaults.standard.object(forKey: a.lastBadgePercentageKey).map { "\($0)" } ?? "nil") weeklyOnly=\(a.weeklyOnlyConfirmed) showsWeekly=\(a.badgeShowsWeekly) timerNextFire=\(next)s")
         }
         // Titled, visible app windows (the status item's own window excluded).
         let windows = NSApp.windows.filter {

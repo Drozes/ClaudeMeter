@@ -915,7 +915,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let prefix = name.map { "\($0) " } ?? "Claude usage "
             if value == "--" { return prefix + "signed out" }
             guard value.hasSuffix("%"), let number = Int(value.dropLast()) else { return prefix + "no data yet" }
-            let weekly = account?.hasNoSessionWindow == true
+            let weekly = account?.badgeShowsWeekly == true
             var text = prefix + (weekly ? "weekly " : "") + "\(number) percent"
             if weekly { text += ", no session limit on this plan" }
             if let account = account, let band = BurnRateBand.band(for: account.badgeForecast) {
@@ -1023,23 +1023,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let badgeKey = account.lastBadgePercentageKey
 
         if let pct = account.sessionPercentage(from: account.latestSections) {
+            account.badgeShowsWeekly = false
             setBadgeTitle("\(pct)%", reason: "model meter labeled current session",
                           style: singleAccountBadgeStyle(for: account, text: "\(pct)%"))
             UserDefaults.standard.set(pct, forKey: badgeKey)
             return
         }
 
-        // The latest successful fetch has no session window (plans without a
-        // five-hour limit): show the weekly window and replace the cached
-        // value, so an old session percentage can never linger. The XPath
-        // session scrape is skipped: it could only resurrect a stale value.
-        if account.hasNoSessionWindow {
+        // Confirmed weekly-only plan (two JSON fetches without a session
+        // window): show the weekly window and replace the cached value, so an
+        // old session percentage can never linger. The XPath session scrape is
+        // skipped: against an authoritative JSON answer it could only
+        // resurrect a stale value.
+        if account.weeklyOnlyConfirmed {
             if let reading = account.badgeReading() {
                 let text = "\(reading.percentage)%"
+                account.badgeShowsWeekly = true
                 setBadgeTitle(text, reason: "model weekly (no session window)",
                               style: singleAccountBadgeStyle(for: account, text: text))
                 UserDefaults.standard.set(reading.percentage, forKey: badgeKey)
             } else {
+                account.badgeShowsWeekly = false
                 UserDefaults.standard.removeObject(forKey: badgeKey)
                 setBadgeTitle("\u{2014}%", reason: "no session or weekly window in model")
             }
@@ -1053,9 +1057,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // Re-check guards on the JS callback — popover state may have changed.
             guard self.showMenuBarBadge, self.popover?.isShown != true else { return }
             if let pct = result as? Int {
+                account.badgeShowsWeekly = false
                 self.setBadgeTitle("\(pct)%", reason: "XPath fallback scrape",
                                    style: self.singleAccountBadgeStyle(for: account, text: "\(pct)%"))
                 UserDefaults.standard.set(pct, forKey: badgeKey)
+            } else if account.latestSectionsPath == "dom", account.sessionWindowAbsent,
+                      let weekly = account.weeklyPercentage(from: account.latestSections) {
+                // DOM sections without a session meter and no session text on
+                // the page either: the plan has no session window.
+                account.badgeShowsWeekly = true
+                self.setBadgeTitle("\(weekly)%", reason: "model weekly (DOM, no session window)",
+                                   style: self.singleAccountBadgeStyle(for: account, text: "\(weekly)%"))
+                UserDefaults.standard.set(weekly, forKey: badgeKey)
             } else if self.statusItem.button?.title.isEmpty == true {
                 self.setBadgeTitle("\u{2014}%", reason: "XPath fallback returned nil")
             }
@@ -1074,7 +1087,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         // A plan without a session window: say so, with weekly figures.
-        if let account = accounts.first, account.hasNoSessionWindow {
+        if let account = accounts.first, account.badgeShowsWeekly {
             button.toolTip = weeklyOnlyTooltipLines(for: account, name: nil).joined(separator: "\n")
             return
         }
@@ -1654,15 +1667,17 @@ extension AppDelegate {
             if account.isSignedOut { continue }
             if let reading = account.badgeReading() {
                 badgeSideText[id] = "\(reading.percentage)%"
+                account.badgeShowsWeekly = reading.source == .weekly
                 UserDefaults.standard.set(reading.percentage, forKey: account.lastBadgePercentageKey)
                 freshSides += 1
                 if reading.source == .weekly { weeklySides += 1 }
                 continue
             }
-            // No session and no weekly window in a successful fetch: never
+            // Confirmed weekly-only plan without a weekly window either: never
             // keep (or scrape back) an old session value.
-            if account.hasNoSessionWindow {
+            if account.weeklyOnlyConfirmed {
                 badgeSideText[id] = "\u{2014}%"
+                account.badgeShowsWeekly = false
                 UserDefaults.standard.removeObject(forKey: account.lastBadgePercentageKey)
                 continue
             }
@@ -1671,10 +1686,19 @@ extension AppDelegate {
             account.webView.evaluateJavaScript(Self.scrapeSessionPercentageJS) { [weak self, weak account] result, _ in
                 guard let self = self, let account = account, !account.isSignedOut,
                       self.showMenuBarBadge, self.popover?.isShown != true,
-                      self.accounts.count >= 2, let pct = result as? Int else { return }
-                self.badgeSideText[account.id] = "\(pct)%"
-                UserDefaults.standard.set(pct, forKey: account.lastBadgePercentageKey)
-                self.renderMultiAccountBadge(reason: "XPath fallback scrape")
+                      self.accounts.count >= 2 else { return }
+                if let pct = result as? Int {
+                    account.badgeShowsWeekly = false
+                    self.badgeSideText[account.id] = "\(pct)%"
+                    UserDefaults.standard.set(pct, forKey: account.lastBadgePercentageKey)
+                    self.renderMultiAccountBadge(reason: "XPath fallback scrape")
+                } else if account.latestSectionsPath == "dom", account.sessionWindowAbsent,
+                          let weekly = account.weeklyPercentage(from: account.latestSections) {
+                    account.badgeShowsWeekly = true
+                    self.badgeSideText[account.id] = "\(weekly)%"
+                    UserDefaults.standard.set(weekly, forKey: account.lastBadgePercentageKey)
+                    self.renderMultiAccountBadge(reason: "model weekly (DOM, no session window)")
+                }
             }
         }
         // freshSides counts sides read from their account's latest fetched
@@ -1786,7 +1810,7 @@ extension AppDelegate {
                 lines.append("\(name): signed out")
                 continue
             }
-            if account.hasNoSessionWindow {
+            if account.badgeShowsWeekly {
                 lines.append(contentsOf: weeklyOnlyTooltipLines(for: account, name: name))
                 continue
             }
@@ -2032,7 +2056,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     private var signedOutProbeTimer: Timer?
     private var pageRetryUsed = false
     private var lastSignInConfirmAt: Date?
-    private var pinnedTierRefreshed = false
+    private var tierKindRefreshedThisLaunch = false
     static let signedOutProbeInterval: TimeInterval = 15 * 60
     /// Called once when the login window closes: true after a verified
     /// sign-in, false when the user closed it first.
@@ -2721,25 +2745,50 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// Which window the badge shows for this account.
     enum BadgeSource { case session, weekly }
 
-    /// True when the latest successful fetch (latestSections only changes on
-    /// success) has no session window, as on plans without a five-hour
-    /// limit. Failed fetches never change this.
-    var hasNoSessionWindow: Bool {
+    /// Fetch path ("json" or "dom") that produced latestSections. Only a
+    /// JSON response is authoritative about a missing session window; the DOM
+    /// scrape can miss one (label drift), so DOM sections go through the
+    /// XPath session scrape first.
+    private(set) var latestSectionsPath: String?
+    private var weeklyOnlyJSONStreak = 0
+    /// Two consecutive successful JSON fetches without a session window (a
+    /// plan with no five-hour limit). One such fetch is not enough, so a
+    /// transient shape change cannot flip the badge; a fetch with a session
+    /// window clears it at once.
+    private(set) var weeklyOnlyConfirmed = false
+    /// The badge side currently shows this account's weekly window (tooltip,
+    /// VoiceOver and the activity dot follow it).
+    var badgeShowsWeekly = false
+
+    /// The latest successful fetch has sections but no session window.
+    var sessionWindowAbsent: Bool {
         !latestSections.isEmpty && sessionPercentage(from: latestSections) == nil
     }
 
+    /// Called by distributeFetchResult for every successful (non-empty) fetch.
+    func noteFetchedSections(_ sections: [UsageSection], path: String) {
+        latestSectionsPath = path
+        if sessionPercentage(from: sections) != nil {
+            weeklyOnlyJSONStreak = 0
+            weeklyOnlyConfirmed = false
+        } else if path == "json" {
+            weeklyOnlyJSONStreak += 1
+            if weeklyOnlyJSONStreak >= 2 { weeklyOnlyConfirmed = true }
+        }
+    }
+
     /// The badge reading from the latest successful fetch: the session
-    /// window, or, when that fetch had none, the weekly window.
+    /// window, or, once a weekly-only plan is confirmed, the weekly window.
     func badgeReading() -> (percentage: Int, source: BadgeSource)? {
         if let session = sessionPercentage(from: latestSections) { return (session, .session) }
-        if hasNoSessionWindow, let weekly = weeklyPercentage(from: latestSections) { return (weekly, .weekly) }
+        if weeklyOnlyConfirmed, let weekly = weeklyPercentage(from: latestSections) { return (weekly, .weekly) }
         return nil
     }
 
-    /// Forecast behind the activity dot: the weekly forecast when the badge
+    /// Forecast behind the activity dot: the weekly forecast while the badge
     /// shows the weekly window, else the session forecast.
     var badgeForecast: UsageForecast? {
-        hasNoSessionWindow ? lastWeeklyForecast : lastSessionForecast
+        badgeShowsWeekly ? lastWeeklyForecast : lastSessionForecast
     }
 
     /// Extract the "Current session" percentage from the shared data store.
@@ -2899,6 +2948,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         }
 
         self.consecutiveEmptyScrapes = 0
+        self.noteFetchedSections(sections, path: path)
         self.setSignedOut(false, reason: "fetch succeeded")
         UserDefaults.standard.set(path, forKey: self.lastFetchPathKey)
         NSLog("[ClaudeMeter] distributed \(sections.count) sections via \(path)")
@@ -3231,9 +3281,9 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         let tier = (record.planTier ?? "").lowercased()
         let ravenWithoutKind = tier.contains("raven") && record.planVariant == nil
         if record.orgPinned || (ravenWithoutKind && record.orgUUID != nil) {
-            guard !pinnedTierRefreshed, (record.orgPinned && tier.isEmpty) || ravenWithoutKind,
+            guard !tierKindRefreshedThisLaunch, (record.orgPinned && tier.isEmpty) || ravenWithoutKind,
                   let pinned = record.orgUUID else { return }
-            pinnedTierRefreshed = true
+            tierKindRefreshedThisLaunch = true
             copyCookiesToSession(logCount: false) { [weak self] session in
                 guard let self = self else { session.finishTasksAndInvalidate(); return }
                 self.requestOrgList(session: session, context: "tierRefresh", quiet: true) { [weak self] _, orgs in

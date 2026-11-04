@@ -117,7 +117,7 @@ defaults write "$BUNDLE_ID" accounts.list -string "{\"schema\":1,\"accounts\":[
  {\"id\":\"$U2\",\"displayName\":\"Side\",\"badgeLabel\":\"S\",\"badgeSlot\":\"hidden\",\"orgPinned\":false,\"storeIdentifier\":\"$S2\"},
  {\"id\":\"$U3\",\"displayName\":\"Broken\",\"badgeLabel\":\"B\",\"badgeSlot\":\"hidden\",\"orgPinned\":false}]}"
 
-A="dump,wait:10,dump,seedKeys:1,seedKeys:2,keys:1,keys:2,rename:2:Consulting,addSynthetic:Fourth,wait:6,dump"
+A="dump,waitSignedOut:1:60,waitSignedOut:2:60,wait:1,dump,seedKeys:1,seedKeys:2,keys:1,keys:2,rename:2:Consulting,addSynthetic:Fourth,wait:6,dump"
 A="$A,addThenCancel:Temp,wait:3,dump,signIn:1,wait:3,dump,closeLogin:1,wait:3"
 A="$A,remove:2,wait:6,keys:1,dump,makeOrphanStore,wait:4,sweep,wait:6,done"
 LOG="$LOGDIR/claudemeter.qa.multi.A.log"
@@ -164,7 +164,7 @@ defaults write "$BUNDLE_ID" showMenuBarBadge -bool YES
 defaults write "$BUNDLE_ID" accounts.list -string '{"schema":1,"accounts":[{"id":"primary","displayName":"Personal","badgeLabel":"P","badgeSlot":"left","orgPinned":false}]}'
 
 B="wait:8,inject:0:47,badge,popover"                                    # badge 1, popover 1
-B="$B,addSynthetic:Work,wait:10,badge"                                   # badge 2
+B="$B,addSynthetic:Work,waitSignedOut:1:60,wait:1,badge"                 # badge 2
 B="$B,inject:1:12,badge"                                                 # badge 3
 B="$B,setSlot:1:left,badge"                                              # badge 4
 B="$B,setSlot:0:right,badge"                                             # badge 5
@@ -267,28 +267,32 @@ defaults write "$BUNDLE_ID" showMenuBarBadge -bool YES
 defaults write "$BUNDLE_ID" lastBadgePercentage.primary -int 2
 defaults write "$BUNDLE_ID" accounts.list -string '{"schema":1,"accounts":[{"id":"primary","displayName":"Personal","badgeLabel":"P","badgeSlot":"left","orgPinned":false,"planTier":"default_claude_max_20x","colorKey":"blue"}]}'
 D="wait:8,badge"                                             # badge 1: stale cached 2%
-D="$D,injectWeekly:0:96,badge,dump"                          # badge 2, dump 1
-D="$D,forecastWeekly:0:3,badge"                              # badge 3: weekly forecast -> gold
-D="$D,forecast:0:20,badge"                                   # badge 4: session forecast ignored -> still gold
+D="$D,injectWeekly:0:96,badge"                               # badge 2: one weekly-only fetch, no switch yet
+D="$D,injectWeekly:0:96,badge,dump"                          # badge 3: second fetch, switch; dump 1
+D="$D,forecastWeekly:0:3,badge"                              # badge 4: weekly forecast -> gold
+D="$D,forecast:0:20,badge"                                   # badge 5: session forecast ignored -> still gold
 D="$D,renderPopover:weekly-only"
-D="$D,inject:0:47,forecast:0:20,badge"                       # badge 5: session window back -> crimson
-D="$D,injectWeekly:0:96,addSynthetic:Work,wait:10,inject:1:12,badge"   # badge 6: P 96% | W 12%
+D="$D,inject:0:47,forecast:0:20,badge"                       # badge 6: session window back -> crimson, immediately
+D="$D,injectWeeklyDOM:0:88,wait:2,badge"                     # badge 7: DOM weekly-only: XPath first (nil here), then weekly
+D="$D,injectWeekly:0:96,injectWeekly:0:96,addSynthetic:Work,waitSignedOut:1:60,inject:1:12,badge"   # badge 8: P 96% | W 12%
 D="$D,done"
 LOG="$LOGDIR/claudemeter.qa.multi.D.log"
 run_app "$LOG" "$D"
 log "log: $LOG"
-for i in 1 2 3 4 5 6; do log "  badge $i: '$(badge $i)'  $(bstyle $i)"; done
+for i in 1 2 3 4 5 6 7 8; do log "  badge $i: '$(badge $i)'  $(bstyle $i)"; done
 check "D finished" 'grep -q QA-DONE "$LOG"'
 check "stale cached session value shown before the first fetch" '[ "$(badge 1)" = "2%" ]'
-check "weekly-only fetch: badge shows weekly 96%, logged as weekly" '[ "$(badge 2)" = "96%" ] && L | grep -q "badge title: .2%. -> .96%. (model weekly (no session window))"'
-check "weekly-only fetch replaces the stale cached value" 'dump 1 | grep -q "name=Personal .* cachedBadge=96 noSession=true"'
-check "no XPath session scrape for a weekly-only account" '! L | awk "/QA-ACTION injectWeekly:0:96/{on=1} /QA-ACTION inject:0:47/{on=0} on" | grep -q "falling back to XPath"'
-check "activity dot follows the weekly forecast" 'bstyle 3 | grep -q "dots=\[\"gold\"\] dotViews=1"'
-check "session forecast ignored while weekly-only" 'bstyle 4 | grep -q "dots=\[\"gold\"\] dotViews=1"'
-check "VoiceOver says weekly, no session limit" 'nth badge 3 | grep -q "QA-BADGEA11Y .Claude usage weekly 96 percent, no session limit on this plan, rising."'
-check "tooltip says weekly, no session limit" 'nth badge 3 | grep -q "QA-TOOLTIP .weekly 96% · no session limit on this plan"'
-check "session window back: session value and session forecast" '[ "$(badge 5)" = "47%" ] && bstyle 5 | grep -q "dots=\[\"crimson\"\]"'
-check "two accounts: weekly-only side shows weekly %" '[ "$(badge 6)" = "P 96% | W 12%" ] && nth badge 6 | grep -q "QA-TOOLTIP .Personal: weekly 96% · no session limit on this plan"'
+check "one weekly-only fetch does not switch yet (hysteresis), cache kept" '[ "$(badge 2)" = "2%" ]'
+check "second weekly-only fetch: badge shows weekly 96%, logged as weekly" '[ "$(badge 3)" = "96%" ] && L | grep -q "badge title: .2%. -> .96%. (model weekly (no session window))"'
+check "weekly-only fetch replaces the stale cached value" 'dump 1 | grep -q "name=Personal .* cachedBadge=96 weeklyOnly=true showsWeekly=true"'
+check "no XPath session scrape once weekly-only is confirmed" '! L | awk "/QA-ACTION forecastWeekly:0:3/{on=1} /QA-ACTION inject:0:47/{on=0} on" | grep -q "falling back to XPath"'
+check "activity dot follows the weekly forecast" 'bstyle 4 | grep -q "dots=\[\"gold\"\] dotViews=1"'
+check "session forecast ignored while weekly-only" 'bstyle 5 | grep -q "dots=\[\"gold\"\] dotViews=1"'
+check "VoiceOver says weekly, no session limit" 'nth badge 4 | grep -q "QA-BADGEA11Y .Claude usage weekly 96 percent, no session limit on this plan, rising."'
+check "tooltip says weekly, no session limit" 'nth badge 4 | grep -q "QA-TOOLTIP .weekly 96% · no session limit on this plan"'
+check "session window back at once: session value and session forecast" '[ "$(badge 6)" = "47%" ] && bstyle 6 | grep -q "dots=\[\"crimson\"\]"'
+check "DOM weekly-only: XPath scrape first, then the weekly value" '[ "$(badge 7)" = "88%" ] && L | grep -q "(model weekly (DOM, no session window))" && L | awk "/QA-ACTION injectWeeklyDOM/{on=1} /QA-ACTION badge/{if(on)exit} on" | grep -q "falling back to XPath"'
+check "two accounts: weekly-only side shows weekly %" '[ "$(badge 8)" = "P 96% | W 12%" ] && nth badge 8 | grep -q "QA-TOOLTIP .Personal: weekly 96% · no session limit on this plan"'
 check "popover render of a weekly-only account written" '[ -s "$SHOTDIR/weekly-only-popover.png" ]'
 check "D: no secret-looking values logged" '! grep -qiE "sessionKey=|Bearer |@[a-z0-9.-]+\.[a-z]{2,}" "$LOG"'
 

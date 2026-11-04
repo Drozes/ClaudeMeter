@@ -57,17 +57,19 @@ if (fixtureName === "json") {
     const normalize = (r) => {
         const session = [];
         const weekly = [];
-        const s = r.five_hour || r.session;
-        if (s) session.push({ label: s.label || "Current session", percentage: pct(s), detail: detail(s) });
-        const w = r.seven_day || r.weekly;
-        if (w) weekly.push({ label: w.label || "Weekly usage", percentage: pct(w), detail: detail(w) });
+        // `??` like Swift's optional fallback: only null/undefined fall back
+        // (an empty-string label stays empty, as in Swift).
+        const s = r.five_hour ?? r.session;
+        if (s) session.push({ label: s.label ?? "Current session", percentage: pct(s), detail: detail(s) });
+        const w = r.seven_day ?? r.weekly;
+        if (w) weekly.push({ label: w.label ?? "Weekly usage", percentage: pct(w), detail: detail(w) });
         for (const [model, win] of [["Opus", r.seven_day_opus], ["Sonnet", r.seven_day_sonnet]]) {
             if (win) weekly.push({ label: `Weekly ${model} usage`, percentage: pct(win), detail: detail(win) });
         }
         if (Array.isArray(r.per_model)) {
             for (const pm of r.per_model) {
-                const model = pm.model || "";
-                const baseLabel = pm.label || (model ? `Weekly ${model} usage` : "Weekly");
+                const model = pm.model ?? "";
+                const baseLabel = pm.label ?? (model ? `Weekly ${model} usage` : "Weekly");
                 weekly.push({ label: baseLabel, percentage: pct(pm), detail: detail(pm) });
             }
         }
