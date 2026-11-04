@@ -55,7 +55,10 @@ while :; do
     fi
 
     text=$("$OCR" "$SHOT" 2>/dev/null | tr '\n' ' ' | tr -s ' ')
-    badge=$(echo "$text" | grep -oE '[0-9]+%|—%|--%' | head -1)
+    # Whole badge in any of its three forms: "47%", "W 47%", "P 47% | W 12%"
+    # (a side may read "--" or "—%"; OCR may read "|" as "I" or "l").
+    side='([0-9]+%|—%|--%?)'
+    badge=$(echo "$text" | grep -oE "([A-Za-z0-9]{1,3} )?${side}( ?[|Il] ?[A-Za-z0-9]{1,3} ${side})?" | head -1)
     badge="${badge:-?}"
 
     printf '{"ts":"%s","badge":"%s","ocr":"%s"}\n' \

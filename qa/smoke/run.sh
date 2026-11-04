@@ -7,9 +7,11 @@
 # OCR of the actual menu bar is a supplementary check — Macs with notches
 # often hide status items, making OCR unreliable as a primary signal.
 #
-# Requires Claude Desktop signed in (the app imports cookies from there). On a
-# machine without it, the badge will stay at "—%" or "—%"-only changes will
-# show up, and this test will FAIL with a clear auth-missing message.
+# Requires a claude.ai session in the QA bundle's own WebKit store: QA
+# launches pass -skipDesktopImport YES (no Claude Desktop import, so no
+# Keychain prompt) and -suppressAutoLoginWindow YES. Without a session the
+# primary account shows signed out and this test times out. One-time setup
+# is described in qa/README.md (L3 Smoke).
 
 set -uo pipefail
 
@@ -24,8 +26,11 @@ TIMEOUT="${CLAUDEMETER_QA_TIMEOUT:-45}"
 
 log() { printf '[L3] %s\n' "$*" >&2; }
 
-# 1. Make sure binary is built and current.
-if [ ! -x "$BIN" ] || [ "$QA_DIR/../ClaudeMeter.swift" -nt "$BIN" ]; then
+# 1. Make sure binary is built and current. L0 also wraps it in a minimal
+#    .app bundle (UNUserNotificationCenter needs one); launch that copy.
+LAUNCH="$BIN.app/Contents/MacOS/$(basename "$BIN")"
+if [ ! -x "$BIN" ] || [ ! -x "$LAUNCH" ] || [ "$QA_DIR/../ClaudeMeter.swift" -nt "$BIN" ] \
+    || [ "$BIN" -nt "$LAUNCH" ]; then
     log "binary stale or missing — rebuilding via L0"
     "$QA_DIR/build.sh" >/dev/null || { log "FAIL: L0 build failed"; exit 1; }
 fi
@@ -37,15 +42,28 @@ if [ ! -x "$OCR" ] || [ "$SMOKE_DIR/ocr.swift" -nt "$OCR" ]; then
         || log "warn: OCR helper compile failed (supplementary check will be skipped)"
 fi
 
-# 3. Tear down any prior ClaudeMeter so we're observing OUR process.
-pkill -x ClaudeMeter 2>/dev/null || true
+# 3. Tear down any prior QA instance so we're observing OUR process. Only the
+#    QA binary (ClaudeMeter.qa) is stopped: the installed ClaudeMeter keeps
+#    running (its own bundle ID, prefs and support folder; the badge check
+#    reads this process's stderr). The EXIT trap stops our own process.
 pkill -f "$(basename "$BIN")" 2>/dev/null || true
 sleep 0.5
 
 # 4. Launch with badge forced ON (NSArgumentDomain override).
-log "launching $BIN with -showMenuBarBadge YES"
+#    -declinedMoveToApplications YES suppresses the modal "Move to
+#    Applications?" alert that a bundled copy outside /Applications triggers.
+#    -lastBadgePercentage 0 and -lastBadgePercentage.primary 0 (the v2.7.1
+#    key and its per-account successor) blank the cached badge value the QA
+#    bundle's own prefs domain kept from an earlier run, so the launch-time
+#    restore shows the placeholder instead of an old percentage.
+log "launching $LAUNCH with -showMenuBarBadge YES"
 : > "$STDERR"
-"$BIN" -showMenuBarBadge YES >"$STDOUT" 2>"$STDERR" &
+#    -skipDesktopImport / -suppressAutoLoginWindow: no Claude Desktop import,
+#    so no Keychain prompt; the QA bundle's own WebKit store must already hold
+#    a claude.ai session (see qa/README.md for the one-time sign-in).
+"$LAUNCH" -showMenuBarBadge YES -declinedMoveToApplications YES \
+    -skipDesktopImport YES -suppressAutoLoginWindow YES \
+    -lastBadgePercentage 0 -lastBadgePercentage.primary 0 >"$STDOUT" 2>"$STDERR" &
 PID=$!
 
 cleanup() {
@@ -56,7 +74,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 5. Poll: tail stderr for "badge title: '...' -> '<digits>%'".
+# 5. Poll: tail stderr for "badge title: '...' -> '<badge>'" where <badge> is
+#    one of the three badge forms below. Badge labels are 1 to 3 characters
+#    with no whitespace, "|", "%" or "'" (the app enforces this; see
+#    AccountRecord.sanitizeBadgeLabel). Multi-code-point emoji labels may
+#    exceed {1,3}; L3 itself runs with one account (no label).
+SIDE="([0-9]+%|--|$(printf '\342\200\224')%)"
+LABEL="[^ |']{1,3}"
+BADGE_FORM="([0-9]+%|${LABEL} ${SIDE}( \| ${LABEL} ${SIDE})?)"
 #    A real percentage (not "—%", not "") in the *target* of the transition
 #    proves the data pipeline reached the badge writer.
 log "watching stderr for ${TIMEOUT}s for a real percentage badge update"
@@ -76,11 +101,19 @@ while :; do
         exit 1
     fi
 
-    # Look for an arrow target that's a real percentage.
-    # Match: badge title: '<anything>' -> '<digits>%' (
-    if grep -qE "badge title: '[^']*' -> '[0-9]+%'" "$STDERR" 2>/dev/null; then
-        line=$(grep -E "badge title: '[^']*' -> '[0-9]+%'" "$STDERR" | tail -1)
-        badge=$(echo "$line" | sed -E "s/.*-> '([0-9]+%)'.*/\1/")
+    # Look for an arrow target that is one of the three badge forms with at
+    # least one real percentage:
+    #   one account:            '47%'
+    #   one slot, 2+ accounts:  'W 47%'
+    #   both slots:             'P 47% | W 12%'   (a side may read '--' or '—%')
+    # Transitions with reason "applyBadgeVisibility cached=" (launch restore)
+    # or "multi: cached sides only" (no side fresh from the model) are
+    # excluded: they prove nothing about fetching.
+    line=$(grep -E "badge title: '[^']*' -> '${BADGE_FORM}' \(" "$STDERR" 2>/dev/null \
+        | grep -E -e "-> '[^']*[0-9]+%" \
+        | grep -v -e "(applyBadgeVisibility cached=" -e "(multi: cached sides only)" | tail -1)
+    if [ -n "$line" ]; then
+        badge=$(echo "$line" | sed -E "s/.*-> '([^']*)' \(.*/\1/")
         log "PASS: badge updated to $badge"
         log "  log line: $(echo "$line" | sed 's/.*\[ClaudeMeter\]/  [ClaudeMeter]/')"
 

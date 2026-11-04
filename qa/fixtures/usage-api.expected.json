@@ -1,11 +1,23 @@
 {
   "normalizeJSONResponse": {
     "minMeters": 3,
-    "requireLabels": ["current session", "weekly", "opus"],
-    "requirePercentages": [47, 23, 12]
+    "requireLabels": [
+      "current session",
+      "weekly",
+      "opus"
+    ],
+    "requirePercentages": [
+      47,
+      23,
+      12
+    ]
   },
   "sessionPercentageFromModel": {
     "expected": 47,
     "matchLabelContains": "current session"
+  },
+  "badgeChoice": {
+    "source": "session",
+    "percentage": 47
   }
 }

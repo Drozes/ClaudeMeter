@@ -1,0 +1,28 @@
+{
+  "_comment": "Synthetic, current schema: five_hour maps to the \"Current session\" meter, seven_day to \"Weekly usage\", seven_day_opus to \"Weekly Opus usage\".",
+  "normalizeJSONResponse": {
+    "minMeters": 3,
+    "requireLabels": [
+      "current session",
+      "weekly usage",
+      "weekly opus usage"
+    ],
+    "requireSectionTitles": [
+      "Session limit",
+      "Weekly limit"
+    ],
+    "requirePercentages": [
+      47,
+      23,
+      12
+    ]
+  },
+  "sessionPercentageFromModel": {
+    "expected": 47,
+    "matchLabelContains": "current session"
+  },
+  "badgeChoice": {
+    "source": "session",
+    "percentage": 47
+  }
+}

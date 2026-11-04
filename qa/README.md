@@ -81,6 +81,46 @@ Compiles `ClaudeMeter.swift` with `swiftc`, launches the binary, waits 4s, and
 verifies the process is still alive. Catches compile errors and crash-on-launch
 regressions (e.g., a force-unwrap on a nil cookie).
 
+The binary is launched from a minimal `.app` bundle written next to it
+(`$CLAUDEMETER_QA_BIN.app`, bundle ID `com.local.ClaudeMeter.qa`). Since v2.4
+the app calls `UNUserNotificationCenter.current()` at launch, which throws
+`bundleProxyForCurrentProcess is nil` for an unbundled executable. The distinct
+bundle ID keeps QA runs out of the installed app's preferences domain. Both
+L0 and L3 pass `-declinedMoveToApplications YES` so a bundled copy outside
+`/Applications` never shows the modal "Move to Applications?" alert (which
+would block the main thread and, if accepted, copy the QA bundle into
+`/Applications`). L3 launches the same bundled copy.
+
+Isolation from the installed app, and what L0 really touches:
+
+- **Preferences:** the QA bundle has its own domain (`com.local.ClaudeMeter.qa`),
+  separate from the installed app's `com.local.ClaudeMeter`. Values persist in
+  that domain between QA runs; L3 passes `-lastBadgePercentage 0` and
+  `-lastBadgePercentage.primary 0` (v2.7.1 key and per-account key) so a cached
+  badge from an earlier run cannot be mistaken for a fresh fetch, and the L3
+  pass regex ignores `applyBadgeVisibility cached=` transitions for the same
+  reason.
+- **Application Support:** the app derives its support subfolder from its
+  bundle ID. The installed app (and unbundled binaries) keep
+  `~/Library/Application Support/ClaudeMeter/`; the QA bundle uses
+  `~/Library/Application Support/com.local.ClaudeMeter.qa/`, so QA runs never
+  read, migrate or overwrite the real history files.
+- **No Keychain access:** every QA launcher (L0, L3, the multi-account test)
+  passes `-skipDesktopImport YES -suppressAutoLoginWindow YES`. The app then
+  never reads Claude Desktop's cookie database or the "Claude Safe Storage"
+  Keychain item. (Each rebuilt QA binary is ad-hoc signed with a new code
+  hash, so that read would raise a fresh Keychain prompt on every run, even
+  after "Always Allow".) The primary account uses whatever claude.ai session
+  the QA bundle's own WebKit store already holds, and when it has none the
+  app shows it as signed out instead of opening a login window. Both
+  switches default to off; the installed app behaves exactly as before.
+  QA never touches any `Claude Code-credentials*` Keychain item.
+- **Real side effects:** a QA launch is still a real app run: it makes real
+  requests to claude.ai with the QA bundle's own session (if any) and keeps
+  cookies in the QA bundle's own WebKit website data store.
+- `build.sh` refuses to replace a bundle under `/Applications` or
+  `~/Applications`, or one named `ClaudeMeter.app`.
+
 ### L1 Static audit ([static-audit.sh](static-audit.sh))
 Greps the Swift source for known fragile patterns. Specifically enforces:
 - Both `scrapeUsageJS` and `scrapeSessionPercentageJS` exist (defense in depth)
@@ -107,8 +147,21 @@ percentage, and OCRs the menu bar via Apple's Vision framework
 end-to-end test that would have caught today's "badge stuck" bug
 *at the user-visible layer*.
 
-Requires Claude Desktop signed in (the app imports cookies from there).
-Won't work on a fresh machine or in CI without seeded auth.
+Requires a claude.ai session in the QA bundle's own WebKit store
+(`~/Library/WebKit/com.local.ClaudeMeter.qa`), because QA launches skip the
+Claude Desktop import (no Keychain prompt) and never auto-open a login window.
+Without a session L3 times out with the primary account signed out. One-time
+setup, either:
+
+- sign in by hand once (no Keychain access):
+  `/tmp/ClaudeMeter.qa.app/Contents/MacOS/ClaudeMeter.qa -declinedMoveToApplications YES -skipDesktopImport YES`
+  then right-click the QA menu-bar icon → Sign In…, sign in, and quit; or
+- import from Claude Desktop once (one Keychain prompt; choose Allow):
+  run the same command without `-skipDesktopImport YES`, wait for the badge,
+  and quit.
+
+The session persists across rebuilds because the store belongs to the bundle
+ID, not the binary. Won't work in CI without seeded auth.
 
 ### L4 Drift ([drift/watch.sh](drift/watch.sh))
 Long-running. Samples the badge every 5 minutes (configurable), logs each
@@ -117,6 +170,66 @@ same value for 12 consecutive samples (i.e., 1 hour without an update). This
 is exactly the failure mode that prompted this whole pipeline.
 
 Install as a launchd agent via [drift/com.claudemeter.qa.drift.plist](drift/com.claudemeter.qa.drift.plist).
+
+## Multi-account flow test ([multiaccount/run.sh](multiaccount/run.sh))
+
+Not part of `qa.sh` (about 20 minutes; it briefly opens login windows and the
+popover; run it on an idle machine, since its timing checks assume a normal
+load). Builds `ClaudeMeter.swift` together with
+[multiaccount/testhooks.swift](multiaccount/testhooks.swift) using
+`-D CLAUDEMETER_TESTHOOKS` (release builds never include the hooks), into an
+isolated bundle `com.local.ClaudeMeter.qa.multi` with its own prefs domain,
+Application Support folder and WebKit stores, and runs these scenarios through
+the real code paths:
+
+- **A, accounts:** three seeded accounts (the real primary plus two
+  secondaries on empty isolated stores): API-confirmed signed-out detection
+  without auto-opened windows, the Accounts menu (including Badge Position
+  and Badge Label), staggered timers, rename, add, cancelled add, a requested
+  login window, removal (record, exact-ID keys, history file, WebKit store),
+  and the orphaned-store sweep.
+- **B, badge and popover:** one account (`47%`, popover is the usage view
+  itself), two accounts (`P 47% | W --`, `P 47% | W 12%`), slot reassignment
+  moving the occupant to Hidden (`W 12%`), right-then-left order, both slots
+  hidden (falls back to the primary account), a custom label, a signed-out
+  side (`--`), three accounts stacked in the popover with the popover sized
+  to their sum, and back to one account.
+- **C, activity dot and colours**, and **D, weekly-only plans**: the burn-rate
+  dot, account colours, and the badge, tooltip and dot for a plan that
+  reports only a weekly window (with the two-fetch hysteresis), all on
+  synthetic data.
+- **E, background behaviour** (needs the L0/L3 QA bundle's own session): runs
+  the hooks build as `com.local.ClaudeMeter.qa` with `-skipDesktopImport YES`
+  and the badge at 30 s, popover closed. It checks that the primary account
+  fetches on its timer, that its hidden page stays parked (no page loads, no
+  page scripts), and that a simulated sleep, display sleep and screen lock
+  each stop the timers with no fetch while paused and exactly one fetch
+  afterwards. The lock test posts a QA-only alias of the lock notification
+  while the app's distributed notifications are suspended, as for an
+  inactive app. Opening the popover ends a lock pause, and the paused-state
+  safety check clears a stale reason. It logs counters only; that bundle is
+  not cleaned up.
+- **F, DOM fallback** (same bundle and session): opening the JSON circuit
+  loads the page and runs page scripts, reloads of a page that left the usage
+  page are rate-limited, and the circuit's auto-reset brings JSON back and
+  parks the page again.
+- **G, signed-out primary** (isolated bundle, no session, sign-in window
+  allowed to open by itself): the window opens once, is never brought
+  forward again, the DOM path does not reload the page every tick, a closed
+  window is not reopened by the background, and the circuit's auto-reset
+  still runs.
+
+Scenario A also checks that cookie write-back stays in each account's own
+store (the hook logs cookie counts, never names or values).
+
+It cleans up the test domain and folders afterwards (not the QA bundle that
+E uses; `--keep` leaves them). Like L0/L3 it skips the Claude Desktop import
+(no Keychain access). Outside E and F the primary account has no session
+and is shown signed out, and the badge and popover checks feed it synthetic
+data.
+
+The L3 smoke regex and the L4 OCR accept all three badge forms: `47%`,
+`W 47%` and `P 47% | W 12%` (a side may read `--`).
 
 ## Environment variables
 

@@ -1,0 +1,24 @@
+{
+  "_comment": "Synthetic, scrubbed: a plan with no five-hour session window (five_hour null), as Max plans now return. The badge must use the weekly window.",
+  "normalizeJSONResponse": {
+    "minMeters": 2,
+    "requireLabels": [
+      "weekly usage",
+      "sonnet"
+    ],
+    "forbidLabels": [
+      "current session"
+    ],
+    "requireSectionTitles": [
+      "Weekly limit"
+    ],
+    "requirePercentages": [
+      96,
+      3
+    ]
+  },
+  "badgeChoice": {
+    "source": "weekly",
+    "percentage": 96
+  }
+}

@@ -15,10 +15,42 @@ struct ClaudeMeterApp {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate, NSPopoverDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
-    var webView: WKWebView!
+    // Per-account metering engines (WKWebView, timers, fetch state, history).
+    // The first is always the primary (default-store) account that the
+    // Claude Desktop import feeds; secondary accounts follow (macOS 14+).
+    var accounts: [AccountController] = []
+    // Accounts being added: kept alive until their sign-in completes or is
+    // cancelled, but not metered or saved yet.
+    var pendingAccounts: [AccountController] = []
+    var signInMenuItem: NSMenuItem?
+    var importMenuItem: NSMenuItem?
+    var accountsMenuItems: [NSMenuItem] = []
+    // Saved accounts that cannot run (missing/invalid store identifier).
+    var unavailableRecords: [AccountRecord] = []
+    // Why background activity is paused ("sleep", "screens", "session",
+    // "lock") and since when; refresh timers and probes stop while any
+    // reason is present.
+    var pauseReasons: [String: Date] = [:]
+    var activityPaused: Bool { !pauseReasons.isEmpty }
+    // While paused: re-checks the reasons against the system every 15 min
+    // and drops any older than `pauseReasonMaxAge` (a missed wake/unlock
+    // notification must not stop refreshes for good).
+    var pauseSafetyTimer: Timer?
+    static let pauseReasonMaxAge: TimeInterval = 4 * 3600
+    // Two or more accounts: the stacked popover view, each secondary
+    // account's own usage view, and each badge side's last text.
+    var multiAccountView: MultiAccountUsageView?
+    var accountViews: [String: UsageContentView] = [:]
+    var badgeSideText: [String: String] = [:]
+    var badgeWasMulti = false
+    // Badge styling currently applied (nil = plain title) and its dot views.
+    var appliedBadgeStyle: BadgeStyle?
+    var badgeDotViews: [ColorDotView] = []
+    var badgeDotLayoutPending = false
+    var lastBadgeDotBounds: NSRect = .zero
     var usageView: UsageContentView!
     var contextMenu: NSMenu!
 
@@ -32,8 +64,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         let saved = UserDefaults.standard.double(forKey: AppDelegate.refreshIntervalKey)
         return saved > 0 ? saved : 6.0
     }()
-    var refreshTimer: Timer?
-    var lastRefreshDate: Date?
 
     // Menu bar badge
     static let badgeIntervalKey = "badgeRefreshInterval"
@@ -44,8 +74,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         let saved = UserDefaults.standard.double(forKey: AppDelegate.badgeIntervalKey)
         return saved > 0 ? saved : 120.0
     }()
-    // v2.7 — track latest session forecast for the menu-bar tooltip.
-    var lastSessionForecast: UsageForecast?
+    // v2.7: refresh the menu-bar tooltip between scrapes.
     var tooltipRefreshTimer: Timer?
 
     // Update checking
@@ -54,35 +83,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     var checkForUpdatesMenuItem: NSMenuItem?
     var versionMenuItem: NSMenuItem?
     var updateBadgeDot: NSView?
-    var refreshCycleCount: Int = 0
 
-    // Shared data store — populated by every scrape, read by badge and popover
-    var latestSections: [UsageSection] = []
-    var history: UsageHistory = UsageHistory.loadFromDisk()
     var badgeIntervalMenuItem: NSMenuItem?
     var notifier: ThresholdNotifier!
     var notificationsEnabledMenuItem: NSMenuItem?
     var notificationThresholdMenuItems: [NSMenuItem] = []
-
-    // Empty-scrape streak. Transient empties happen during normal page renders
-    // (React mid-update), so a single empty must NOT clear the badge or popover.
-    // Only a sustained streak indicates a real failure (page DOM changed,
-    // network broke, scraper no longer matches).
-    var consecutiveEmptyScrapes: Int = 0
-    static let emptyScrapeFailureThreshold = 3
-
-    // JSON-primary fetch state
-    var cachedOrgUUID: String? = UserDefaults.standard.string(forKey: AppDelegate.cachedOrgUUIDKey)
-    var cachedPlanTier: String? = UserDefaults.standard.string(forKey: AppDelegate.cachedPlanTierKey)
-    var jsonFetchInFlight: Bool = false
-    var jsonConsecutiveFailures: Int = 0
-    var jsonCircuitOpen: Bool = false
-    var jsonCircuitOpenedAt: Date?
-    static let jsonFailureCircuitBreaker = 5
-    // Background WebView is process-suspended when the popover is closed, so a
-    // permanently-open JSON circuit means DOM scrapes return stale page data
-    // until the next ~hourly full reload. Auto-reset gives JSON another shot.
-    static let jsonCircuitResetInterval: TimeInterval = 30 * 60
 
     static let showBadgeKey = "showMenuBarBadge"
     var showMenuBarBadge: Bool = UserDefaults.standard.bool(forKey: AppDelegate.showBadgeKey) {
@@ -100,28 +105,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         didSet {
             UserDefaults.standard.set(showBurnRate, forKey: Self.showBurnRateKey)
             usageView?.showBurnRate = showBurnRate
+            accountViews.values.forEach { $0.showBurnRate = showBurnRate }
         }
     }
     var showSparkline: Bool = AppDelegate.boolPref(key: AppDelegate.showSparklineKey, default: true) {
         didSet {
             UserDefaults.standard.set(showSparkline, forKey: Self.showSparklineKey)
             usageView?.showSparkline = showSparkline
+            accountViews.values.forEach { $0.showSparkline = showSparkline }
+        }
+    }
+    // Activity dot under each shown badge percentage (burn-rate band). Off
+    // means exactly the v2.8 badge.
+    static let showActivityDotKey = "showActivityDot"
+    var showActivityDot: Bool = AppDelegate.boolPref(key: AppDelegate.showActivityDotKey, default: true) {
+        didSet {
+            UserDefaults.standard.set(showActivityDot, forKey: Self.showActivityDotKey)
+            reapplyBadgeStyle(reason: "activity dot \(showActivityDot ? "on" : "off")")
         }
     }
     private static func boolPref(key: String, default defaultValue: Bool) -> Bool {
         if UserDefaults.standard.object(forKey: key) == nil { return defaultValue }
         return UserDefaults.standard.bool(forKey: key)
     }
-
-    // Fallback login window (email/magic-link in WKWebView)
-    var loginWindow: NSWindow?
-    var loginWebView: WKWebView?
-
-    // OAuth popup windows
-    var popupWindows: [NSWindow] = []
-
-    // Track whether we've already tried the desktop import for this launch
-    var hasAttemptedDesktopImport = false
 
     static let safariUA: String = {
         let v = ProcessInfo.processInfo.operatingSystemVersion
@@ -146,11 +152,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     static let apiOrgsURL = URL(string: "https://claude.ai/api/organizations")!
     static let apiUsagePath = "/api/organizations/%@/usage"
     static let forceDOMOnlyKey = "forceDOMOnly"
+    // QA/dev switches, off unless set (QA passes them in the argument
+    // domain). skipDesktopImport: never read Claude Desktop's cookies, so no
+    // "Claude Safe Storage" Keychain access; the primary account uses what
+    // its own WebKit store already holds. suppressAutoLoginWindow: the
+    // primary account does not open its login window on its own when signed
+    // out (it shows signed out, like added accounts).
+    static let skipDesktopImportKey = "skipDesktopImport"
+    static let suppressAutoLoginWindowKey = "suppressAutoLoginWindow"
+    // v2.7.1 global keys, now read only by AccountStore.migrateIfNeeded; the
+    // values live on AccountRecord (org UUID, plan tier).
     static let cachedOrgUUIDKey = "cachedOrgUUID"
     static let cachedPlanTierKey = "cachedPlanTier"
+    // Key families: per-account keys are "<family>.<accountId>" (AccountKeys).
     static let lastFetchPathKey = "lastFetchPath"
+    static let lastBadgePercentageKey = "lastBadgePercentage"
 
-    static func planTierDisplayName(slug: String?) -> String? {
+    static let knownPlanTierSlugs: Set<String> = [
+        "default_claude_free", "default_claude_pro", "default_claude_max_5x",
+        "default_claude_max_20x", "default_claude_team", "default_claude_enterprise",
+    ]
+
+    /// `variant` is the org's Team/Enterprise kind when known (its
+    /// raven_type, or derived from capabilities), used for "raven" tiers,
+    /// Anthropic's internal name for Team/Enterprise seats.
+    static func planTierDisplayName(slug: String?, variant: String? = nil) -> String? {
         guard let s = slug?.lowercased(), !s.isEmpty else { return nil }
         switch s {
         case "default_claude_free":         return "Free"
@@ -160,12 +186,46 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         case "default_claude_team":         return "Team"
         case "default_claude_enterprise":   return "Enterprise"
         default:
-            // Titlecase the stem for unknown future tiers (e.g. max_50x).
-            let stripped = s.replacingOccurrences(of: "default_claude_", with: "")
-            guard !stripped.isEmpty else { return nil }
-            return stripped.prefix(1).uppercased() + stripped.dropFirst()
+            if s.contains("raven") {
+                let v = (variant ?? "").lowercased()
+                if v.contains("enterprise") { return "Enterprise" }
+                if v.contains("team") { return "Team" }
+                return "Work plan"
+            }
+            // Unknown future tiers: a tidy label, never the raw code
+            // ("default_claude_max_50x" -> "Max 50x").
+            var stem = s
+            for prefix in ["default_claude_", "default_", "claude_"] where stem.hasPrefix(prefix) {
+                stem = String(stem.dropFirst(prefix.count))
+            }
+            let words = stem.split(separator: "_").map { $0.prefix(1).uppercased() + $0.dropFirst() }
+            return words.isEmpty ? "Unknown plan" : words.joined(separator: " ")
         }
     }
+
+    /// The Team/Enterprise kind of an org: its raven_type when present,
+    /// else "enterprise" / "team" when a capability names one, else nil.
+    static func planVariant(for org: OrgListResponse.Org) -> String? {
+        if let raven = org.raven_type, !raven.isEmpty { return raven.lowercased() }
+        let caps = (org.capabilities ?? []).map { $0.lowercased() }
+        if caps.contains(where: { $0.contains("enterprise") }) { return "enterprise" }
+        if caps.contains(where: { $0.contains("team") }) { return "team" }
+        return nil
+    }
+
+    /// Logs what an unmapped tier looks like (tier code, variant, capability
+    /// strings), never org names or emails.
+    /// Logs a non-standard tier once per launch per tier code: "raven"
+    /// (Team/Enterprise) tiers as plan-tier detail, anything else as
+    /// unmapped.
+    static func logUnmappedTier(_ org: OrgListResponse.Org, context: String) {
+        let tier = (org.rate_limit_tier ?? "").lowercased()
+        guard !tier.isEmpty, !knownPlanTierSlugs.contains(tier), !loggedPlanTiers.contains(tier) else { return }
+        loggedPlanTiers.insert(tier)
+        let kind = tier.contains("raven") ? "plan tier detail" : "unmapped plan tier"
+        NSLog("%@", "[ClaudeMeter] \(context): \(kind) '\(tier)' raven_type=\(org.raven_type ?? "nil") capabilities=\(org.capabilities ?? []) -> '\(planTierDisplayName(slug: tier, variant: planVariant(for: org)) ?? "nil")'")
+    }
+    private static var loggedPlanTiers = Set<String>()
 
     /// Direct XPath scrape for the "Current session" percentage. Independent
     /// fallback used by the badge when the structured scrape's label-detection
@@ -276,6 +336,148 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
 
     // MARK: - App Lifecycle
 
+    func applicationWillTerminate(_ notification: Notification) {
+        // History writes are throttled; save the latest samples on quit.
+        accounts.forEach { $0.history.persistNow() }
+    }
+
+    /// Low Power Mode or a serious / critical thermal state: the closed-state
+    /// refresh interval is doubled.
+    var reducedPowerMode: Bool {
+        let info = ProcessInfo.processInfo
+        return info.isLowPowerModeEnabled || info.thermalState == .serious || info.thermalState == .critical
+    }
+
+    /// Pauses refresh timers and probes while the Mac sleeps, the displays
+    /// sleep, the screen is locked or the session is switched away, and runs
+    /// one staggered fetch per account when everything is awake again.
+    func installPowerObservers() {
+        let ws = NSWorkspace.shared.notificationCenter
+        let pairs: [(Notification.Name, Notification.Name, String)] = [
+            (NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification, "sleep"),
+            (NSWorkspace.screensDidSleepNotification, NSWorkspace.screensDidWakeNotification, "screens"),
+            (NSWorkspace.sessionDidResignActiveNotification, NSWorkspace.sessionDidBecomeActiveNotification, "session"),
+        ]
+        for (pause, resume, reason) in pairs {
+            ws.addObserver(forName: pause, object: nil, queue: .main) { [weak self] _ in self?.pauseActivity(reason) }
+            ws.addObserver(forName: resume, object: nil, queue: .main) { [weak self] _ in self?.resumeActivity(reason) }
+        }
+        observeLockNotifications(lock: "com.apple.screenIsLocked", unlock: "com.apple.screenIsUnlocked")
+        for name in [Notification.Name.NSProcessInfoPowerStateDidChange, ProcessInfo.thermalStateDidChangeNotification] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.powerModeChanged()
+            }
+        }
+    }
+
+    /// Screen lock and unlock arrive as distributed notifications. An
+    /// accessory app is usually inactive, and Cocoa holds back distributed
+    /// notifications for inactive apps unless they ask for immediate delivery.
+    func observeLockNotifications(lock: String, unlock: String) {
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(self, selector: #selector(screenDidLock(_:)), name: Notification.Name(lock),
+                        object: nil, suspensionBehavior: .deliverImmediately)
+        dnc.addObserver(self, selector: #selector(screenDidUnlock(_:)), name: Notification.Name(unlock),
+                        object: nil, suspensionBehavior: .deliverImmediately)
+    }
+
+    @objc func screenDidLock(_ note: Notification) {
+        DispatchQueue.main.async { self.pauseActivity("lock") }
+    }
+
+    @objc func screenDidUnlock(_ note: Notification) {
+        DispatchQueue.main.async { self.resumeActivity("lock") }
+    }
+
+    func pauseActivity(_ reason: String) {
+        let wasPaused = activityPaused
+        if pauseReasons[reason] == nil { pauseReasons[reason] = Date() }
+        guard !wasPaused else { return }
+        NSLog("%@", "[ClaudeMeter] background activity paused (\(reason))")
+        for account in accounts {
+            account.stopRefreshTimer()
+            account.cancelInFlightRequests()
+            account.history.persistNow()
+        }
+        pauseSafetyTimer?.invalidate()
+        pauseSafetyTimer = Timer.scheduledTimer(withTimeInterval: 15 * 60, repeats: true) { [weak self] _ in
+            self?.reconcilePauseReasons()
+        }
+        pauseSafetyTimer?.tolerance = 60
+    }
+
+    func resumeActivity(_ reason: String) {
+        dropPauseReasons([reason], why: reason)
+    }
+
+    /// Removes pause reasons; when none is left, background activity resumes.
+    func dropPauseReasons(_ reasons: [String], why: String) {
+        let wasPaused = activityPaused
+        for reason in reasons { pauseReasons.removeValue(forKey: reason) }
+        guard wasPaused, !activityPaused else { return }
+        pauseSafetyTimer?.invalidate()
+        pauseSafetyTimer = nil
+        NSLog("%@", "[ClaudeMeter] background activity resumed (\(why))")
+        // Let the network come back first, then one fetch per account
+        // (staggered) and the usual timers.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+            guard let self = self, !self.activityPaused else { return }
+            for account in self.accounts where !(account.isSignedOut && !account.isPrimary) {
+                account.staggered { account.refreshNow(reason: "wake") }
+            }
+            if self.popover?.isShown == true || self.showMenuBarBadge {
+                self.accounts.forEach { $0.startRefreshTimer() }
+            }
+        }
+    }
+
+    /// The user opened the popover, so the screen is awake, unlocked and
+    /// this session is on the console: drop those pause reasons (the
+    /// popover itself refreshes every account).
+    func userIsPresent() {
+        let present = ["screens", "lock", "session"].filter { pauseReasons[$0] != nil }
+        guard !present.isEmpty else { return }
+        let wasPaused = activityPaused
+        present.forEach { pauseReasons.removeValue(forKey: $0) }
+        if wasPaused && !activityPaused {
+            pauseSafetyTimer?.invalidate()
+            pauseSafetyTimer = nil
+            NSLog("%@", "[ClaudeMeter] background activity resumed (popover opened)")
+        }
+    }
+
+    /// Safety net while paused: drops a reason the system no longer reports
+    /// (screen unlocked, session on the console, display awake) and any
+    /// reason older than `pauseReasonMaxAge`. This timer firing at all
+    /// means the Mac is awake.
+    func reconcilePauseReasons(now: Date = Date()) {
+        var stale = pauseReasons.filter { now.timeIntervalSince($0.value) >= Self.pauseReasonMaxAge }.map { $0.key }
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+        if pauseReasons["lock"] != nil, let session = session,
+           (session["CGSSessionScreenIsLocked"] as? Bool ?? false) == false {
+            stale.append("lock")
+        }
+        if pauseReasons["session"] != nil, let session = session,
+           (session[kCGSessionOnConsoleKey as String] as? Bool ?? false) {
+            stale.append("session")
+        }
+        if pauseReasons["screens"] != nil, CGDisplayIsAsleep(CGMainDisplayID()) == 0 {
+            stale.append("screens")
+        }
+        if pauseReasons["sleep"] != nil { stale.append("sleep") }
+        let drop = Array(Set(stale))
+        guard !drop.isEmpty else { return }
+        NSLog("%@", "[ClaudeMeter] pause reasons cleared by safety check: \(drop.sorted().joined(separator: ", "))")
+        dropPauseReasons(drop, why: "safety check")
+    }
+
+    func powerModeChanged() {
+        NSLog("%@", "[ClaudeMeter] power mode changed: reduced=\(reducedPowerMode)")
+        for account in accounts where account.refreshTimer != nil {
+            account.startRefreshTimer()
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
@@ -288,6 +490,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             button.target = self
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
+
+        // Copy v2.7.1's global per-account state into the primary account's
+        // namespace once, before anything reads it.
+        AccountStore.migrateIfNeeded()
 
         setupMenu()
         notifier = ThresholdNotifier()
@@ -304,7 +510,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         // usage JSON path is circuit-broken. Wait long enough for cookies to
         // be imported and the WKWebView to attach them.
         DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
-            self?.refreshPlanTierIfNeeded()
+            self?.accounts.forEach { account in account.staggered { account.refreshPlanTierIfNeeded() } }
+        }
+
+        // Remove WebKit stores no account references (macOS 14+).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            self?.sweepOrphanedDataStores()
         }
 
         // Silent update check after 30s, then every 4 hours
@@ -316,33 +527,44 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         // v2.7 — refresh the menu-bar tooltip every minute so the "at HH:MM"
         // peak time stays current between scrapes.
         tooltipRefreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            self?.updateMenuBarTooltip()
+            guard let self = self, !self.activityPaused else { return }
+            self.updateMenuBarTooltip()
         }
         tooltipRefreshTimer?.tolerance = 10
+        installPowerObservers()
+
+        // Activity dots follow the status button's size and the screen setup.
+        statusItem.button?.postsFrameChangedNotifications = true
+        if let button = statusItem.button {
+            NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification, object: button,
+                                                   queue: .main) { [weak self] _ in self?.relayoutBadgeDotsIfNeeded() }
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil,
+                                               queue: .main) { [weak self] _ in self?.layoutBadgeDots() }
+
+        #if CLAUDEMETER_TESTHOOKS
+        runQATestHooks()   // qa/multiaccount/testhooks.swift; never in release builds
+        #endif
     }
 
     // MARK: - Popover
 
     func setupPopover() {
-        // WKWebView is kept off-screen for data scraping only
-        let config = WKWebViewConfiguration()
-        config.websiteDataStore = .default()
-
-        webView = WKWebView(frame: .zero, configuration: config)
-        webView.navigationDelegate = self
-        webView.uiDelegate = self
-        webView.customUserAgent = Self.safariUA
-
-        // Import cookies and start loading
-        hasAttemptedDesktopImport = true
-        importFromClaudeDesktop { [weak self] success in
-            guard let self = self else { return }
-            self.webView.load(URLRequest(url: Self.usageURL))
-        }
+        // One AccountController per metered account. start() fetches through
+        // the usage API first (the primary account after importing Claude
+        // Desktop cookies; secondary accounts from their own isolated store,
+        // staggered). Each account's off-screen usage page is created only
+        // when needed (sign-in, DOM fallback, keep-alive) and parked again.
+        accounts = makeAccountControllers()
+        normalizeBadgeSlots()
+        persistDerivedAccountColors()
+        let account = accounts[0]
+        accounts.forEach { $0.start() }
 
         // Native popover content, sized to skeleton, auto-resizes on content load.
         usageView = UsageContentView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-        usageView.planTierDisplayName = Self.planTierDisplayName(slug: cachedPlanTier)
+        account.usageView = usageView
+        usageView.planTierDisplayName = account.planDisplayName
         usageView.showBurnRate = showBurnRate
         usageView.showSparkline = showSparkline
         let skeletonH = usageView.skeletonHeight
@@ -359,33 +581,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         popover.animates = true
 
         usageView.onContentSizeChanged = { [weak self] height in
-            guard let self = self else { return }
-            // Use as much of the screen as macOS permits. NSPopover hard-caps
-            // around (visibleFrame - small margin) on its own; we just need to
-            // not under-clamp ahead of it. Floor at 1200 so smaller screens
-            // still get a generously tall popover.
-            let screenMax = (NSScreen.main?.visibleFrame.height ?? 1200) - 40
-            let ceiling = max(1200, screenMax)
-            let clamped = min(max(height, 120), ceiling)
-            let current = self.popover.contentSize.height
-            // Only animate if height changed meaningfully — sub-pixel layout
-            // rounding differences would otherwise cause the popover to flicker.
-            guard abs(clamped - current) > 2 else { return }
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.3
-                ctx.allowsImplicitAnimation = true
-                self.popover.contentSize = NSSize(width: 400, height: clamped)
-            }
+            self?.applyPopoverContentHeight(height)
         }
+
+        badgeWasMulti = accounts.count >= 2
+        rebuildAccountsMenu()
+        rebuildPopoverContent()
     }
 
     // MARK: - Claude Desktop Cookie Import
 
+    /// Claude Desktop's cookies always go to the primary account.
     @objc func importFromDesktop() {
-        importFromClaudeDesktop { [weak self] success in
-            guard let self = self else { return }
+        guard let account = accounts.first else { return }
+        account.importFromClaudeDesktop { success in
             if success {
-                self.webView.load(URLRequest(url: Self.usageURL))
+                account.loadUsagePage(reason: "Claude Desktop import")
             } else {
                 let alert = NSAlert()
                 alert.messageText = "Could not import session"
@@ -396,172 +607,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
     }
 
-    func importFromClaudeDesktop(completion: @escaping (Bool) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let cookies = ClaudeDesktopCookies.extract()
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self, let cookies = cookies, !cookies.isEmpty else {
-                    completion(false)
-                    return
-                }
-                self.injectCookies(cookies) { completion(true) }
-            }
-        }
-    }
-
-    func injectCookies(_ cookies: [HTTPCookie], completion: @escaping () -> Void) {
-        let store = webView.configuration.websiteDataStore.httpCookieStore
-        let group = DispatchGroup()
-        for cookie in cookies {
-            group.enter()
-            store.setCookie(cookie) { group.leave() }
-        }
-        group.notify(queue: .main, execute: completion)
-    }
-
-    // MARK: - Fallback Login Window (email/magic-link)
-
-    func showLoginWindow() {
-        if let window = loginWindow {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
-        }
-
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 640),
-            styleMask: [.titled, .closable, .resizable, .miniaturizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Sign in to Claude"
-        window.center()
-        window.isReleasedWhenClosed = false
-        window.delegate = self
-
-        let loginConfig = WKWebViewConfiguration()
-        loginConfig.websiteDataStore = .default()
-
-        let lw = WKWebView(frame: window.contentView!.bounds, configuration: loginConfig)
-        lw.autoresizingMask = [.width, .height]
-        lw.navigationDelegate = self
-        lw.uiDelegate = self
-        lw.customUserAgent = Self.safariUA
-        lw.load(URLRequest(url: Self.loginURL))
-
-        window.contentView?.addSubview(lw)
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-
-        loginWebView = lw
-        loginWindow = window
-    }
-
-    func closeLoginWindow() {
-        loginWindow?.close()
-        loginWindow = nil
-        loginWebView = nil
-        webView.load(URLRequest(url: Self.usageURL))
-    }
-
-    // MARK: - WKNavigationDelegate
-
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard let url = webView.url?.absoluteString else { return }
-
-        // Popover hit a login page → show login window (desktop import already attempted at startup)
-        if webView === self.webView && isLoginURL(url) {
-            if !hasAttemptedDesktopImport {
-                hasAttemptedDesktopImport = true
-                importFromClaudeDesktop { [weak self] success in
-                    guard let self = self else { return }
-                    if success {
-                        self.webView.load(URLRequest(url: Self.usageURL))
-                    } else {
-                        if self.popover.isShown { self.popover.performClose(nil) }
-                        self.showLoginWindow()
-                    }
-                }
-                return
-            }
-            if popover.isShown { popover.performClose(nil) }
-            showLoginWindow()
-            return
-        }
-
-        // Login WebView reached a non-login page → auth succeeded
-        if webView === loginWebView && url.contains("claude.ai") && !isLoginURL(url) {
-            closeLoginWindow()
-            return
-        }
-
-        if webView === self.webView {
-            lastRefreshDate = Date()
-            usageView?.setStatusFresh(true)
-            // Scrape immediately, then again after React renders
-            scrapeAndDistribute()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                guard let self = self else { return }
-                self.scrapeAndDistribute()
-                // Ensure refresh timer is running after initial page load
-                if self.refreshTimer == nil && (self.popover?.isShown == true || self.showMenuBarBadge) {
-                    self.startRefreshTimer()
-                }
-            }
-        }
-    }
-
-    // MARK: - WKUIDelegate (popup handling for OAuth)
-
-    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
-                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        let popupWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 600),
-            styleMask: [.titled, .closable, .resizable],
-            backing: .buffered, defer: false
-        )
-        popupWindow.title = "Sign In"
-        popupWindow.center()
-        popupWindow.isReleasedWhenClosed = false
-
-        let popupWebView = WKWebView(frame: popupWindow.contentView!.bounds, configuration: configuration)
-        popupWebView.autoresizingMask = [.width, .height]
-        popupWebView.navigationDelegate = self
-        popupWebView.uiDelegate = self
-        popupWebView.customUserAgent = Self.safariUA
-
-        popupWindow.contentView?.addSubview(popupWebView)
-        popupWindow.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        popupWindows.append(popupWindow)
-        return popupWebView
-    }
-
-    func webViewDidClose(_ webView: WKWebView) {
-        guard let window = webView.window else { return }
-        window.close()
-        popupWindows.removeAll { $0 === window }
-    }
-
-    // MARK: - NSWindowDelegate
-
-    func windowWillClose(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow else { return }
-        if window === loginWindow {
-            loginWindow = nil
-            loginWebView = nil
-            webView.load(URLRequest(url: Self.usageURL))
-        }
-        popupWindows.removeAll { $0 === window }
-    }
-
     // MARK: - Menu
 
     func setupMenu() {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Reload", action: #selector(reload), keyEquivalent: "r"))
-        menu.addItem(NSMenuItem(title: "Import from Claude Desktop", action: #selector(importFromDesktop), keyEquivalent: "i"))
-        menu.addItem(NSMenuItem(title: "Sign In\u{2026}", action: #selector(openLogin), keyEquivalent: "l"))
+        let importItem = NSMenuItem(title: "Import from Claude Desktop", action: #selector(importFromDesktop), keyEquivalent: "i")
+        importMenuItem = importItem
+        menu.addItem(importItem)
+        let signIn = NSMenuItem(title: "Sign In\u{2026}", action: #selector(openLogin), keyEquivalent: "l")
+        signInMenuItem = signIn
+        menu.addItem(signIn)
         menu.addItem(NSMenuItem.separator())
 
         let intervalItem = NSMenuItem(title: "Refresh Interval", action: nil, keyEquivalent: "")
@@ -614,6 +670,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         sparklineItem.target = self
         sparklineItem.state = showSparkline ? .on : .off
         menu.addItem(sparklineItem)
+        let activityDotItem = NSMenuItem(title: "Show Activity Dot",
+                                          action: #selector(toggleActivityDot(_:)),
+                                          keyEquivalent: "")
+        activityDotItem.target = self
+        activityDotItem.state = showActivityDot ? .on : .off
+        menu.addItem(activityDotItem)
 
         let notificationsItem = NSMenuItem(title: "Notifications", action: nil, keyEquivalent: "")
         let notificationsSubmenu = NSMenu()
@@ -705,6 +767,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         sender.state = showBurnRate ? .on : .off
     }
 
+    @objc func toggleActivityDot(_ sender: NSMenuItem) {
+        showActivityDot.toggle()
+        sender.state = showActivityDot ? .on : .off
+    }
+
     @objc func toggleSparkline(_ sender: NSMenuItem) {
         showSparkline.toggle()
         sender.state = showSparkline ? .on : .off
@@ -720,9 +787,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
         sender.state = .on
 
-        // Restart timer if active and popover is closed
-        if refreshTimer != nil && popover?.isShown != true {
-            startRefreshTimer()
+        // Restart timers that are active while the popover is closed
+        if popover?.isShown != true {
+            for account in accounts where account.refreshTimer != nil {
+                account.startRefreshTimer()
+            }
         }
     }
 
@@ -737,9 +806,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
         sender.state = .on
 
-        // Restart timer if active and popover is open
-        if refreshTimer != nil && popover?.isShown == true {
-            startRefreshTimer()
+        // Restart timers that are active while the popover is open
+        if popover?.isShown == true {
+            for account in accounts where account.refreshTimer != nil {
+                account.startRefreshTimer()
+            }
         }
     }
 
@@ -757,10 +828,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         if popover.isShown {
             popover.performClose(nil)
         } else {
-            stopRefreshTimer()
-            // Only show skeleton on first open; subsequent opens display
-            // the last known data immediately while refreshing in the background.
-            if usageView?.hasContent != true {
+            userIsPresent()
+            accounts.forEach { $0.stopRefreshTimer() }
+            // Views are not rebuilt while the popover is closed; replay the
+            // latest data before showing it.
+            accounts.forEach { $0.renderLatestIfNeeded() }
+            if accounts.count >= 2 {
+                // Several accounts: skeleton per account without data yet,
+                // then size the popover to all sections.
+                rebuildPopoverContent()
+                for account in accounts where !account.isSignedOut {
+                    let view = usageView(for: account)
+                    if view.hasContent { view.setStatusLoading() } else { view.showLoadingSkeleton() }
+                }
+                if let multi = multiAccountView {
+                    let h = multi.contentHeight
+                    popover.contentSize = NSSize(width: 400, height: min(max(h, 120), max(1200, (NSScreen.main?.visibleFrame.height ?? 1200) - 40)))
+                }
+            } else if usageView?.hasContent != true {
+                // Only show skeleton on first open; subsequent opens display
+                // the last known data immediately while refreshing in the background.
                 usageView?.showLoadingSkeleton()
                 if let h = usageView?.skeletonHeight {
                     popover.contentSize = NSSize(width: 400, height: h)
@@ -768,56 +855,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             } else {
                 usageView?.setStatusLoading()
             }
-            softReload()
+            accounts.forEach { account in account.staggered { account.refreshForPopover() } }
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
-            usageView?.scrollToTop()
-            startRefreshTimer()
-            usageView?.startCountdownTicker()
-        }
-    }
-
-    /// Soft reload: if already on the usage page, click the site's own refresh button.
-    /// Falls back to a full page reload if needed.
-    func softReload() {
-        guard let url = webView.url?.absoluteString, url.contains("/settings/usage") else {
-            gracefulReload()
-            return
-        }
-        usageView?.setStatusLoading()
-        let js = """
-        (function() {
-            var btns = document.querySelectorAll('button');
-            for (var b of btns) {
-                if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
-                    b.closest('[class*="text-xs"]')) {
-                    b.click();
-                    return 'clicked';
-                }
-            }
-            return 'not_found';
-        })()
-        """
-        webView.evaluateJavaScript(js) { [weak self] result, _ in
-            if (result as? String) == "clicked" {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    self?.lastRefreshDate = Date()
-                    self?.scrapeAndDistribute()
-                }
+            if let multi = multiAccountView, accounts.count >= 2 {
+                multi.scrollToTop()
             } else {
-                self?.gracefulReload()
+                usageView?.scrollToTop()
             }
+            accounts.forEach { $0.startRefreshTimer() }
+            activeUsageViews.forEach { $0.startCountdownTicker() }
         }
     }
 
-    /// Full page reload.
-    func gracefulReload() {
-        usageView?.setStatusLoading()
-        webView.load(URLRequest(url: Self.usageURL))
-    }
-
-    @objc func reload() { gracefulReload() }
-    @objc func openLogin() { showLoginWindow() }
+    @objc func reload() { accounts.forEach { $0.gracefulReload() } }
+    @objc func openLogin() { accounts.first?.showLoginWindow() }
     @objc func checkForUpdates() { AppUpdater.checkForUpdates() }
     @objc func quit() { NSApp.terminate(nil) }
 
@@ -876,100 +928,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         updateBadgeDot = dot
     }
 
-    // MARK: - Polling (Unified Adaptive Timer)
-
-    /// The effective refresh interval depends on popover state.
-    var activeRefreshInterval: TimeInterval {
-        if popover?.isShown == true {
-            return statusFreshnessInterval   // fast (6s default)
-        } else {
-            return badgeRefreshInterval       // slow (120s default)
-        }
-    }
-
-    func startRefreshTimer() {
-        refreshTimer?.invalidate()
-        let interval = activeRefreshInterval
-        NSLog("[ClaudeMeter] startRefreshTimer: interval=\(interval)s, popoverOpen=\(popover?.isShown == true)")
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            self?.unifiedRefresh()
-        }
-        refreshTimer?.tolerance = interval * 0.1
-    }
-
-    func stopRefreshTimer() {
-        refreshTimer?.invalidate()
-        refreshTimer = nil
-    }
-
-    /// Unified refresh: clicks the site's refresh button, then scrapes all data.
-    /// Adapts behavior based on whether the popover is open or closed.
-    func unifiedRefresh() {
-        guard let url = webView.url?.absoluteString, url.contains("/settings/usage") else { return }
-
-        let popoverOpen = popover?.isShown == true
-
-        // When popover is closed, only refresh if badge is enabled
-        if !popoverOpen && !showMenuBarBadge { return }
-
-        // Periodic full WebView reload to prevent unbounded memory growth
-        // (only relevant when running in background badge mode)
-        if !popoverOpen {
-            refreshCycleCount += 1
-            if refreshCycleCount >= 30 {
-                refreshCycleCount = 0
-                NSLog("[ClaudeMeter] unifiedRefresh: periodic full reload to reclaim WebView memory")
-                webView.load(URLRequest(url: Self.usageURL))
-                return
-            }
-        }
-
-        // Skip the in-page Refresh-button click when JSON is the active path:
-        // JSON hits Anthropic's API directly and doesn't depend on the page's
-        // own React state, so the click + 1.5s wait is dead weight (and the
-        // button selector is currently brittle, returning 'not_found').
-        let lastPath = UserDefaults.standard.string(forKey: Self.lastFetchPathKey) ?? ""
-        if lastPath == "json" && !jsonCircuitOpen {
-            lastRefreshDate = Date()
-            scrapeAndDistribute()
-            return
-        }
-
-        let js = """
-        (function() {
-            var btns = document.querySelectorAll('button');
-            for (var b of btns) {
-                if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
-                    b.closest('[class*="text-xs"]')) {
-                    b.click();
-                    return 'clicked';
-                }
-            }
-            return 'not_found';
-        })()
-        """
-        webView.evaluateJavaScript(js) { [weak self] result, error in
-            if let error = error {
-                NSLog("[ClaudeMeter] unifiedRefresh JS error: \(error.localizedDescription)")
-            } else {
-                NSLog("[ClaudeMeter] unifiedRefresh click result: \(result ?? "nil")")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    self?.lastRefreshDate = Date()
-                    self?.scrapeAndDistribute()
-                }
-            }
-        }
-    }
-
     func popoverDidClose(_ notification: Notification) {
         NSLog("[ClaudeMeter] popoverDidClose")
-        stopRefreshTimer()
-        usageView?.stopCountdownTicker()
-        refreshCycleCount = 0
+        accounts.forEach { $0.stopRefreshTimer() }
+        activeUsageViews.forEach { $0.stopCountdownTicker() }
+        accounts.forEach { $0.refreshCycleCount = 0 }
+        syncBadgeMode()
         updateBadgeFromModel()
         if showMenuBarBadge {
             NSLog("[ClaudeMeter] badge enabled, starting background refresh")
-            startRefreshTimer()
+            accounts.forEach { $0.startRefreshTimer() }
         }
     }
 
@@ -979,16 +947,200 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     /// `reason` so the QA pipeline (and on-call operators) have a deterministic
     /// signal for whether the badge is updating, independent of OCR/screenshots.
     /// Skips the assignment if the value is unchanged to avoid layout churn.
-    func setBadgeTitle(_ title: String, reason: String) {
+    ///
+    /// `style` adds tinted account labels and activity dots. Without it (or
+    /// with an empty one) the plain title is set exactly as before. The
+    /// anti-flicker check compares text and style, so a dot change applies
+    /// even when the text is unchanged; that is logged as "badge style" so
+    /// the "badge title" lines stay text transitions only.
+    func setBadgeTitle(_ title: String, reason: String, style: BadgeStyle? = nil) {
         guard let button = statusItem.button else { return }
         let old = button.title
-        if old == title { return }
-        button.title = title
+        let newStyle = (style?.isEmpty ?? true) ? nil : style
+        if old == title && newStyle == appliedBadgeStyle { return }
+        if let newStyle = newStyle {
+            button.attributedTitle = attributedBadgeTitle(title, style: newStyle, font: button.font,
+                                                          alignment: button.alignment)
+        } else {
+            button.title = title
+        }
+        appliedBadgeStyle = newStyle
+        layoutBadgeDots()
+        updateBadgeAccessibility(title: title)
         // NSLog treats its first argument as a printf format string. The badge
         // value contains '%' (e.g. "47%") which NSLog would otherwise consume
         // as a format specifier, mangling the output. Always pass user-data
         // strings through "%@" instead of inlining them in the format string.
-        NSLog("%@", "[ClaudeMeter] badge title: '\(old)' -> '\(title)' (\(reason))")
+        if old != title {
+            NSLog("%@", "[ClaudeMeter] badge title: '\(old)' -> '\(title)' (\(reason))")
+        } else {
+            let dots = newStyle?.dots.map { $0.band.rawValue } ?? []
+            NSLog("%@", "[ClaudeMeter] badge style: '\(title)' dots=\(dots) (\(reason))")
+        }
+    }
+
+    /// The badge text with account labels tinted. Other text keeps the
+    /// standard menu-bar text colour.
+    func attributedBadgeTitle(_ title: String, style: BadgeStyle, font: NSFont?,
+                              alignment: NSTextAlignment = .center) -> NSAttributedString {
+        let base = font ?? NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        // controlTextColor matches AppKit's own plain status-item title in
+        // every menu-bar appearance (light, dark, vibrant, highlighted);
+        // labelColor renders lighter on a vibrant light menu bar.
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = alignment
+        let text = NSMutableAttributedString(string: title, attributes: [
+            .font: base, .foregroundColor: NSColor.controlTextColor, .paragraphStyle: paragraph,
+        ])
+        let length = (title as NSString).length
+        for tint in style.tints where NSMaxRange(tint.range) <= length {
+            text.addAttribute(.foregroundColor, value: tint.color.color, range: tint.range)
+        }
+        return text
+    }
+
+    /// Places one activity dot under each styled percentage. Positions come
+    /// from the button cell's title rect and the measured text, recomputed
+    /// after the status item resizes; the text itself is never moved.
+    func layoutBadgeDots() {
+        badgeDotViews.forEach { $0.removeFromSuperview() }
+        badgeDotViews.removeAll()
+        guard let style = appliedBadgeStyle, !style.dots.isEmpty,
+              let button = statusItem.button, let cell = button.cell else { return }
+        let title = button.attributedTitle
+        let titleRect = cell.titleRect(forBounds: button.bounds)
+        let fullWidth = title.size().width
+        let originX = titleRect.minX + max(0, (titleRect.width - fullWidth) / 2)
+        let diameter: CGFloat = 4
+        for dot in style.dots where NSMaxRange(dot.range) <= title.length {
+            let prefixWidth = title.attributedSubstring(from: NSRange(location: 0, length: dot.range.location)).size().width
+            let numberWidth = title.attributedSubstring(from: dot.range).size().width
+            let centerX = originX + prefixWidth + numberWidth / 2
+            let view = ColorDotView(frame: .zero)
+            view.translatesAutoresizingMaskIntoConstraints = false
+            view.color = dot.band.color
+            button.addSubview(view)
+            // Pinned to the button's bottom edge (like the update dot), so a
+            // menu-bar height change keeps it under the number.
+            NSLayoutConstraint.activate([
+                view.widthAnchor.constraint(equalToConstant: diameter),
+                view.heightAnchor.constraint(equalToConstant: diameter),
+                view.bottomAnchor.constraint(equalTo: button.bottomAnchor, constant: -1.5),
+                view.centerXAnchor.constraint(equalTo: button.leadingAnchor, constant: centerX.rounded()),
+            ])
+            badgeDotViews.append(view)
+        }
+        // The status item resizes to the new title on the next pass; lay out
+        // again once it has.
+        if !badgeDotLayoutPending {
+            badgeDotLayoutPending = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.badgeDotLayoutPending = false
+                self.relayoutBadgeDotsIfNeeded()
+            }
+        }
+    }
+
+    func relayoutBadgeDotsIfNeeded() {
+        guard let button = statusItem.button, appliedBadgeStyle?.dots.isEmpty == false else { return }
+        if button.bounds != lastBadgeDotBounds {
+            lastBadgeDotBounds = button.bounds
+            layoutBadgeDots()
+        }
+    }
+
+    /// Re-applies the current badge text with fresh styling (toggle, colour
+    /// or label changes). Respects the popover-open deferral.
+    func reapplyBadgeStyle(reason: String) {
+        guard showMenuBarBadge, popover?.isShown != true, let title = statusItem.button?.title else { return }
+        if accounts.count >= 2 {
+            renderMultiAccountBadge(reason: reason)
+        } else if let account = accounts.first {
+            setBadgeTitle(title, reason: reason, style: singleAccountBadgeStyle(for: account, text: title))
+        }
+    }
+
+    /// VoiceOver text for the badge: each shown side as words, with its
+    /// activity (from the session burn rate), e.g. "Personal 47 percent,
+    /// rising fast". Only the user's own account display names are used.
+    func updateBadgeAccessibility(title: String) {
+        guard let button = statusItem.button else { return }
+        guard !title.isEmpty else {
+            button.setAccessibilityValue(nil)
+            return
+        }
+        func spoken(_ value: String, _ account: AccountController?, _ name: String?) -> String {
+            let prefix = name.map { "\($0) " } ?? "Claude usage "
+            if value == "--" { return prefix + "signed out" }
+            guard value.hasSuffix("%"), let number = Int(value.dropLast()) else { return prefix + "no data yet" }
+            let weekly = account?.badgeShowsWeekly == true
+            var text = prefix + (weekly ? "weekly " : "") + "\(number) percent"
+            if weekly { text += ", no session limit on this plan" }
+            if let account = account, let band = BurnRateBand.band(for: account.badgeForecast) {
+                text += ", " + band.spokenTrend
+            }
+            return text
+        }
+        let parts: [String]
+        if accounts.count < 2 {
+            parts = [spoken(title, accounts.first, nil)]
+        } else {
+            parts = badgeAccounts().map { account in
+                let value = account.isSignedOut ? "--" : (badgeSideText[account.id] ?? cachedBadgeSideText(for: account))
+                return spoken(value, account, account.record.displayName)
+            }
+        }
+        button.setAccessibilityValue(parts.joined(separator: "; "))
+    }
+
+    /// One account: no label, so the only styling is the activity dot.
+    func singleAccountBadgeStyle(for account: AccountController, text: String) -> BadgeStyle? {
+        guard let band = activityBand(for: account, value: text) else { return nil }
+        return BadgeStyle(tints: [], dots: [BadgeStyle.Dot(range: NSRange(location: 0, length: (text as NSString).length), band: band)])
+    }
+
+    /// The activity dot for one badge side: only with the toggle on, for a
+    /// signed-in account showing a real percentage, and only when its
+    /// session forecast has a burn-rate band (same rule as the chip).
+    func activityBand(for account: AccountController, value: String) -> BurnRateBand? {
+        guard showActivityDot, !account.isSignedOut,
+              value.range(of: "^[0-9]+%$", options: .regularExpression) != nil else { return nil }
+        return BurnRateBand.band(for: account.badgeForecast)
+    }
+
+    /// The account's colour: its saved key if it is a known palette colour;
+    /// otherwise Blue for the primary account and, for others, the first
+    /// palette colour no earlier account uses.
+    func accountColor(for account: AccountController) -> AccountColor {
+        if let key = account.record.colorKey, let color = AccountColor(rawValue: key) { return color }
+        if account.isPrimary { return .blue }
+        var used = Set<AccountColor>()
+        for other in accounts {
+            if other === account { break }
+            used.insert(accountColor(for: other))
+        }
+        return AccountColor.allCases.first { !used.contains($0) } ?? .blue
+    }
+
+    /// Saves the derived colour of every account that has none yet, so a
+    /// later change to one account's colour cannot shift another's.
+    func persistDerivedAccountColors() {
+        for account in accounts where account.record.colorKey == nil {
+            let color = accountColor(for: account)
+            account.updateRecord { $0.colorKey = color.rawValue }
+        }
+    }
+
+    /// First palette colour not used by any running account.
+    func nextUnusedAccountColor() -> AccountColor {
+        let used = Set(accounts.map { accountColor(for: $0) })
+        return AccountColor.allCases.first { !used.contains($0) } ?? .blue
+    }
+
+    func setAccountColor(_ color: AccountColor, for account: AccountController) {
+        account.updateRecord { $0.colorKey = color.rawValue }
+        NSLog("%@", "[ClaudeMeter] account colour: \(account.id) -> \(color.rawValue)")
     }
 
     func applyBadgeVisibility() {
@@ -997,17 +1149,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         if showMenuBarBadge {
             statusItem.button?.imagePosition = .imageLeading
             // Restore cached value instantly, or show placeholder
-            let cached = UserDefaults.standard.integer(forKey: "lastBadgePercentage")
-            setBadgeTitle(cached > 0 ? "\(cached)%" : "\u{2014}%", reason: "applyBadgeVisibility cached=\(cached)")
+            restoreCachedBadge()
             updateBadgeFromModel()
             // Start background refresh if popover isn't open
             if popover?.isShown != true {
-                startRefreshTimer()
+                accounts.forEach { $0.startRefreshTimer() }
             }
         } else {
             setBadgeTitle("", reason: "badge disabled")
             statusItem.button?.imagePosition = .imageOnly
-            stopRefreshTimer()
+            accounts.forEach { $0.stopRefreshTimer() }
         }
     }
 
@@ -1020,36 +1171,96 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         // Don't change badge while the popover is shown — resizing the status
         // item shifts the popover anchor and causes visible flicker.
         guard popover?.isShown != true else { return }
+        // Two or more accounts: the two-slot badge ("P 47% | W 12%").
+        if accounts.count >= 2 {
+            updateMultiAccountBadge()
+            return
+        }
+        // One account: the badge mirrors it exactly as in v2.7.1 ("47%").
+        guard let account = accounts.first else { return }
 
-        if let pct = sessionPercentage(from: latestSections) {
-            setBadgeTitle("\(pct)%", reason: "model meter labeled current session")
-            UserDefaults.standard.set(pct, forKey: "lastBadgePercentage")
+        let badgeKey = account.lastBadgePercentageKey
+
+        if let pct = account.sessionPercentage(from: account.latestSections) {
+            account.badgeShowsWeekly = false
+            setBadgeTitle("\(pct)%", reason: "model meter labeled current session",
+                          style: singleAccountBadgeStyle(for: account, text: "\(pct)%"))
+            UserDefaults.standard.setIfChanged(pct, forKey: badgeKey)
             return
         }
 
-        // Fallback: direct XPath scrape (independent of structured scrape's labels).
+        // Confirmed weekly-only plan (two JSON fetches without a session
+        // window): show the weekly window and replace the cached value, so an
+        // old session percentage can never linger. The XPath session scrape is
+        // skipped: against an authoritative JSON answer it could only
+        // resurrect a stale value.
+        if account.weeklyOnlyConfirmed {
+            if let reading = account.badgeReading() {
+                let text = "\(reading.percentage)%"
+                account.badgeShowsWeekly = true
+                setBadgeTitle(text, reason: "model weekly (no session window)",
+                              style: singleAccountBadgeStyle(for: account, text: text))
+                UserDefaults.standard.setIfChanged(reading.percentage, forKey: badgeKey)
+            } else {
+                account.badgeShowsWeekly = false
+                UserDefaults.standard.removeObject(forKey: badgeKey)
+                setBadgeTitle("\u{2014}%", reason: "no session or weekly window in model")
+            }
+            return
+        }
+
+        // Fallback: direct XPath scrape (independent of structured scrape's
+        // labels), only when this account's data comes through the page (DOM
+        // path or JSON circuit open). A JSON-healthy account never gets here.
+        // On the DOM path the page is normally loaded; if it is not (still
+        // being created after a park), the result counts as "no session text
+        // found" and the next refresh tries again.
+        guard account.needsPageScrape else { return }
         NSLog("[ClaudeMeter] updateBadgeFromModel: no 'current session' meter in model, falling back to XPath")
-        webView.evaluateJavaScript(Self.scrapeSessionPercentageJS) { [weak self] result, _ in
+        let handleXPathResult: (Any?) -> Void = { [weak self] result in
             guard let self = self else { return }
             // Re-check guards on the JS callback — popover state may have changed.
             guard self.showMenuBarBadge, self.popover?.isShown != true else { return }
             if let pct = result as? Int {
-                self.setBadgeTitle("\(pct)%", reason: "XPath fallback scrape")
-                UserDefaults.standard.set(pct, forKey: "lastBadgePercentage")
+                account.badgeShowsWeekly = false
+                self.setBadgeTitle("\(pct)%", reason: "XPath fallback scrape",
+                                   style: self.singleAccountBadgeStyle(for: account, text: "\(pct)%"))
+                UserDefaults.standard.setIfChanged(pct, forKey: badgeKey)
+            } else if account.latestSectionsPath == "dom", account.sessionWindowAbsent,
+                      let weekly = account.weeklyPercentage(from: account.latestSections) {
+                // DOM sections without a session meter and no session text on
+                // the page either: the plan has no session window.
+                account.badgeShowsWeekly = true
+                self.setBadgeTitle("\(weekly)%", reason: "model weekly (DOM, no session window)",
+                                   style: self.singleAccountBadgeStyle(for: account, text: "\(weekly)%"))
+                UserDefaults.standard.setIfChanged(weekly, forKey: badgeKey)
             } else if self.statusItem.button?.title.isEmpty == true {
                 self.setBadgeTitle("\u{2014}%", reason: "XPath fallback returned nil")
             }
         }
+        let started = account.runPageScript(Self.scrapeSessionPercentageJS) { result, _ in
+            handleXPathResult(result)
+        }
+        if !started { handleXPathResult(nil) }
     }
 
     /// v2.7 — Menu-bar tooltip with today's peak / 24h avg / streak,
-    /// computed from `history`. Idempotent and cheap (linear scan over
+    /// computed from the account's `history`. Idempotent and cheap (linear scan over
     /// at most ~720 samples). Called after every successful scrape and
     /// from a 1-min refresh tick so the "at HH:MM" timestamp doesn't go
     /// stale between fetches.
     func updateMenuBarTooltip() {
         guard let button = statusItem.button else { return }
-        let samples = history.samples
+        if accounts.count >= 2 {
+            button.toolTip = multiAccountTooltip()
+            return
+        }
+        // A plan without a session window: say so, with weekly figures.
+        if let account = accounts.first, account.badgeShowsWeekly {
+            button.toolTip = weeklyOnlyTooltipLines(for: account, name: nil).joined(separator: "\n")
+            return
+        }
+        let samples = accounts.first?.history.samples ?? []
         guard !samples.isEmpty else {
             button.toolTip = "ClaudeMeter — no usage data yet"
             return
@@ -1078,7 +1289,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             lines.append("Streak under 90%: \(streak) samples")
         }
 
-        if let forecast = lastSessionForecast, case .ok = forecast.state, forecast.ratePerHour >= 0.05 {
+        if let forecast = accounts.first?.lastSessionForecast, case .ok = forecast.state, forecast.ratePerHour >= 0.05 {
             let rate = forecast.ratePerHour
             let formatted: String
             if rate >= 10 { formatted = String(format: "%.0f%%/h", rate) }
@@ -1087,6 +1298,1961 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
 
         button.toolTip = lines.joined(separator: "\n")
+    }
+
+    // MARK: - Peak Window
+
+    /// True when "now" lies inside the configured peak-hour window (Mon-Fri
+    /// 5-11 AM Pacific by default). DST handled automatically by TimeZone.
+    static func isInPeakWindow(now: Date = Date()) -> Bool {
+        guard let tz = TimeZone(identifier: peakWindow.timeZone) else { return false }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        let hour = cal.component(.hour, from: now)
+        let weekday = cal.component(.weekday, from: now)
+        if peakWindow.weekdaysOnly && !(2...6).contains(weekday) { return false }
+        return hour >= peakWindow.startHour && hour < peakWindow.endHour
+    }
+
+    /// Time remaining until the peak window closes today. Returns nil when not
+    /// currently in the peak window.
+    static func peakWindowRemaining(now: Date = Date()) -> TimeInterval? {
+        guard isInPeakWindow(now: now), let tz = TimeZone(identifier: peakWindow.timeZone) else {
+            return nil
+        }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        var comps = cal.dateComponents([.year, .month, .day], from: now)
+        comps.hour = peakWindow.endHour
+        comps.minute = 0
+        comps.second = 0
+        guard let endDate = cal.date(from: comps) else { return nil }
+        return max(0, endDate.timeIntervalSince(now))
+    }
+}
+
+// MARK: - Accounts: menu and management
+
+extension AppDelegate {
+    /// Adding accounts needs isolated WebKit stores (WKWebsiteDataStore
+    /// forIdentifier:), which exist on macOS 14 and later only.
+    /// Tag of the disabled org/email line in each account's submenu (QA
+    /// redacts these when logging the menu; they can contain an email).
+    static let accountInfoMenuTag = 7_301
+
+    var canAddAccounts: Bool {
+        if #available(macOS 14.0, *) { return true }
+        return false
+    }
+
+    func account(withID id: String?) -> AccountController? {
+        guard let id = id else { return nil }
+        return accounts.first { $0.id == id }
+    }
+
+    /// Called whenever an account is added or removed, or a record or
+    /// signed-in state changes. With one account only the menu is rebuilt,
+    /// so single-account badge and popover behavior stay exactly as before.
+    func accountsDidChange() {
+        rebuildAccountsMenu()
+        guard popover != nil else { return }
+        rebuildPopoverContent()
+        if (accounts.count >= 2) != badgeWasMulti {
+            syncBadgeMode()
+            updateBadgeFromModel()
+            updateMenuBarTooltip()
+        } else if accounts.count >= 2 {
+            updateBadgeFromModel()
+            updateMenuBarTooltip()
+        }
+    }
+
+    /// Restarts the running refresh timers of secondary accounts so offsets
+    /// follow the current account count (index * interval / count). The
+    /// primary account (offset 0) keeps its phase.
+    func restaggerRefreshTimers() {
+        for account in accounts where account.refreshTimer != nil && !account.isPrimary {
+            account.startRefreshTimer()
+        }
+    }
+
+    /// Deletes isolated WebKit stores that no saved, running or pending
+    /// account references (left behind by a crash mid-add, an old build, or a
+    /// failed removal). Skipped entirely unless the saved account list was
+    /// read completely, so a store is never deleted because of a read error.
+    func sweepOrphanedDataStores() {
+        guard #available(macOS 14.0, *) else { return }
+        guard AccountStore.isListFullyReadable else {
+            NSLog("%@", "[ClaudeMeter] data store sweep skipped: account list not fully readable")
+            return
+        }
+        WKWebsiteDataStore.fetchAllDataStoreIdentifiers { identifiers in
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, AccountStore.isListFullyReadable else { return }
+                var referenced = Set(AccountStore.load().compactMap { $0.storeIdentifier?.lowercased() })
+                for account in self.accounts + self.pendingAccounts {
+                    if let sid = account.record.storeIdentifier { referenced.insert(sid.lowercased()) }
+                }
+                let orphans = identifiers.filter { !referenced.contains($0.uuidString.lowercased()) }
+                NSLog("%@", "[ClaudeMeter] data store sweep: \(identifiers.count) found, \(orphans.count) orphaned")
+                for id in orphans { AccountController.removeDataStore(identifier: id) }
+            }
+        }
+    }
+
+    /// Creates the controllers for every saved account. The primary account
+    /// always exists and comes first; secondary accounts need macOS 14 for
+    /// their isolated data store and are skipped (left saved) on macOS 13.
+    func makeAccountControllers() -> [AccountController] {
+        unavailableRecords = []
+        var result = [AccountController(app: self, notifier: notifier,
+                                        record: AccountStore.primaryRecord(), dataStore: .default())]
+        for record in AccountStore.load() where !record.isPrimary {
+            guard #available(macOS 14.0, *) else {
+                NSLog("%@", "[ClaudeMeter] account \(record.id) skipped: needs macOS 14 for an isolated data store")
+                continue
+            }
+            guard let sid = record.storeIdentifier, let storeUUID = UUID(uuidString: sid) else {
+                // Cannot run without its own store. Kept (record, keys,
+                // history) and listed in the Accounts menu as unavailable,
+                // where the user can remove it.
+                unavailableRecords.append(record)
+                NSLog("%@", "[ClaudeMeter] account \(record.id) unavailable: missing or invalid store identifier")
+                continue
+            }
+            result.append(AccountController(app: self, notifier: notifier, record: record,
+                                            dataStore: WKWebsiteDataStore(forIdentifier: storeUUID)))
+        }
+        return result
+    }
+
+    // MARK: Menu
+
+    /// Account items sit right after "Sign In…". One account: only "Add
+    /// Account…" (macOS 14+). Two or more: an "Accounts" submenu listing each
+    /// account with Sign In Again / Rename / Remove, plus Add Account. A
+    /// signed-out secondary account also gets a top-level "Sign In Again to
+    /// <name>…" item, since it never opens a login window on its own.
+    func rebuildAccountsMenu() {
+        guard let menu = contextMenu else { return }
+        for item in accountsMenuItems where item.menu === menu {
+            menu.removeItem(item)
+        }
+        accountsMenuItems = []
+
+        // With an Accounts submenu, the primary-only top-level "Import from
+        // Claude Desktop" and "Sign In…" move into the primary account's
+        // submenu (with their shortcuts); with one account they stay as is.
+        let showsAccountsSubmenu = accounts.count + unavailableRecords.count >= 2
+        signInMenuItem?.isHidden = showsAccountsSubmenu
+        importMenuItem?.isHidden = showsAccountsSubmenu
+
+        var items: [NSMenuItem] = []
+        for account in accounts where !account.isPrimary && account.isSignedOut {
+            items.append(accountMenuItem("Sign In Again to \(account.record.displayName)\u{2026}",
+                                         #selector(signInAgain(_:)), account))
+        }
+        if showsAccountsSubmenu {
+            let parent = NSMenuItem(title: "Accounts", action: nil, keyEquivalent: "")
+            let submenu = NSMenu()
+            for account in accounts {
+                let record = account.record
+                var title = record.displayName
+                if let tier = account.planDisplayName { title += " (\(tier))" }
+                if account.isSignedOut { title += ", signed out" }
+                let accountItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                accountItem.image = accountColor(for: account).swatch
+                let accountMenu = NSMenu()
+                if let detail = record.email ?? record.orgName {
+                    let info = NSMenuItem(title: detail, action: nil, keyEquivalent: "")
+                    info.isEnabled = false
+                    info.tag = AppDelegate.accountInfoMenuTag
+                    accountMenu.addItem(info)
+                    accountMenu.addItem(NSMenuItem.separator())
+                }
+                let signInAgainItem = accountMenuItem("Sign In Again\u{2026}", #selector(signInAgain(_:)), account)
+                accountMenu.addItem(signInAgainItem)
+                if account.isPrimary {
+                    signInAgainItem.keyEquivalent = "l"
+                    let importItem = NSMenuItem(title: "Import from Claude Desktop", action: #selector(importFromDesktop), keyEquivalent: "i")
+                    importItem.target = self
+                    accountMenu.addItem(importItem)
+                }
+                accountMenu.addItem(accountMenuItem("Rename\u{2026}", #selector(renameAccount(_:)), account))
+                let position = NSMenuItem(title: "Badge Position", action: nil, keyEquivalent: "")
+                let positionMenu = NSMenu()
+                for (tag, slot) in [BadgeSlot.left, .right, .hidden].enumerated() {
+                    let title = slot == .left ? "Left" : (slot == .right ? "Right" : "Hidden")
+                    let item = accountMenuItem(title, #selector(setBadgeSlotFromMenu(_:)), account)
+                    item.tag = tag
+                    item.state = record.badgeSlot == slot ? .on : .off
+                    positionMenu.addItem(item)
+                }
+                if account.isPrimary && !accounts.contains(where: { $0.record.badgeSlot != .hidden }) {
+                    positionMenu.addItem(NSMenuItem.separator())
+                    let note = NSMenuItem(title: "Shown on badge: no account has a position", action: nil, keyEquivalent: "")
+                    note.isEnabled = false
+                    positionMenu.addItem(note)
+                }
+                position.submenu = positionMenu
+                accountMenu.addItem(position)
+                accountMenu.addItem(accountMenuItem("Badge Label (\(record.badgeLabel))\u{2026}", #selector(editBadgeLabel(_:)), account))
+                let colourItem = NSMenuItem(title: "Colour", action: nil, keyEquivalent: "")
+                let colourMenu = NSMenu()
+                let current = accountColor(for: account)
+                for (tag, color) in AccountColor.allCases.enumerated() {
+                    let item = accountMenuItem(color.title, #selector(setAccountColorFromMenu(_:)), account)
+                    item.tag = tag
+                    item.image = color.swatch
+                    item.state = color == current ? .on : .off
+                    colourMenu.addItem(item)
+                }
+                colourItem.submenu = colourMenu
+                accountMenu.addItem(colourItem)
+                if !account.isPrimary {
+                    accountMenu.addItem(accountMenuItem("Remove\u{2026}", #selector(removeAccountFromMenu(_:)), account))
+                }
+                accountItem.submenu = accountMenu
+                submenu.addItem(accountItem)
+            }
+            for record in unavailableRecords {
+                let item = NSMenuItem(title: "\(record.displayName) (unavailable)", action: nil, keyEquivalent: "")
+                let menu = NSMenu()
+                let remove = NSMenuItem(title: "Remove\u{2026}", action: #selector(removeUnavailableAccount(_:)), keyEquivalent: "")
+                remove.target = self
+                remove.representedObject = record.id
+                menu.addItem(remove)
+                item.submenu = menu
+                submenu.addItem(item)
+            }
+            if canAddAccounts {
+                submenu.addItem(NSMenuItem.separator())
+                let add = NSMenuItem(title: "Add Account\u{2026}", action: #selector(addAccount(_:)), keyEquivalent: "")
+                add.target = self
+                submenu.addItem(add)
+            }
+            parent.submenu = submenu
+            items.append(parent)
+        } else if canAddAccounts {
+            let add = NSMenuItem(title: "Add Account\u{2026}", action: #selector(addAccount(_:)), keyEquivalent: "")
+            add.target = self
+            items.append(add)
+        }
+
+        var index = signInMenuItem.map { menu.index(of: $0) + 1 } ?? 0
+        if index <= 0 || index > menu.numberOfItems { index = min(3, menu.numberOfItems) }
+        for item in items {
+            menu.insertItem(item, at: index)
+            index += 1
+        }
+        accountsMenuItems = items
+    }
+
+    func accountMenuItem(_ title: String, _ action: Selector, _ account: AccountController) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.representedObject = account.id
+        return item
+    }
+
+    // MARK: Actions (each runs only from an explicit menu choice)
+
+    @objc func signInAgain(_ sender: NSMenuItem) {
+        guard let account = account(withID: sender.representedObject as? String) else { return }
+        if popover?.isShown == true { popover.performClose(nil) }
+        account.showLoginWindow()
+    }
+
+    @objc func renameAccount(_ sender: NSMenuItem) {
+        guard let account = account(withID: sender.representedObject as? String) else { return }
+        guard let name = promptForText(title: "Rename Account",
+                                       message: "Shown in the menu, and in notifications once you have more than one account.",
+                                       defaultValue: account.record.displayName,
+                                       confirmTitle: "Rename") else { return }
+        account.rename(to: name)
+    }
+
+    @objc func removeAccountFromMenu(_ sender: NSMenuItem) {
+        guard let account = account(withID: sender.representedObject as? String), !account.isPrimary else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Remove \(account.record.displayName)?"
+        alert.informativeText = "ClaudeMeter signs this account out and deletes its usage history and settings. Your claude.ai account itself is not changed."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        removeAccount(account)
+    }
+
+    /// Removes a saved account that could not run (no usable store).
+    @objc func removeUnavailableAccount(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let record = unavailableRecords.first(where: { $0.id == id }) else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Remove \(record.displayName)?"
+        alert.informativeText = "This account could not be loaded. ClaudeMeter deletes its saved settings and usage history."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        AccountStore.remove(id: id)
+        let keys = AccountStore.removeKeys(forAccount: id)
+        try? FileManager.default.removeItem(at: UsageHistory.fileURL(accountID: id))
+        unavailableRecords.removeAll { $0.id == id }
+        NSLog("%@", "[ClaudeMeter] unavailable account removed: \(id) keys=\(keys)")
+        rebuildAccountsMenu()
+    }
+
+    @objc func addAccount(_ sender: Any?) {
+        guard #available(macOS 14.0, *) else { return }
+        // One add at a time: bring the pending sign-in window forward.
+        if let pending = pendingAccounts.first {
+            pending.showLoginWindow()
+            return
+        }
+        let names = Set((accounts + pendingAccounts).map { $0.record.displayName.lowercased() })
+        let suggested = names.contains("work") ? "Account \(accounts.count + 1)" : "Work"
+        guard let name = promptForText(title: "Add Account",
+                                       message: "Name the account, then sign in to it in the window that opens. It gets its own isolated session, so your other accounts stay signed in.",
+                                       defaultValue: suggested,
+                                       confirmTitle: "Continue") else { return }
+        let controller = beginAddAccount(named: name)
+        controller.showLoginWindow()
+    }
+
+    // MARK: Add / remove (no UI; also used by QA test hooks)
+
+    /// Creates a not-yet-saved account on a fresh isolated data store. It is
+    /// saved and starts metering only after a verified sign-in; closing the
+    /// login window first discards it and its store.
+    @available(macOS 14.0, *)
+    @discardableResult
+    func beginAddAccount(named name: String) -> AccountController {
+        let storeUUID = UUID()
+        // The badge slot is assigned when the add completes (finishAddAccount).
+        let record = AccountRecord(id: UUID().uuidString, displayName: name,
+                                   badgeLabel: AccountRecord.defaultBadgeLabel(for: name),
+                                   badgeSlot: .hidden,
+                                   email: nil, orgUUID: nil, orgName: nil, planTier: nil,
+                                   orgPinned: false, storeIdentifier: storeUUID.uuidString)
+        let controller = AccountController(app: self, notifier: notifier, record: record,
+                                           dataStore: WKWebsiteDataStore(forIdentifier: storeUUID))
+        controller.isPendingAdd = true
+        pendingAccounts.append(controller)
+        controller.onLoginWindowClosed = { [weak self, weak controller] succeeded in
+            guard let self = self, let controller = controller else { return }
+            self.pendingAccounts.removeAll { $0 === controller }
+            if succeeded {
+                self.finishAddAccount(controller)
+            } else {
+                NSLog("%@", "[ClaudeMeter] add account cancelled before sign-in; discarding \(controller.id)")
+                self.discardAccount(controller)
+            }
+        }
+        NSLog("%@", "[ClaudeMeter] add account started: \(record.id)")
+        return controller
+    }
+
+    /// Saves a pending account and starts metering it.
+    func finishAddAccount(_ controller: AccountController) {
+        // Slot decided now, not at start, so two adds can never both take Right.
+        let rightTaken = accounts.contains { $0.record.badgeSlot == .right }
+        let color = nextUnusedAccountColor()
+        controller.updateRecord {
+            $0.badgeSlot = rightTaken ? .hidden : .right
+            $0.colorKey = color.rawValue
+        }
+        controller.isPendingAdd = false
+        controller.persistRecord()
+        accounts.append(controller)
+        NSLog("%@", "[ClaudeMeter] account added: \(controller.id) slot=\(controller.record.badgeSlot.rawValue) accounts=\(accounts.count)")
+        restaggerRefreshTimers()
+        if popover?.isShown == true || showMenuBarBadge {
+            controller.startRefreshTimer()
+        }
+        accountsDidChange()
+    }
+
+    /// Removes a secondary account completely: stops it, deletes its saved
+    /// record, its namespaced UserDefaults keys (exact ID segment), its
+    /// history file and its isolated WebKit data store.
+    func removeAccount(_ account: AccountController) {
+        guard !account.isPrimary else { return }
+        let id = account.id
+        // Stop it first so no in-flight fetch writes history or keys back.
+        account.tearDown()
+        accounts.removeAll { $0 === account }
+        AccountStore.remove(id: id)
+        let removedKeys = AccountStore.removeKeys(forAccount: id)
+        let historyURL = UsageHistory.fileURL(accountID: id)
+        let hadHistory = FileManager.default.fileExists(atPath: historyURL.path)
+        try? FileManager.default.removeItem(at: historyURL)
+        notifier.removeDeliveredNotifications(forAccount: id)
+        NSLog("%@", "[ClaudeMeter] account removed: \(id) keys=\(removedKeys) history=\(hadHistory ? "deleted" : "none") accounts=\(accounts.count)")
+        discardAccount(account)
+        restaggerRefreshTimers()
+        accountsDidChange()
+    }
+
+    /// Tears a controller down and deletes its isolated data store once
+    /// WebKit has released it.
+    private func discardAccount(_ account: AccountController) {
+        let storeID = account.record.storeIdentifier.flatMap { UUID(uuidString: $0) }
+        account.tearDown()
+        guard !account.isPrimary, let uuid = storeID else { return }
+        if #available(macOS 14.0, *) {
+            // Give WebKit a moment to drop the web views that used the store.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                AccountController.removeDataStore(identifier: uuid)
+            }
+        }
+    }
+
+    // MARK: Dialogs
+
+    func promptForText(title: String, message: String, defaultValue: String, confirmTitle: String) -> String? {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: confirmTitle)
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = defaultValue
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        return String(value.prefix(40))
+    }
+
+    /// Org picker shown after a verified sign-in that returned several orgs.
+    /// Always returns one of `orgs` (the preselected one if the user just
+    /// confirms).
+    /// `preselect` (the pinned org on Sign In Again) wins; otherwise a Team
+    /// or Enterprise org is preselected, since extra accounts are usually work
+    /// accounts. Orgs another account already meters are marked.
+    func pickOrganization(_ orgs: [OrgListResponse.Org], for account: AccountController,
+                          preselect: String? = nil) -> OrgListResponse.Org {
+        func isWorkOrg(_ org: OrgListResponse.Org) -> Bool {
+            let tier = (org.rate_limit_tier ?? "").lowercased()
+            let caps = (org.capabilities ?? []).map { $0.lowercased() }
+            return tier.contains("team") || tier.contains("enterprise")
+                || caps.contains { $0.contains("team") || $0.contains("enterprise") }
+        }
+        let preferred = preselect.flatMap { p in orgs.firstIndex { $0.uuid == p } }
+            ?? orgs.firstIndex(where: isWorkOrg) ?? 0
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Choose an organization for \(account.record.displayName)"
+        alert.informativeText = "This sign-in belongs to several organizations. ClaudeMeter meters the one you choose; you can change it later with Sign In Again."
+        alert.addButton(withTitle: "Use This Organization")
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 26), pullsDown: false)
+        for org in orgs {
+            var title = org.name ?? "Organization"
+            if let tier = Self.planTierDisplayName(slug: org.rate_limit_tier, variant: Self.planVariant(for: org)) { title += " (\(tier))" }
+            if let other = accounts.first(where: { $0 !== account && $0.record.orgUUID == org.uuid }) {
+                title += ", already metered as \(other.record.displayName)"
+            }
+            popup.addItem(withTitle: title)
+        }
+        popup.selectItem(at: preferred)
+        alert.accessoryView = popup
+        alert.runModal()
+        let index = popup.indexOfSelectedItem
+        return orgs.indices.contains(index) ? orgs[index] : orgs[preferred]
+    }
+}
+
+// MARK: - Accounts: combined badge and popover
+
+extension AppDelegate {
+    // MARK: Badge slots
+
+    /// At most one account per badge slot; extra claimants become Hidden.
+    func normalizeBadgeSlots() {
+        var taken = Set<BadgeSlot>()
+        for account in accounts {
+            let slot = account.record.badgeSlot
+            guard slot != .hidden else { continue }
+            if taken.contains(slot) {
+                account.updateRecord { $0.badgeSlot = .hidden }
+                NSLog("%@", "[ClaudeMeter] badge slot \(slot.rawValue) already taken; \(account.id) set to hidden")
+            } else {
+                taken.insert(slot)
+            }
+        }
+    }
+
+    /// Moves an account to a slot. A Left/Right slot holds one account: its
+    /// previous occupant moves to Hidden.
+    func setBadgeSlot(_ slot: BadgeSlot, for account: AccountController) {
+        if slot != .hidden {
+            for other in accounts where other !== account && other.record.badgeSlot == slot {
+                other.updateRecord { $0.badgeSlot = .hidden }
+            }
+        }
+        account.updateRecord { $0.badgeSlot = slot }
+        NSLog("%@", "[ClaudeMeter] badge slot: \(account.id) -> \(slot.rawValue)")
+    }
+
+    /// Sets a 1 to 3 character badge label (see sanitizeBadgeLabel).
+    /// Returns false if nothing usable is left.
+    @discardableResult
+    func setBadgeLabel(_ text: String, for account: AccountController) -> Bool {
+        guard let label = AccountRecord.sanitizeBadgeLabel(text) else { return false }
+        account.updateRecord { $0.badgeLabel = label }
+        return true
+    }
+
+    /// Accounts shown in the badge, left then right. One account: that
+    /// account (no label). Several: the Left and Right slot holders; if both
+    /// slots are Hidden, the primary account as if it held Left, so the badge
+    /// never goes blank while "Show Usage in Menu Bar" is on.
+    func badgeAccounts() -> [AccountController] {
+        guard accounts.count >= 2 else { return Array(accounts.prefix(1)) }
+        let left = accounts.first { $0.record.badgeSlot == .left }
+        let right = accounts.first { $0.record.badgeSlot == .right }
+        let shown = [left, right].compactMap { $0 }
+        return shown.isEmpty ? [accounts[0]] : shown
+    }
+
+    func cachedBadgeSideText(for account: AccountController) -> String {
+        let cached = UserDefaults.standard.integer(forKey: account.lastBadgePercentageKey)
+        return cached > 0 ? "\(cached)%" : "\u{2014}%"
+    }
+
+    /// Two or more accounts: refresh each shown side from its own account's
+    /// model (or its own XPath fallback, never for a pinned org), keeping
+    /// that side's last value otherwise.
+    func updateMultiAccountBadge() {
+        var freshSides = 0
+        var weeklySides = 0
+        for account in badgeAccounts() {
+            let id = account.id
+            if account.isSignedOut { continue }
+            if let reading = account.badgeReading() {
+                badgeSideText[id] = "\(reading.percentage)%"
+                account.badgeShowsWeekly = reading.source == .weekly
+                UserDefaults.standard.setIfChanged(reading.percentage, forKey: account.lastBadgePercentageKey)
+                freshSides += 1
+                if reading.source == .weekly { weeklySides += 1 }
+                continue
+            }
+            // Confirmed weekly-only plan without a weekly window either: never
+            // keep (or scrape back) an old session value.
+            if account.weeklyOnlyConfirmed {
+                badgeSideText[id] = "\u{2014}%"
+                account.badgeShowsWeekly = false
+                UserDefaults.standard.removeObject(forKey: account.lastBadgePercentageKey)
+                continue
+            }
+            if badgeSideText[id] == nil { badgeSideText[id] = cachedBadgeSideText(for: account) }
+            guard !account.record.orgPinned, account.needsPageScrape else { continue }
+            let handleXPathResult: (Any?) -> Void = { [weak self, weak account] result in
+                guard let self = self, let account = account, !account.isSignedOut,
+                      self.showMenuBarBadge, self.popover?.isShown != true,
+                      self.accounts.count >= 2 else { return }
+                if let pct = result as? Int {
+                    account.badgeShowsWeekly = false
+                    self.badgeSideText[account.id] = "\(pct)%"
+                    UserDefaults.standard.setIfChanged(pct, forKey: account.lastBadgePercentageKey)
+                    self.renderMultiAccountBadge(reason: "XPath fallback scrape")
+                } else if account.latestSectionsPath == "dom", account.sessionWindowAbsent,
+                          let weekly = account.weeklyPercentage(from: account.latestSections) {
+                    account.badgeShowsWeekly = true
+                    self.badgeSideText[account.id] = "\(weekly)%"
+                    UserDefaults.standard.setIfChanged(weekly, forKey: account.lastBadgePercentageKey)
+                    self.renderMultiAccountBadge(reason: "model weekly (DOM, no session window)")
+                }
+            }
+            let started = account.runPageScript(Self.scrapeSessionPercentageJS) { result, _ in
+                handleXPathResult(result)
+            }
+            if !started { handleXPathResult(nil) }
+        }
+        // freshSides counts sides read from their account's latest fetched
+        // sections in this call (not necessarily a fetch that just happened);
+        // with none, every side shows a cached value and the reason says so.
+        // QA (L3) ignores "cached sides only" transitions.
+        let reason: String
+        if freshSides == 0 {
+            reason = "multi: cached sides only"
+        } else if weeklySides == freshSides {
+            reason = "model weekly (no session window)"
+        } else if weeklySides > 0 {
+            reason = "model meter labeled current session; weekly for sides with no session window"
+        } else {
+            reason = "model meter labeled current session"
+        }
+        renderMultiAccountBadge(reason: reason)
+    }
+
+    /// "W 47%" with one shown side, "P 47% | W 12%" with two (left first).
+    /// A signed-out side reads "W --".
+    func renderMultiAccountBadge(reason: String) {
+        var text = ""
+        var style = BadgeStyle()
+        for (i, account) in badgeAccounts().enumerated() {
+            if i > 0 { text += " | " }
+            let value = account.isSignedOut ? "--" : (badgeSideText[account.id] ?? cachedBadgeSideText(for: account))
+            let label = account.record.badgeLabel
+            let labelRange = NSRange(location: (text as NSString).length, length: (label as NSString).length)
+            text += label + " "
+            let valueRange = NSRange(location: (text as NSString).length, length: (value as NSString).length)
+            text += value
+            style.tints.append(BadgeStyle.Tint(range: labelRange, color: accountColor(for: account)))
+            if let band = activityBand(for: account, value: value) {
+                style.dots.append(BadgeStyle.Dot(range: valueRange, band: band))
+            }
+        }
+        setBadgeTitle(text, reason: reason, style: style)
+    }
+
+    /// Restores the badge from cached values (launch, badge re-enabled, or a
+    /// switch between one and several accounts).
+    func restoreCachedBadge() {
+        badgeWasMulti = accounts.count >= 2
+        if accounts.count >= 2 {
+            for account in badgeAccounts() { badgeSideText[account.id] = cachedBadgeSideText(for: account) }
+            renderMultiAccountBadge(reason: "applyBadgeVisibility cached=multi")
+        } else {
+            let cached = accounts.first.map { UserDefaults.standard.integer(forKey: $0.lastBadgePercentageKey) } ?? 0
+            setBadgeTitle(cached > 0 ? "\(cached)%" : "\u{2014}%", reason: "applyBadgeVisibility cached=\(cached)")
+        }
+    }
+
+    /// After the account count crosses between one and several, re-render
+    /// the badge in the matching form (not while the popover is open).
+    func syncBadgeMode() {
+        guard showMenuBarBadge, popover?.isShown != true, (accounts.count >= 2) != badgeWasMulti else { return }
+        restoreCachedBadge()
+    }
+
+    /// An account's empty-scrape streak reached the threshold: blank its side.
+    func badgeAccountFailed(_ account: AccountController, reason: String) {
+        if accounts.count >= 2 {
+            guard badgeAccounts().contains(where: { $0 === account }) else { return }
+            badgeSideText[account.id] = "\u{2014}%"
+            renderMultiAccountBadge(reason: reason)
+        } else if account === accounts.first {
+            setBadgeTitle("\u{2014}%", reason: reason)
+        }
+    }
+
+    /// Tooltip lines for an account whose plan has no session window: its
+    /// weekly percentage, a note, the weekly peak / average, and the weekly
+    /// burn rate.
+    func weeklyOnlyTooltipLines(for account: AccountController, name: String?) -> [String] {
+        let prefix = name.map { "\($0): " } ?? ""
+        var lines: [String] = []
+        if let weekly = account.weeklyPercentage(from: account.latestSections) {
+            var line = "\(prefix)weekly \(weekly)% · no session limit on this plan"
+            if let f = account.lastWeeklyForecast, BurnRateBand.band(for: f) != nil {
+                line += f.ratePerHour >= 10 ? String(format: " · +%.0f%%/h", f.ratePerHour)
+                                            : String(format: " · +%.1f%%/h", f.ratePerHour)
+            }
+            lines.append(line)
+        } else {
+            lines.append("\(prefix)no session limit on this plan")
+        }
+        let samples = account.history.samples
+        if let peak = samples.max(by: { $0.w < $1.w }) {
+            let f = DateFormatter()
+            f.dateFormat = "h:mma"
+            f.amSymbol = "a"; f.pmSymbol = "p"
+            let avg = Int((Double(samples.reduce(0) { $0 + $1.w }) / Double(samples.count)).rounded())
+            let peakTime = f.string(from: Date(timeIntervalSince1970: peak.t)).lowercased()
+            lines.append("\(name == nil ? "" : "  ")Weekly peak: \(peak.w)% at \(peakTime) · 24h avg: \(avg)%")
+        }
+        return lines
+    }
+
+    /// Two or more accounts: one block per account in the menu-bar tooltip.
+    func multiAccountTooltip() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "h:mma"
+        f.amSymbol = "a"; f.pmSymbol = "p"
+        var lines: [String] = []
+        for account in accounts {
+            let name = account.record.displayName
+            if account.isSignedOut {
+                lines.append("\(name): signed out")
+                continue
+            }
+            if account.badgeShowsWeekly {
+                lines.append(contentsOf: weeklyOnlyTooltipLines(for: account, name: name))
+                continue
+            }
+            var parts: [String] = []
+            if let s = account.sessionPercentage(from: account.latestSections) { parts.append("session \(s)%") }
+            if let w = account.weeklyPercentage(from: account.latestSections) { parts.append("weekly \(w)%") }
+            if let f = account.lastSessionForecast, BurnRateBand.band(for: f) != nil {
+                parts.append(f.ratePerHour >= 10 ? String(format: "+%.0f%%/h", f.ratePerHour)
+                                                 : String(format: "+%.1f%%/h", f.ratePerHour))
+            }
+            lines.append("\(name): " + (parts.isEmpty ? "no usage data yet" : parts.joined(separator: " · ")))
+            let samples = account.history.samples
+            if let peak = samples.max(by: { $0.s < $1.s }) {
+                let avg = Int((Double(samples.reduce(0) { $0 + $1.s }) / Double(samples.count)).rounded())
+                let peakTime = f.string(from: Date(timeIntervalSince1970: peak.t)).lowercased()
+                lines.append("  Peak: \(peak.s)% at \(peakTime) · 24h avg: \(avg)%")
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: Popover
+
+    /// Clamps and animates the popover to a content height.
+    func applyPopoverContentHeight(_ height: CGFloat) {
+        // Use as much of the screen as macOS permits. NSPopover hard-caps
+        // around (visibleFrame - small margin) on its own; we just need to
+        // not under-clamp ahead of it. Floor at 1200 so smaller screens
+        // still get a generously tall popover.
+        let screenMax = (NSScreen.main?.visibleFrame.height ?? 1200) - 40
+        let ceiling = max(1200, screenMax)
+        let clamped = min(max(height, 120), ceiling)
+        let current = popover.contentSize.height
+        // Only animate if the height changed meaningfully: sub-pixel layout
+        // rounding differences would otherwise cause the popover to flicker.
+        guard abs(clamped - current) > 2 else { return }
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.3
+            ctx.allowsImplicitAnimation = true
+            self.popover.contentSize = NSSize(width: 400, height: clamped)
+        }
+    }
+
+    /// Each account's own usage view. The primary account's is `usageView`
+    /// (the whole popover with one account); others are created on demand.
+    func usageView(for account: AccountController) -> UsageContentView {
+        if account.isPrimary, let view = usageView { return view }
+        if let view = accountViews[account.id] { return view }
+        let view = UsageContentView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        view.planTierDisplayName = account.planDisplayName
+        view.showBurnRate = showBurnRate
+        view.showSparkline = showSparkline
+        account.usageView = view
+        accountViews[account.id] = view
+        account.renderLatest()
+        return view
+    }
+
+    /// The usage views currently in the popover.
+    var activeUsageViews: [UsageContentView] {
+        guard accounts.count >= 2 else { return usageView.map { [$0] } ?? [] }
+        return accounts.map { usageView(for: $0) }
+    }
+
+    /// One account: the popover is exactly that account's usage view, as
+    /// before. Two or more: the stacked multi-account view.
+    func rebuildPopoverContent() {
+        guard let vc = popover?.contentViewController, let primaryView = usageView else { return }
+        if accounts.count >= 2 {
+            let multi: MultiAccountUsageView
+            if let existing = multiAccountView {
+                multi = existing
+            } else {
+                multi = MultiAccountUsageView(frame: NSRect(x: 0, y: 0, width: 400, height: popover.contentSize.height))
+                multi.onContentSizeChanged = { [weak self] height in self?.applyPopoverContentHeight(height) }
+                multi.onSignInAgain = { [weak self] id in
+                    guard let self = self, let account = self.account(withID: id) else { return }
+                    if self.popover.isShown { self.popover.performClose(nil) }
+                    account.showLoginWindow()
+                }
+                multiAccountView = multi
+            }
+            if vc.view !== multi { vc.view = multi }
+            let entries = accounts.map { account -> MultiAccountUsageView.Entry in
+                let record = account.record
+                let tier = account.planDisplayName
+                let view = usageView(for: account)
+                view.planTierDisplayName = tier
+                let detail = [record.email ?? record.orgName, tier].compactMap { $0 }.joined(separator: " · ")
+                return MultiAccountUsageView.Entry(accountID: account.id, title: record.displayName,
+                                                   detail: detail.isEmpty ? nil : detail,
+                                                   signedOut: account.isSignedOut, usageView: view,
+                                                   color: accountColor(for: account).color)
+            }
+            multi.reload(entries)
+            // A section added while the popover is open gets its countdown.
+            if popover.isShown {
+                for view in entries.map({ $0.usageView }) where !view.isCountdownTickerRunning {
+                    view.startCountdownTicker()
+                }
+            }
+        } else if let multi = multiAccountView {
+            multi.detachAll()
+            multiAccountView = nil
+            primaryView.isEmbedded = false
+            primaryView.isHidden = false
+            primaryView.translatesAutoresizingMaskIntoConstraints = true
+            primaryView.frame = NSRect(x: 0, y: 0, width: 400, height: popover.contentSize.height)
+            primaryView.onContentSizeChanged = { [weak self] height in self?.applyPopoverContentHeight(height) }
+            vc.view = primaryView
+            applyPopoverContentHeight(primaryView.skeletonHeight)
+        }
+        let live = Set(accounts.map { $0.id })
+        for (id, view) in accountViews where !live.contains(id) {
+            view.stopCountdownTicker()
+        }
+        accountViews = accountViews.filter { live.contains($0.key) }
+    }
+
+    // MARK: Menu actions for the badge
+
+    @objc func setAccountColorFromMenu(_ sender: NSMenuItem) {
+        guard let account = account(withID: sender.representedObject as? String),
+              AccountColor.allCases.indices.contains(sender.tag) else { return }
+        setAccountColor(AccountColor.allCases[sender.tag], for: account)
+    }
+
+    @objc func setBadgeSlotFromMenu(_ sender: NSMenuItem) {
+        guard let account = account(withID: sender.representedObject as? String) else { return }
+        let slots: [BadgeSlot] = [.left, .right, .hidden]
+        guard slots.indices.contains(sender.tag) else { return }
+        setBadgeSlot(slots[sender.tag], for: account)
+    }
+
+    @objc func editBadgeLabel(_ sender: NSMenuItem) {
+        guard let account = account(withID: sender.representedObject as? String) else { return }
+        guard let text = promptForText(title: "Badge Label",
+                                       message: "One to three characters shown before this account's percentage in the menu bar (no spaces, \"|\", \"%\" or \"'\").",
+                                       defaultValue: account.record.badgeLabel,
+                                       confirmTitle: "Save") else { return }
+        setBadgeLabel(text, for: account)
+    }
+}
+
+// MARK: - Account Controller
+
+/// Usage API redirects: followed only to https claude.ai hosts, since each
+/// request carries a hand-set Cookie header. Others are refused (the 3xx
+/// answer is returned as is); only the host is logged.
+final class APIRedirectGuard: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        let host = request.url?.host?.lowercased() ?? ""
+        if request.url?.scheme == "https" && (host == "claude.ai" || host.hasSuffix(".claude.ai")) {
+            completionHandler(request)
+        } else {
+            NSLog("%@", "[ClaudeMeter] API redirect off claude.ai refused (host \(host.isEmpty ? "nil" : host))")
+            completionHandler(nil)
+        }
+    }
+}
+
+/// Per-account metering engine. Owns one claude.ai session end to end: the
+/// off-screen WKWebView and its cookie store, the fallback login window and
+/// OAuth popups, the refresh timer, the JSON circuit breaker and empty-scrape
+/// streak, the resolved org and plan tier, the latest sections, history and
+/// forecast. It is the navigation and UI delegate for every web view it
+/// creates (background, login and OAuth popups) and the window delegate for
+/// its login window; OAuth popup windows have no window delegate. App-wide UI
+/// (status item, popover, menu, preferences) stays on AppDelegate, reached
+/// through `app`.
+final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
+    /// AppDelegate owns every AccountController and lives for the whole
+    /// process, so this back-reference can never dangle.
+    unowned let app: AppDelegate
+    /// The single shared notifier (also the UNUserNotificationCenter delegate).
+    /// Stored non-optional so the notifier evaluate call keeps exactly one call site,
+    /// inside distributeFetchResult (static-audit check 16).
+    let notifier: ThresholdNotifier
+    /// The popover section this account renders into. Owned by the popover's
+    /// view controller.
+    weak var usageView: UsageContentView?
+
+    /// The hidden claude.ai usage page, created on demand (see "Hidden usage
+    /// page" below). nil while parked.
+    private(set) var pageView: WKWebView?
+    /// WebKit data store holding this account's claude.ai session: the
+    /// default store for the primary account, an identifier-keyed store
+    /// (macOS 14+) for every other account. Login windows and OAuth popups
+    /// use it too.
+    let dataStore: WKWebsiteDataStore
+    var refreshTimer: Timer?
+    var lastRefreshDate: Date?
+    // Counts background refreshes; every 30th does a full WebView reload.
+    var refreshCycleCount: Int = 0
+    // v2.7: latest session forecast, read by the menu-bar tooltip.
+    var lastSessionForecast: UsageForecast?
+    // Latest render inputs, replayed into a usage view created later.
+    var lastWeeklyForecast: UsageForecast?
+    var lastSessionResetAt: Date?
+    var lastWeeklyResetAt: Date?
+
+    /// Persisted, non-secret description of this account (id, label, badge
+    /// slot, org, plan tier, store identifier). Saved through AccountStore.
+    private(set) var record: AccountRecord
+    var id: String { record.id }
+
+    // Shared data store — populated by every scrape, read by badge and popover
+    var latestSections: [UsageSection] = []
+    var history: UsageHistory
+
+    // Empty-scrape streak. Transient empties happen during normal page renders
+    // (React mid-update), so a single empty must NOT clear the badge or popover.
+    // Only a sustained streak indicates a real failure (page DOM changed,
+    // network broke, scraper no longer matches).
+    var consecutiveEmptyScrapes: Int = 0
+    static let emptyScrapeFailureThreshold = 3
+
+    // JSON-primary fetch state. Org and tier live on the account record.
+    var cachedOrgUUID: String? {
+        get { record.orgUUID }
+        set { record.orgUUID = newValue }
+    }
+    var cachedPlanTier: String? {
+        get { record.planTier }
+        set { record.planTier = newValue }
+    }
+    var jsonFetchInFlight: Bool = false
+    /// When the fetch in flight started; one older than
+    /// `jsonFetchStaleAfter` is treated as lost (logged and reset).
+    private var jsonFetchStartedAt: Date?
+    private var jsonFetchGeneration = 0
+    static let jsonFetchStaleAfter: TimeInterval = 90
+    var jsonConsecutiveFailures: Int = 0
+    var jsonCircuitOpen: Bool = false
+    var jsonCircuitOpenedAt: Date?
+    static let jsonFailureCircuitBreaker = 5
+    // A permanently open circuit would leave the account on the DOM path
+    // (stale page data, page kept loaded). Auto-reset, checked at the start
+    // of every timer tick, gives JSON another shot.
+    static let jsonCircuitResetInterval: TimeInterval = 30 * 60
+
+    // Fallback login window (email/magic-link in WKWebView)
+    var loginWindow: NSWindow?
+    var loginWebView: WKWebView?
+
+    // OAuth popup windows
+    var popupWindows: [NSWindow] = []
+
+    // Track whether we've already tried the desktop import for this launch
+    var hasAttemptedDesktopImport = false
+
+    /// True when the background page or the usage API says this account's
+    /// session is gone. A secondary account then waits for the user to pick
+    /// "Sign In Again"; nothing opens on its own.
+    private(set) var isSignedOut = false
+
+    // Login verification: /api/organizations must return 200 with at least
+    // one org, checked after each login-page load and every 4s.
+    private var loginCheckTimer: Timer?
+    private var loginCheckInFlight = false
+    private var loginSucceeded = false
+    private var lastLoginCheckStatus: Int?
+    // Signed-out confirmation and slow background re-probe (secondaries).
+    private var signInProbeInFlight = false
+    private var signedOutProbeTimer: Timer?
+    private var pageRetryUsed = false
+    private var lastSignInConfirmAt: Date?
+    private var viewNeedsRefresh = false
+    private var lastDistributedLogKey: String?
+    private var lastDistributedLogAt = Date.distantPast
+    private var lastFetchLogKey: String?
+    private var lastFetchLogAt = Date.distantPast
+    private var tierKindRefreshedThisLaunch = false
+    static let signedOutProbeInterval: TimeInterval = 15 * 60
+    /// Called once when the login window closes: true after a verified
+    /// sign-in, false when the user closed it first.
+    var onLoginWindowClosed: ((Bool) -> Void)?
+    /// An account being added: not saved, not in `app.accounts` yet.
+    var isPendingAdd = false
+    private var isTornDown = false
+
+    var isPrimary: Bool { record.isPrimary }
+
+    init(app: AppDelegate, notifier: ThresholdNotifier, record: AccountRecord, dataStore: WKWebsiteDataStore) {
+        self.app = app
+        self.notifier = notifier
+        self.record = record
+        self.dataStore = dataStore
+        self.history = UsageHistory.loadFromDisk(accountID: record.id)
+        super.init()
+    }
+
+    // MARK: - Hidden usage page (parked while the JSON path is healthy)
+
+    /// The page is only needed to detect a sign-in page from the background,
+    /// for the DOM fallback (JSON circuit open, forceDOMOnly) and as a
+    /// periodic session keep-alive. Whenever the JSON path is healthy it is
+    /// destroyed ("parked"), which ends its WebContent process (hundreds of
+    /// MB) and all page work. Cookies live in the data store, not the page.
+    private var lastPageLoadAt = Date()
+    /// At most one keep-alive page load per account in this interval
+    /// (staggered by account), so the claude.ai session stays warm.
+    static let pageKeepAliveInterval: TimeInterval = 6 * 3600
+    // Activity counters (diagnostics; read by the QA test hooks).
+    private(set) var pageLoadCount = 0
+    private(set) var pageScriptCount = 0
+    private(set) var fetchAttemptCount = 0
+    private(set) var jsonSuccessCount = 0
+    private(set) var cookieWriteBackCount = 0
+    /// Times the sign-in window was opened or brought forward (QA).
+    private(set) var loginWindowShowCount = 0
+    private var lastGuardTripPath: String?
+    /// DOM path, page off the usage page: reloads are spaced out, starting
+    /// at 15 min and doubling up to 4 h; reset once the page is back on the
+    /// usage page.
+    private var nextGuardReloadAt = Date.distantPast
+    private var guardReloadBackoff = AccountController.guardReloadBaseInterval
+    static let guardReloadBaseInterval: TimeInterval = 15 * 60
+    static let guardReloadMaxInterval: TimeInterval = 4 * 3600
+    /// The primary's sign-in window opens on its own once per signed-out
+    /// spell (v2.7.1 opened it once per page load that reached the sign-in
+    /// page); opening the popover allows it again.
+    private var autoLoginWindowShown = false
+    /// Set by the fetch after a wake: one transport error retries once.
+    private var wakeRetryArmed = false
+
+    /// JSON is the active path: not forced to DOM and the circuit is closed.
+    var jsonHealthy: Bool {
+        !UserDefaults.standard.bool(forKey: AppDelegate.forceDOMOnlyKey) && !jsonCircuitOpen
+    }
+
+    /// The badge needs the page's XPath scrape only when this account's data
+    /// comes through the page.
+    var needsPageScrape: Bool { !jsonHealthy || latestSectionsPath == "dom" }
+
+    @discardableResult
+    func ensurePageView() -> WKWebView {
+        if let view = pageView { return view }
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = dataStore
+        let view = WKWebView(frame: .zero, configuration: config)
+        view.navigationDelegate = self
+        view.uiDelegate = self
+        view.customUserAgent = AppDelegate.safariUA
+        pageView = view
+        return view
+    }
+
+    func loadUsagePage(reason: String) {
+        guard !isTornDown else { return }
+        pageLoadCount += 1
+        lastPageLoadAt = Date()
+        NSLog("%@", "[ClaudeMeter] account \(id): loading usage page (\(reason))")
+        ensurePageView().load(URLRequest(url: AppDelegate.usageURL))
+    }
+
+    /// Destroys the page once it has finished loading, if the JSON path is
+    /// healthy and no sign-in is in progress.
+    func parkPageIfIdle(reason: String) {
+        guard let view = pageView, !view.isLoading, jsonHealthy, latestSectionsPath != "dom",
+              loginWindow == nil else { return }
+        view.stopLoading()
+        view.navigationDelegate = nil
+        view.uiDelegate = nil
+        pageView = nil
+        NSLog("%@", "[ClaudeMeter] account \(id): usage page parked (\(reason))")
+    }
+
+    /// Runs a script in the page if there is one; false when parked.
+    @discardableResult
+    func runPageScript(_ js: String, completion: @escaping (Any?, Error?) -> Void) -> Bool {
+        guard let page = pageView else { return false }
+        pageScriptCount += 1
+        page.evaluateJavaScript(js, completionHandler: completion)
+        return true
+    }
+
+    /// One refresh now: the JSON API when healthy, else through the page.
+    func refreshNow(reason: String) {
+        guard !isTornDown else { return }
+        if jsonHealthy || record.orgPinned {
+            lastRefreshDate = Date()
+            wakeRetryArmed = reason == "wake"
+            scrapeAndDistribute()
+        } else {
+            loadUsagePage(reason: reason)
+        }
+    }
+
+    /// Popover open: a JSON fetch for healthy accounts (no page reload), the
+    /// page's own refresh otherwise.
+    func refreshForPopover() {
+        // The user is looking: a signed-out primary may show its sign-in
+        // window again (as v2.7.1 did on every popover open).
+        autoLoginWindowShown = false
+        if jsonHealthy || record.orgPinned {
+            usageView?.setStatusLoading()
+            lastRefreshDate = Date()
+            scrapeAndDistribute()
+        } else {
+            softReload()
+        }
+    }
+
+    /// Logs (once per distinct path) where the page sat when the DOM path
+    /// found it off the usage page. Path only, never query strings.
+    private func noteGuardTrip(_ url: URL?) {
+        let path = "\(url?.host ?? "nil")\(url?.path ?? "")"
+        guard path != lastGuardTripPath else { return }
+        lastGuardTripPath = path
+        NSLog("%@", "[ClaudeMeter] account \(id): page is not on the usage page (\(path))")
+    }
+
+    // MARK: - API session (one per account)
+
+    /// One URLSession per account, created on first use and reused, so TLS
+    /// sessions and connections stay warm. Ephemeral with no cookie storage of
+    /// its own: each request carries a Cookie header built from this
+    /// account's WebKit store, so cookies never cross accounts.
+    private var apiSessionStorage: URLSession?
+    var apiSession: URLSession {
+        if let session = apiSessionStorage { return session }
+        let config = URLSessionConfiguration.ephemeral
+        config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
+        config.httpCookieAcceptPolicy = .never
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        // The Cookie header is set by hand, so a redirect must not carry it
+        // off claude.ai: such redirects are refused.
+        let session = URLSession(configuration: config, delegate: APIRedirectGuard(), delegateQueue: nil)
+        apiSessionStorage = session
+        return session
+    }
+
+    /// Pause (sleep, lock): cancels this account's requests in flight. A
+    /// cancelled fetch keeps the last data and is not counted as a failure.
+    func cancelInFlightRequests() {
+        apiSessionStorage?.getAllTasks { tasks in tasks.forEach { $0.cancel() } }
+    }
+
+    /// Offline-class URL errors (and our own cancel on pause): the last data
+    /// stays, nothing counts toward the JSON circuit. Any other transport
+    /// error counts like an HTTP error.
+    static func isOfflineError(_ error: Error) -> Bool {
+        let e = error as NSError
+        guard e.domain == NSURLErrorDomain else { return false }
+        return [NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost, NSURLErrorTimedOut,
+                NSURLErrorCannotFindHost, NSURLErrorCannotConnectToHost, NSURLErrorDNSLookupFailed,
+                NSURLErrorCancelled].contains(e.code)
+    }
+    private var cookieHeader: String?
+    /// Offline-class error of the latest org-list request (org discovery).
+    var lastOrgListTransportError: Error?
+    private var cookieStoreWarm = false
+    private var lastLoggedCookieCount: Int?
+
+    /// Attaches this account's current claude.ai cookies to a request.
+    func applyCookieHeader(to request: inout URLRequest) {
+        if let header = cookieHeader { request.setValue(header, forHTTPHeaderField: "Cookie") }
+    }
+
+    /// Writes cookies set by an API response (session rotation, Cloudflare)
+    /// back into this account's own WebKit store, so the session stays fresh
+    /// without page loads. Counts only; values are never logged.
+    func storeResponseCookies(_ response: URLResponse?) {
+        guard !isTornDown, let http = response as? HTTPURLResponse, let url = http.url else { return }
+        // While this account's sign-in window is open, a 401/403 answer must
+        // not overwrite the cookies the sign-in is setting.
+        if loginWindow != nil && (http.statusCode == 401 || http.statusCode == 403) { return }
+        var fields: [String: String] = [:]
+        for (key, value) in http.allHeaderFields {
+            if let key = key as? String, let value = value as? String { fields[key] = value }
+        }
+        let cookies = HTTPCookie.cookies(withResponseHeaderFields: fields, for: url)
+        guard !cookies.isEmpty else { return }
+        cookieWriteBackCount += cookies.count
+        let store = dataStore.httpCookieStore   // this account's store only
+        store.getAllCookies { existing in
+            for cookie in cookies { store.setCookie(Self.inExistingDomainForm(cookie, existing: existing)) }
+        }
+    }
+
+    /// A response cookie without a Domain attribute is host-only
+    /// ("claude.ai"), while the browser may hold the same cookie as a domain
+    /// cookie (".claude.ai"). Writing it as is would leave two copies; it
+    /// takes the stored copy's domain form instead.
+    static func inExistingDomainForm(_ cookie: HTTPCookie, existing: [HTTPCookie]) -> HTTPCookie {
+        func bare(_ domain: String) -> String {
+            (domain.hasPrefix(".") ? String(domain.dropFirst()) : domain).lowercased()
+        }
+        guard let twin = existing.first(where: {
+                  $0.name == cookie.name && $0.path == cookie.path && bare($0.domain) == bare(cookie.domain)
+              }),
+              twin.domain != cookie.domain, var props = cookie.properties else { return cookie }
+        props[.domain] = twin.domain
+        return HTTPCookie(properties: props) ?? cookie
+    }
+
+    /// RFC 6265 matching of a stored cookie against a request URL.
+    static func cookie(_ cookie: HTTPCookie, matches url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        var domain = cookie.domain.lowercased()
+        let domainCookie = domain.hasPrefix(".")
+        if domainCookie { domain.removeFirst() }
+        let domainOK = host == domain || (domainCookie && host.hasSuffix("." + domain))
+        let path = url.path.isEmpty ? "/" : url.path
+        let pathOK = path.hasPrefix(cookie.path)
+        let notExpired = cookie.expiresDate.map { $0 > Date() } ?? true
+        let secureOK = !cookie.isSecure || url.scheme == "https"
+        return domainOK && pathOK && notExpired && secureOK
+    }
+
+    // MARK: - Per-account keys
+
+    /// Friendly plan name ("Max 20x", "Team", "Work plan"...).
+    var planDisplayName: String? {
+        AppDelegate.planTierDisplayName(slug: record.planTier, variant: record.planVariant)
+    }
+
+    var lastFetchPathKey: String { AccountKeys.key(AppDelegate.lastFetchPathKey, id) }
+    var lastBadgePercentageKey: String { AccountKeys.key(AppDelegate.lastBadgePercentageKey, id) }
+
+    /// Saves this account's record (org, tier, labels) to UserDefaults. The
+    /// controller is the record's only writer: every edit (org discovery,
+    /// rename, sign-in) goes through it, and AccountStore.upsert replaces only
+    /// this record, so edits to different accounts never clobber each other.
+    /// A pending (not yet added) account is not saved.
+    func persistRecord() {
+        guard !isPendingAdd, !isTornDown else { return }
+        AccountStore.upsert(record)
+        app.accountsDidChange()
+    }
+
+    /// Applies an edit to the record and saves it.
+    func updateRecord(_ change: (inout AccountRecord) -> Void) {
+        change(&record)
+        persistRecord()
+    }
+
+    /// Renames the account; a badge label still at its default follows the name.
+    func rename(to name: String) {
+        updateRecord { r in
+            if r.badgeLabel == AccountRecord.defaultBadgeLabel(for: r.displayName) {
+                r.badgeLabel = AccountRecord.defaultBadgeLabel(for: name)
+            }
+            r.displayName = name
+        }
+        NSLog("%@", "[ClaudeMeter] account renamed: \(id)")
+    }
+
+    func setSignedOut(_ signedOut: Bool, reason: String) {
+        guard signedOut != isSignedOut else { return }
+        isSignedOut = signedOut
+        NSLog("%@", "[ClaudeMeter] account \(id) \(signedOut ? "signed out" : "signed in") (\(reason))")
+        if !signedOut {
+            lastSignInConfirmAt = nil
+            autoLoginWindowShown = false
+        }
+        if signedOut && !isPrimary {
+            startSignedOutProbe()
+        } else {
+            signedOutProbeTimer?.invalidate()
+            signedOutProbeTimer = nil
+        }
+        if !isPendingAdd { app.accountsDidChange() }
+    }
+
+    // MARK: - Signed-out confirmation (secondary accounts)
+
+    enum SignInVerdict { case signedIn, signedOut(String), unknown }
+
+    /// Reads an /api/organizations answer: 401/403 means signed out; 2xx
+    /// listing the pinned org (any org when unpinned) means signed in; 2xx
+    /// without the pinned org means signed out (the org is gone, so Sign In
+    /// Again lets the user choose; background code never re-pins); anything
+    /// else is inconclusive.
+    func signInVerdict(status: Int, orgs: [OrgListResponse.Org]?) -> SignInVerdict {
+        if status == 401 || status == 403 { return .signedOut("organizations HTTP \(status)") }
+        guard (200..<300).contains(status), let orgs = orgs else { return .unknown }
+        if record.orgPinned, let pinned = record.orgUUID {
+            return orgs.contains { $0.uuid == pinned } ? .signedIn : .signedOut("pinned org no longer listed")
+        }
+        return orgs.isEmpty ? .signedOut("no organizations") : .signedIn
+    }
+
+    /// One /api/organizations call with this account's cookies (no windows,
+    /// no alerts), reported as a verdict.
+    /// Returns false (and does nothing) when a probe is already in flight.
+    @discardableResult
+    func probeSignIn(_ completion: @escaping (SignInVerdict) -> Void) -> Bool {
+        guard !signInProbeInFlight, !isTornDown else { return false }
+        signInProbeInFlight = true
+        copyCookiesToSession(logCount: false) { [weak self] session in
+            guard let self = self else { return }
+            self.requestOrgList(session: session, context: "signInProbe", quiet: true) { [weak self] status, orgs in
+                guard let self = self, !self.isTornDown else { return }
+                self.signInProbeInFlight = false
+                completion(self.signInVerdict(status: status, orgs: orgs))
+            }
+        }
+        return true
+    }
+
+    /// A secondary account is marked signed out only after the API agrees,
+    /// so one transient 403 or an odd page landing cannot sign it out.
+    /// `throttled` (the pinned usage-API failure path only): at most one
+    /// confirmation per account per 15 minutes, so a usage endpoint that
+    /// keeps failing does not double every request. Page-based hints are
+    /// rare and always checked.
+    func confirmSignedOut(reason: String, throttled: Bool = false) {
+        guard !isPrimary, !isSignedOut else { return }
+        if throttled, let last = lastSignInConfirmAt,
+           Date().timeIntervalSince(last) < Self.signedOutProbeInterval { return }
+        let started = probeSignIn { [weak self] verdict in
+            guard let self = self else { return }
+            switch verdict {
+            case .signedOut(let why):
+                self.setSignedOut(true, reason: "\(reason); \(why)")
+            case .signedIn:
+                NSLog("%@", "[ClaudeMeter] account \(self.id): \(reason), but organizations still answer; treating as transient")
+                // A page that wandered off the usage page: one reload later.
+                if !self.pageRetryUsed, let page = self.pageView,
+                   page.url?.absoluteString.contains("/settings/usage") != true {
+                    self.pageRetryUsed = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+                        guard let self = self, !self.isTornDown else { return }
+                        self.refreshNow(reason: "page retry")
+                    }
+                }
+            case .unknown:
+                NSLog("%@", "[ClaudeMeter] account \(self.id): \(reason), sign-in check inconclusive; no change")
+            }
+        }
+        // Stamp only when a probe actually started (not when one was in flight).
+        if started && throttled { lastSignInConfirmAt = Date() }
+    }
+
+    /// Slow re-check while a secondary account is signed out (every 15 min,
+    /// staggered; API only). A false "signed out" heals on its own.
+    private func startSignedOutProbe() {
+        signedOutProbeTimer?.invalidate()
+        signedOutProbeTimer = Timer.scheduledTimer(withTimeInterval: Self.signedOutProbeInterval, repeats: true) { [weak self] _ in
+            self?.runSignedOutProbe()
+        }
+        signedOutProbeTimer?.tolerance = 60
+        signedOutProbeTimer?.fireDate = Date().addingTimeInterval(Self.signedOutProbeInterval + Double(staggerIndex) * 30)
+    }
+
+    func runSignedOutProbe() {
+        guard isSignedOut, !isPrimary, loginWindow == nil, !app.activityPaused else { return }
+        probeSignIn { [weak self] verdict in
+            guard let self = self, self.isSignedOut, case .signedIn = verdict else { return }
+            self.setSignedOut(false, reason: "background probe: organizations answer again")
+            self.refreshNow(reason: "signed in again")
+        }
+    }
+
+    // MARK: - Staggering
+
+    /// Position among the metered accounts (0 for the primary account).
+    var staggerIndex: Int { app.accounts.firstIndex { $0 === self } ?? 0 }
+
+    /// Runs `work` now for the first account and 2s later per position for
+    /// the others, so accounts never hit claude.ai in the same second.
+    func staggered(_ work: @escaping () -> Void) {
+        let delay = Double(staggerIndex) * 2.0
+        if delay <= 0 {
+            work()
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self = self, !self.isTornDown else { return }
+                work()
+            }
+        }
+    }
+
+    /// Replays the latest data into the usage view if it changed while the
+    /// popover was closed.
+    func renderLatestIfNeeded() {
+        guard viewNeedsRefresh else { return }
+        viewNeedsRefresh = false
+        renderLatest()
+    }
+
+    /// Pushes the latest data into a usage view created after it arrived.
+    func renderLatest() {
+        guard let view = usageView, !latestSections.isEmpty else { return }
+        view.update(sections: latestSections,
+                    sessionForecast: lastSessionForecast,
+                    weeklyForecast: lastWeeklyForecast,
+                    sessionResetAt: lastSessionResetAt,
+                    weeklyResetAt: lastWeeklyResetAt,
+                    history: history)
+        view.setStatusFresh(true)
+    }
+
+    /// Import cookies and start loading. The primary account imports Claude
+    /// Desktop's cookies first and loads whether or not that worked; a login
+    /// page then routes to the login window through didFinish. Secondary
+    /// accounts load straight from their own store (Claude Desktop's session
+    /// belongs to the primary account only).
+    func start() {
+        hasAttemptedDesktopImport = true
+        // JSON first: no page load unless the API cannot be used (then the
+        // failure path loads the page, which also detects a sign-in page).
+        guard isPrimary else {
+            staggered { [weak self] in
+                self?.refreshNow(reason: "launch")
+            }
+            return
+        }
+        importFromClaudeDesktop { [weak self] _ in
+            self?.refreshNow(reason: "launch")
+        }
+    }
+
+    /// Stops all activity before the account is discarded: timers, windows
+    /// and page loads. Afterwards nothing reloads or saves.
+    func tearDown() {
+        isTornDown = true
+        stopRefreshTimer()
+        signedOutProbeTimer?.invalidate()
+        signedOutProbeTimer = nil
+        loginCheckTimer?.invalidate()
+        loginCheckTimer = nil
+        onLoginWindowClosed = nil
+        loginWindow?.close()
+        for window in popupWindows { window.close() }
+        popupWindows.removeAll()
+        pageView?.stopLoading()
+        pageView?.navigationDelegate = nil
+        pageView?.uiDelegate = nil
+        pageView = nil
+        apiSessionStorage?.invalidateAndCancel()
+        apiSessionStorage = nil
+    }
+
+    /// Deletes an isolated account's WebKit data store (cookies, storage).
+    /// Retries while WebKit still has it in use.
+    @available(macOS 14.0, *)
+    static func removeDataStore(identifier: UUID, attempt: Int = 1) {
+        WKWebsiteDataStore.remove(forIdentifier: identifier) { error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    NSLog("%@", "[ClaudeMeter] data store removal attempt \(attempt) failed: \(error.localizedDescription)")
+                    if attempt < 4 {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                            removeDataStore(identifier: identifier, attempt: attempt + 1)
+                        }
+                    }
+                } else {
+                    NSLog("%@", "[ClaudeMeter] data store removed (attempt \(attempt))")
+                }
+            }
+        }
+    }
+
+    // MARK: - Claude Desktop Cookie Import
+
+    func importFromClaudeDesktop(completion: @escaping (Bool) -> Void) {
+        // The single gate for every Claude Desktop import (launch, the
+        // login-page fallback and the menu item): with skipDesktopImport set
+        // nothing reads the cookie database or the Keychain.
+        if UserDefaults.standard.bool(forKey: AppDelegate.skipDesktopImportKey) {
+            NSLog("%@", "[ClaudeMeter] Claude Desktop import skipped (skipDesktopImport); no Keychain access")
+            DispatchQueue.main.async { completion(false) }
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let cookies = ClaudeDesktopCookies.extract()
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, let cookies = cookies, !cookies.isEmpty else {
+                    completion(false)
+                    return
+                }
+                self.injectCookies(cookies) { completion(true) }
+            }
+        }
+    }
+
+    func injectCookies(_ cookies: [HTTPCookie], completion: @escaping () -> Void) {
+        let store = dataStore.httpCookieStore
+        let group = DispatchGroup()
+        for cookie in cookies {
+            group.enter()
+            store.setCookie(cookie) { group.leave() }
+        }
+        group.notify(queue: .main, execute: completion)
+    }
+
+    // MARK: - Fallback Login Window (email/magic-link)
+
+    func showLoginWindow() {
+        loginWindowShowCount += 1
+        if let window = loginWindow {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 640),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = isPrimary ? "Sign in to Claude" : "Sign in to Claude: \(record.displayName)"
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+
+        let loginConfig = WKWebViewConfiguration()
+        loginConfig.websiteDataStore = dataStore
+
+        let lw = WKWebView(frame: window.contentView!.bounds, configuration: loginConfig)
+        lw.autoresizingMask = [.width, .height]
+        lw.navigationDelegate = self
+        lw.uiDelegate = self
+        lw.customUserAgent = AppDelegate.safariUA
+        lw.load(URLRequest(url: AppDelegate.loginURL))
+
+        window.contentView?.addSubview(lw)
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        loginWebView = lw
+        loginWindow = window
+        loginSucceeded = false
+        lastLoginCheckStatus = nil
+        loginCheckTimer?.invalidate()
+        loginCheckTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
+            self?.checkLoginSucceeded()
+        }
+    }
+
+    /// Closes the login window; windowWillClose resets state and reloads.
+    func closeLoginWindow() {
+        loginWindow?.close()
+    }
+
+    /// Sign-in counts as done only when /api/organizations, called with this
+    /// account's cookies, returns 200 with at least one org. A URL guess is
+    /// not enough: SSO flows pass through intermediate claude.ai pages.
+    func checkLoginSucceeded() {
+        guard loginWindow != nil, !loginSucceeded, !loginCheckInFlight, !isTornDown else { return }
+        loginCheckInFlight = true
+        copyCookiesToSession(logCount: false) { [weak self] session in
+            guard let self = self else { return }
+            self.requestOrgList(session: session, context: "loginCheck", quiet: true) { [weak self] status, orgs in
+                guard let self = self else { return }
+                self.loginCheckInFlight = false
+                // Log state changes only (this runs every 4s).
+                if status != self.lastLoginCheckStatus {
+                    self.lastLoginCheckStatus = status
+                    NSLog("%@", "[ClaudeMeter] loginCheck for account \(self.id): HTTP \(status), \(orgs?.count ?? 0) orgs")
+                }
+                guard self.loginWindow != nil, !self.loginSucceeded, (200..<300).contains(status) else { return }
+                let orgList = orgs ?? []
+                // The primary account also accepts a 2xx with an undecodable
+                // org list once the login page sits on a claude.ai non-login
+                // page, so a shape change cannot keep the window open forever.
+                let pageLooksSignedIn: Bool = {
+                    guard let url = self.loginWebView?.url, let host = url.host?.lowercased() else { return false }
+                    let onClaude = host == "claude.ai" || host.hasSuffix(".claude.ai")
+                    return onClaude && !self.isLoginURL(url.absoluteString)
+                }()
+                if !orgList.isEmpty || (self.isPrimary && pageLooksSignedIn) {
+                    self.completeLogin(orgs: orgList)
+                }
+            }
+        }
+    }
+
+    /// Verified sign-in. Secondary accounts pin their org: the pinned org if
+    /// it is still listed, else the only org, else the user's pick. The
+    /// primary account keeps today's automatic org selection.
+    private func completeLogin(orgs: [OrgListResponse.Org]) {
+        loginSucceeded = true
+        loginCheckTimer?.invalidate()
+        loginCheckTimer = nil
+        NSLog("%@", "[ClaudeMeter] login verified for account \(id): \(orgs.count) org(s)")
+        if !isPrimary {
+            // Several orgs: always ask, with the pinned org preselected. A
+            // pinned org that disappeared is never silently replaced: ask even
+            // if only one org is left. One org and nothing pinned: take it.
+            let pinned = record.orgPinned ? record.orgUUID : nil
+            let pinnedListed = pinned.map { p in orgs.contains { $0.uuid == p } } ?? false
+            let chosen: OrgListResponse.Org
+            if orgs.count == 1 && (pinned == nil || pinnedListed) {
+                chosen = orgs[0]
+            } else {
+                chosen = app.pickOrganization(orgs, for: self, preselect: pinnedListed ? pinned : nil)
+            }
+            updateRecord { r in
+                r.orgUUID = chosen.uuid
+                r.orgName = chosen.name ?? r.orgName
+                r.planTier = chosen.rate_limit_tier ?? r.planTier
+                r.planVariant = AppDelegate.planVariant(for: chosen)
+                r.orgPinned = true
+            }
+            AppDelegate.logUnmappedTier(chosen, context: "login")
+        }
+        jsonConsecutiveFailures = 0
+        jsonCircuitOpen = false
+        jsonCircuitOpenedAt = nil
+        lastSignInConfirmAt = nil
+        setSignedOut(false, reason: "login verified")
+        loginWindow?.close()
+    }
+
+    // MARK: - WKNavigationDelegate
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard let url = webView.url?.absoluteString else { return }
+
+        // Secondary accounts: a sign-in page or any page outside claude.ai
+        // (an SSO identity provider) is a hint only; the API confirms before
+        // the account is marked signed out. They never open a window on
+        // their own; the menu offers "Sign In Again to <name>" instead.
+        if webView === self.pageView && !isPrimary && looksSignedOut(url) {
+            confirmSignedOut(reason: "background page left the usage page for a sign-in page")
+            return
+        }
+
+        // Popover hit a login page → show login window (desktop import already attempted at startup)
+        if webView === self.pageView && isLoginURL(url) {
+            setSignedOut(true, reason: "background page reached a sign-in page")
+            if UserDefaults.standard.bool(forKey: AppDelegate.suppressAutoLoginWindowKey) {
+                NSLog("%@", "[ClaudeMeter] login window not opened automatically (suppressAutoLoginWindow)")
+                return
+            }
+            // Open it once: never bring an open sign-in window forward from
+            // the background (that stole focus on every reload), and not
+            // again in this signed-out spell after the user closed it.
+            if loginWindow != nil || autoLoginWindowShown { return }
+            autoLoginWindowShown = true
+            if !hasAttemptedDesktopImport {
+                hasAttemptedDesktopImport = true
+                importFromClaudeDesktop { [weak self] success in
+                    guard let self = self else { return }
+                    if success {
+                        self.loadUsagePage(reason: "after Claude Desktop import")
+                    } else {
+                        if self.app.popover.isShown { self.app.popover.performClose(nil) }
+                        self.showLoginWindow()
+                    }
+                }
+                return
+            }
+            if app.popover.isShown { app.popover.performClose(nil) }
+            showLoginWindow()
+            return
+        }
+
+        // Login WebView finished a page: verify sign-in through the API.
+        if webView === loginWebView {
+            checkLoginSucceeded()
+            return
+        }
+
+        if webView === self.pageView {
+            pageRetryUsed = false
+            lastRefreshDate = Date()
+            usageView?.setStatusFresh(true)
+            // One fetch; a JSON-healthy account then parks the page. The DOM
+            // path scrapes again after React renders.
+            let domPath = !(jsonHealthy || record.orgPinned)
+            scrapeAndDistribute()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                guard let self = self else { return }
+                if domPath { self.scrapeAndDistribute() }
+                // Ensure refresh timer is running after initial page load
+                if self.refreshTimer == nil && (self.app.popover?.isShown == true || self.app.showMenuBarBadge) {
+                    self.startRefreshTimer()
+                }
+            }
+        }
+    }
+
+    // MARK: - WKUIDelegate (popup handling for OAuth)
+
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        let popupWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 600),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered, defer: false
+        )
+        popupWindow.title = "Sign In"
+        popupWindow.center()
+        popupWindow.isReleasedWhenClosed = false
+        popupWindow.delegate = self   // so a closed popup leaves popupWindows
+
+        let popupWebView = WKWebView(frame: popupWindow.contentView!.bounds, configuration: configuration)
+        popupWebView.autoresizingMask = [.width, .height]
+        popupWebView.navigationDelegate = self
+        popupWebView.uiDelegate = self
+        popupWebView.customUserAgent = AppDelegate.safariUA
+
+        popupWindow.contentView?.addSubview(popupWebView)
+        popupWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        popupWindows.append(popupWindow)
+        return popupWebView
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+        guard let window = webView.window else { return }
+        window.close()
+        popupWindows.removeAll { $0 === window }
+    }
+
+    // MARK: - NSWindowDelegate
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        if window === loginWindow {
+            let succeeded = loginSucceeded
+            loginCheckTimer?.invalidate()
+            loginCheckTimer = nil
+            loginWindow = nil
+            loginWebView = nil
+            let callback = onLoginWindowClosed
+            onLoginWindowClosed = nil
+            callback?(succeeded)
+            // A cancelled add is discarded by the callback; nothing to load.
+            if !isTornDown && (succeeded || !isPendingAdd) {
+                refreshNow(reason: "login window closed")
+            }
+        }
+        popupWindows.removeAll { $0 === window }
+    }
+
+    /// Soft reload: if already on the usage page, click the site's own refresh button.
+    /// Falls back to a full page reload if needed.
+    func softReload() {
+        guard let page = pageView, let url = page.url?.absoluteString, url.contains("/settings/usage") else {
+            gracefulReload()
+            return
+        }
+        usageView?.setStatusLoading()
+        let js = Self.clickRefreshButtonJS
+        pageScriptCount += 1
+        page.evaluateJavaScript(js) { [weak self] result, _ in
+            if (result as? String) == "clicked" {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    self?.lastRefreshDate = Date()
+                    self?.scrapeAndDistribute()
+                }
+            } else {
+                self?.gracefulReload()
+            }
+        }
+    }
+
+    /// Clicks the usage page's own refresh button.
+    static let clickRefreshButtonJS = """
+    (function() {
+        var btns = document.querySelectorAll('button');
+        for (var b of btns) {
+            if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
+                b.closest('[class*="text-xs"]')) {
+                b.click();
+                return 'clicked';
+            }
+        }
+        return 'not_found';
+    })()
+    """
+
+    /// Full page reload.
+    func gracefulReload() {
+        usageView?.setStatusLoading()
+        loadUsagePage(reason: "reload")
+    }
+
+    // MARK: - Polling (Unified Adaptive Timer)
+
+    /// The effective refresh interval depends on popover state.
+    var activeRefreshInterval: TimeInterval {
+        if app.popover?.isShown == true {
+            return app.statusFreshnessInterval   // fast (6s default)
+        } else {
+            // slow (120s default); doubled in Low Power Mode or when the Mac
+            // is thermally constrained
+            return app.badgeRefreshInterval * (app.reducedPowerMode ? 2 : 1)
+        }
+    }
+
+    /// Repeating refresh timer. Accounts are staggered: account i of n first
+    /// fires after i * interval / n (the primary account, i = 0, after one
+    /// full interval as before), so two accounts never refresh together.
+    func startRefreshTimer() {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+        // Paused while the Mac sleeps, the screens sleep or the session is
+        // locked / switched away; resumed with one fetch on wake.
+        guard !isTornDown, !app.activityPaused else { return }
+        let interval = activeRefreshInterval
+        let count = max(app.accounts.count, 1)
+        let offset = interval * Double(staggerIndex) / Double(count)
+        if offset > 0 {
+            NSLog("[ClaudeMeter] startRefreshTimer: interval=\(interval)s, popoverOpen=\(app.popover?.isShown == true), account=\(id) offset=\(Int(offset))s")
+        } else {
+            NSLog("[ClaudeMeter] startRefreshTimer: interval=\(interval)s, popoverOpen=\(app.popover?.isShown == true)")
+        }
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.unifiedRefresh()
+        }
+        // Closed-state ticks are background work: a wide tolerance lets the
+        // system coalesce wakeups.
+        refreshTimer?.tolerance = interval * (app.popover?.isShown == true ? 0.1 : 0.25)
+        if offset > 0 {
+            refreshTimer?.fireDate = Date().addingTimeInterval(offset)
+        }
+    }
+
+    func stopRefreshTimer() {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+    }
+
+    /// Unified refresh (timer tick): a JSON fetch for healthy and pinned
+    /// accounts; on the DOM path, clicks the site's refresh button (unless
+    /// the last fetch was JSON), then scrapes. Adapts to the popover state.
+    func unifiedRefresh() {
+        guard !isTornDown, !app.activityPaused else { return }
+        // Before anything else, so the DOM path (which never fetches JSON)
+        // cannot keep an open circuit from its retry.
+        resetStaleCircuitIfNeeded()
+        // A signed-out secondary account stays idle until the user signs in
+        // again (no repeated requests with a dead session).
+        if isSignedOut && !isPrimary { return }
+        // Healthy JSON path (and pinned orgs, JSON only): no page is needed,
+        // and the fetch runs wherever the hidden page sits. (The usage page
+        // can move itself, e.g. to /new for plans without a session window,
+        // which used to stop the primary account's background refresh.)
+        if record.orgPinned || jsonHealthy {
+            let popoverOpen = app.popover?.isShown == true
+            if !popoverOpen && !app.showMenuBarBadge { return }
+            // Keep-alive: a page load at most every 6 h (staggered) keeps
+            // the session warm; its didFinish fetches and parks the page.
+            if pageView == nil,
+               Date().timeIntervalSince(lastPageLoadAt) >= Self.pageKeepAliveInterval + Double(staggerIndex) * 600 {
+                loadUsagePage(reason: "session keep-alive")
+                return
+            }
+            lastRefreshDate = Date()
+            scrapeAndDistribute()
+            return
+        }
+        // DOM path (JSON circuit open or forceDOMOnly): the page is needed.
+        // Signed out or signing in: the page sits on a sign-in page and a
+        // reload would only land there again (and, for the primary, raise
+        // the sign-in window). Wait for the sign-in, or for the circuit's
+        // JSON retry above.
+        if isSignedOut || loginWindow != nil { return }
+        guard let page = pageView else {
+            loadUsagePage(reason: "DOM fallback")
+            return
+        }
+        guard let url = page.url?.absoluteString, url.contains("/settings/usage") else {
+            noteGuardTrip(page.url)
+            if page.isLoading { return }
+            if let current = page.url?.absoluteString, isPrimary ? isLoginURL(current) : looksSignedOut(current) { return }
+            let now = Date()
+            guard now >= nextGuardReloadAt else { return }
+            nextGuardReloadAt = now.addingTimeInterval(guardReloadBackoff)
+            NSLog("%@", "[ClaudeMeter] account \(id): reloading the usage page (next guard reload no sooner than \(Int(guardReloadBackoff / 60)) min)")
+            guardReloadBackoff = min(guardReloadBackoff * 2, Self.guardReloadMaxInterval)
+            loadUsagePage(reason: "back to the usage page")
+            return
+        }
+        // Back on the usage page: the guard-reload backoff starts over.
+        guardReloadBackoff = Self.guardReloadBaseInterval
+        nextGuardReloadAt = .distantPast
+
+        let popoverOpen = app.popover?.isShown == true
+
+        // When popover is closed, only refresh if badge is enabled
+        if !popoverOpen && !app.showMenuBarBadge { return }
+
+        // Periodic full WebView reload to prevent unbounded memory growth
+        // (only relevant when running in background badge mode)
+        if !popoverOpen {
+            refreshCycleCount += 1
+            if refreshCycleCount >= 30 {
+                refreshCycleCount = 0
+                NSLog("[ClaudeMeter] unifiedRefresh: periodic full reload to reclaim WebView memory")
+                loadUsagePage(reason: "periodic reload")
+                return
+            }
+        }
+
+        // Skip the in-page Refresh-button click when JSON is the active path:
+        // JSON hits Anthropic's API directly and doesn't depend on the page's
+        // own React state, so the click + 1.5s wait is dead weight (and the
+        // button selector is currently brittle, returning 'not_found').
+        let lastPath = UserDefaults.standard.string(forKey: lastFetchPathKey) ?? ""
+        if lastPath == "json" && !jsonCircuitOpen {
+            lastRefreshDate = Date()
+            scrapeAndDistribute()
+            return
+        }
+
+        let js = Self.clickRefreshButtonJS
+        pageScriptCount += 1
+        page.evaluateJavaScript(js) { [weak self] result, error in
+            if let error = error {
+                NSLog("[ClaudeMeter] unifiedRefresh JS error: \(error.localizedDescription)")
+            } else {
+                NSLog("[ClaudeMeter] unifiedRefresh click result: \(result ?? "nil")")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    self?.lastRefreshDate = Date()
+                    self?.scrapeAndDistribute()
+                }
+            }
+        }
+    }
+
+    /// Which window the badge shows for this account.
+    enum BadgeSource { case session, weekly }
+
+    /// Fetch path ("json" or "dom") that produced latestSections. Only a
+    /// JSON response is authoritative about a missing session window; the DOM
+    /// scrape can miss one (label drift), so DOM sections go through the
+    /// XPath session scrape first.
+    private(set) var latestSectionsPath: String?
+    private var weeklyOnlyJSONStreak = 0
+    /// Two consecutive successful JSON fetches without a session window (a
+    /// plan with no five-hour limit). One such fetch is not enough, so a
+    /// transient shape change cannot flip the badge; a fetch with a session
+    /// window clears it at once.
+    private(set) var weeklyOnlyConfirmed = false
+    /// The badge side currently shows this account's weekly window (tooltip,
+    /// VoiceOver and the activity dot follow it).
+    var badgeShowsWeekly = false
+
+    /// The latest successful fetch has sections but no session window.
+    var sessionWindowAbsent: Bool {
+        !latestSections.isEmpty && sessionPercentage(from: latestSections) == nil
+    }
+
+    /// Called by distributeFetchResult for every successful (non-empty) fetch.
+    func noteFetchedSections(_ sections: [UsageSection], path: String) {
+        latestSectionsPath = path
+        if sessionPercentage(from: sections) != nil {
+            weeklyOnlyJSONStreak = 0
+            weeklyOnlyConfirmed = false
+        } else if path == "json" {
+            weeklyOnlyJSONStreak += 1
+            if weeklyOnlyJSONStreak >= 2 { weeklyOnlyConfirmed = true }
+        }
+    }
+
+    /// The badge reading from the latest successful fetch: the session
+    /// window, or, once a weekly-only plan is confirmed, the weekly window.
+    func badgeReading() -> (percentage: Int, source: BadgeSource)? {
+        if let session = sessionPercentage(from: latestSections) { return (session, .session) }
+        if weeklyOnlyConfirmed, let weekly = weeklyPercentage(from: latestSections) { return (weekly, .weekly) }
+        return nil
+    }
+
+    /// Forecast behind the activity dot: the weekly forecast while the badge
+    /// shows the weekly window, else the session forecast.
+    var badgeForecast: UsageForecast? {
+        badgeShowsWeekly ? lastWeeklyForecast : lastSessionForecast
     }
 
     /// Extract the "Current session" percentage from the shared data store.
@@ -1101,8 +3267,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         return nil
     }
 
+    /// v2.7.1's exact login-page test, used for the primary account.
     private func isLoginURL(_ url: String) -> Bool {
         url.contains("/login") || url.contains("/signin") || url.contains("accounts.google.com")
+    }
+
+    /// Wider hint for secondary accounts: a login page, or any page outside
+    /// claude.ai (an SSO identity provider such as Okta or Microsoft Entra
+    /// ID). Only a hint: confirmSignedOut asks the API before acting.
+    private func looksSignedOut(_ url: String) -> Bool {
+        if isLoginURL(url) { return true }
+        guard let host = URL(string: url)?.host?.lowercased(), !host.isEmpty else { return false }
+        return host != "claude.ai" && !host.hasSuffix(".claude.ai")
     }
 
     // MARK: - Scrape & Distribute
@@ -1111,18 +3287,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     /// when JSON is disabled, errored, or its in-memory circuit breaker has tripped.
     /// Both paths funnel through the same empty-streak gate and badge/model updates,
     /// so callers see a uniform interface regardless of which path succeeded.
+    /// Auto-reset a stale circuit so JSON gets periodic re-attempts. The
+    /// circuit re-opens on its own if 5 fresh failures recur.
+    func resetStaleCircuitIfNeeded() {
+        guard jsonCircuitOpen, let openedAt = jsonCircuitOpenedAt,
+              Date().timeIntervalSince(openedAt) >= Self.jsonCircuitResetInterval else { return }
+        NSLog("%@", "[ClaudeMeter] json circuit auto-reset after \(Int(Self.jsonCircuitResetInterval/60))min cooldown")
+        jsonCircuitOpen = false
+        jsonConsecutiveFailures = 0
+        jsonCircuitOpenedAt = nil
+    }
+
     func scrapeAndDistribute() {
-        let forceDOM = UserDefaults.standard.bool(forKey: Self.forceDOMOnlyKey)
-        // Auto-reset a stale circuit so JSON gets periodic re-attempts. The
-        // circuit re-opens on its own if 5 fresh failures recur.
-        if jsonCircuitOpen, let openedAt = jsonCircuitOpenedAt,
-           Date().timeIntervalSince(openedAt) >= Self.jsonCircuitResetInterval {
-            NSLog("%@", "[ClaudeMeter] json circuit auto-reset after \(Int(Self.jsonCircuitResetInterval/60))min cooldown")
-            jsonCircuitOpen = false
-            jsonConsecutiveFailures = 0
-            jsonCircuitOpenedAt = nil
-        }
-        if forceDOM || jsonCircuitOpen {
+        guard !isTornDown else { return }
+        fetchAttemptCount += 1
+        let forceDOM = UserDefaults.standard.bool(forKey: AppDelegate.forceDOMOnlyKey)
+        resetStaleCircuitIfNeeded()
+        let wakeFetch = wakeRetryArmed
+        wakeRetryArmed = false
+        // A pinned org is metered through the JSON path only: the DOM page
+        // could be showing a different org, so it never stands in.
+        let pinned = record.orgPinned
+        if !pinned && (forceDOM || jsonCircuitOpen) {
             let reason = forceDOM ? "forceDOMOnly=true" : "json circuit open"
             logFetchOutcome(path: "dom", outcome: "selected", detail: reason)
             scrapeViaDOM()
@@ -1133,7 +3319,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
             guard let self = self else { return }
             switch result {
             case .success(let sections):
-                if sections.isEmpty {
+                if sections.isEmpty && pinned {
+                    self.logFetchOutcome(path: "json", outcome: "empty", detail: "n=0 pinned org, no DOM fallback")
+                    self.distributeFetchResult([], path: "json")
+                } else if sections.isEmpty {
                     // Empty means our permissive Codable couldn't pull any meters
                     // from the response (shape mismatch or auth-soft-fail).
                     // Treat as failure and fall through to DOM rather than
@@ -1145,13 +3334,50 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                         self.jsonCircuitOpenedAt = Date()
                         NSLog("%@", "[ClaudeMeter] json circuit breaker tripped after \(self.jsonConsecutiveFailures) consecutive empty/error responses, falling back to DOM-only (will retry in \(Int(Self.jsonCircuitResetInterval/60))min)")
                     }
-                    self.scrapeViaDOM()
+                    self.scrapeViaDOM(refreshFirst: true)
                 } else {
                     self.jsonConsecutiveFailures = 0
+                    self.jsonSuccessCount += 1
                     self.logFetchOutcome(path: "json", outcome: "success", detail: "n=\(sections.count)")
                     self.distributeFetchResult(sections, path: "json")
+                    self.parkPageIfIdle(reason: "JSON healthy")
                 }
             case .failure(let err):
+                // A fetch already running: this request just merges into it.
+                if case .transport(let e) = err, (e as NSError).domain == "ClaudeMeter", (e as NSError).code == -1 {
+                    return
+                }
+                // Offline-class errors (no network, timeouts, DNS, our own
+                // cancel on pause): keep the last data (the empty-streak gate
+                // decides), no page load and no circuit count. A fetch right
+                // after a wake retries once, 15 s later.
+                if case .transport(let e) = err, Self.isOfflineError(e) {
+                    if (e as NSError).code == NSURLErrorCancelled { return }
+                    self.logFetchOutcome(path: "json", outcome: "error", detail: "transport error, keeping last data")
+                    self.distributeFetchResult([], path: "json")
+                    if wakeFetch {
+                        NSLog("%@", "[ClaudeMeter] account \(self.id): fetch after wake failed to connect; retrying once in 15 s")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                            guard let self = self, !self.isTornDown, !self.app.activityPaused else { return }
+                            self.refreshNow(reason: "wake retry")
+                        }
+                    }
+                    return
+                }
+                if pinned {
+                    // No DOM fallback and no circuit-breaker count for a pinned
+                    // org. Auth errors are confirmed in fetchViaJSON; other
+                    // errors keep the last data via the empty-streak gate.
+                    // Either way the empty-streak gate advances, so a side that
+                    // keeps failing clears to the placeholder after 3 tries.
+                    if case .http(let status) = err, [401, 403, 404].contains(status) {
+                        self.logFetchOutcome(path: "json", outcome: "error", detail: "\(err) pinned org, sign-in checked at most every 15 min")
+                    } else {
+                        self.logFetchOutcome(path: "json", outcome: "error", detail: "\(err) pinned org, no DOM fallback")
+                    }
+                    self.distributeFetchResult([], path: "json")
+                    return
+                }
                 self.jsonConsecutiveFailures += 1
                 self.logFetchOutcome(path: "json", outcome: "error", detail: "\(err) failures=\(self.jsonConsecutiveFailures)")
                 if self.jsonConsecutiveFailures >= Self.jsonFailureCircuitBreaker && !self.jsonCircuitOpen {
@@ -1159,7 +3385,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                     self.jsonCircuitOpenedAt = Date()
                     NSLog("%@", "[ClaudeMeter] json circuit breaker tripped after \(self.jsonConsecutiveFailures) consecutive failures, falling back to DOM-only (will retry in \(Int(Self.jsonCircuitResetInterval/60))min)")
                 }
-                self.scrapeViaDOM()
+                self.scrapeViaDOM(refreshFirst: true)
             }
         }
     }
@@ -1167,8 +3393,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     /// DOM scrape path: runs the JS scraper in WKWebView and funnels results
     /// through the shared distribution gate. Kept as a working fallback because
     /// the JSON endpoint is undocumented and may rotate.
-    private func scrapeViaDOM() {
-        webView.evaluateJavaScript(Self.scrapeUsageJS) { [weak self] result, error in
+    private func scrapeViaDOM(refreshFirst: Bool = false) {
+        // No page yet (parked): load it; its didFinish scrapes again.
+        guard let page = pageView, !page.isLoading else {
+            if pageView == nil { loadUsagePage(reason: "JSON unavailable, DOM fallback") }
+            return
+        }
+        // JSON just failed: as v2.7.1 did before a DOM scrape, click the
+        // page's own refresh button first, unless the page was just loaded.
+        if refreshFirst, Date().timeIntervalSince(lastPageLoadAt) > 10,
+           let url = page.url?.absoluteString, url.contains("/settings/usage") {
+            pageScriptCount += 1
+            page.evaluateJavaScript(Self.clickRefreshButtonJS) { [weak self] _, _ in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.scrapeViaDOM() }
+            }
+            return
+        }
+        pageScriptCount += 1
+        page.evaluateJavaScript(AppDelegate.scrapeUsageJS) { [weak self] result, error in
             guard let self = self else { return }
 
             // A nil/non-string result or an empty string means the JS errored
@@ -1196,7 +3438,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
 
     /// Shared distribution + empty-streak gate. Both JSON and DOM paths feed
     /// here so the popover and badge see a single source of truth.
-    private func distributeFetchResult(_ sections: [UsageSection], path: String) {
+    func distributeFetchResult(_ sections: [UsageSection], path: String) {
+        guard !isTornDown else { return }
         if sections.isEmpty {
             // Transient empty — keep last-known data on screen. Only a
             // sustained streak (threshold) is treated as a real failure.
@@ -1206,19 +3449,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                 NSLog("[ClaudeMeter] empty-scrape threshold reached, surfacing failure")
                 self.latestSections = []
                 self.usageView?.update(sections: [])
-                if self.showMenuBarBadge && self.popover?.isShown != true {
-                    self.setBadgeTitle("\u{2014}%", reason: "empty-scrape streak \(self.consecutiveEmptyScrapes)")
+                // Each badge side resets on its own account's failure streak.
+                if self.app.showMenuBarBadge && self.app.popover?.isShown != true {
+                    self.app.badgeAccountFailed(self, reason: "empty-scrape streak \(self.consecutiveEmptyScrapes)")
                 }
             }
             return
         }
 
         self.consecutiveEmptyScrapes = 0
-        UserDefaults.standard.set(path, forKey: Self.lastFetchPathKey)
-        NSLog("[ClaudeMeter] distributed \(sections.count) sections via \(path)")
+        self.noteFetchedSections(sections, path: path)
+        self.setSignedOut(false, reason: "fetch succeeded")
+        UserDefaults.standard.setIfChanged(path, forKey: self.lastFetchPathKey)
+        // Logged on change (count or path) and at most every 30 min otherwise.
+        let distributedKey = "\(sections.count)|\(path)"
+        if distributedKey != lastDistributedLogKey || Date().timeIntervalSince(lastDistributedLogAt) >= 1800 {
+            lastDistributedLogKey = distributedKey
+            lastDistributedLogAt = Date()
+            NSLog("[ClaudeMeter] distributed \(sections.count) sections via \(path)")
+        }
         let sections = self.applyResetEstimates(to: sections)
         self.latestSections = sections
-        self.notifier.evaluate(sections: sections)
+        // Name the account in notification titles only once a second account
+        // exists, so single-account titles stay exactly as before.
+        self.notifier.evaluate(sections: sections, accountID: self.id,
+                               accountLabel: self.app.accounts.count >= 2 ? self.record.displayName : nil)
 
         let sessionPct = self.sessionPercentage(from: sections) ?? 0
         let weeklyPct = self.weeklyPercentage(from: sections) ?? 0
@@ -1249,17 +3504,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         )
 
         self.lastSessionForecast = sessionForecast
-        self.usageView?.update(
-            sections: sections,
-            sessionForecast: sessionForecast,
-            weeklyForecast: weeklyForecast,
-            sessionResetAt: sessionReset,
-            weeklyResetAt: weeklyReset,
-            history: self.history
-        )
-        self.usageView?.setStatusFresh(true)
-        self.updateBadgeFromModel()
-        self.updateMenuBarTooltip()
+        self.lastWeeklyForecast = weeklyForecast
+        self.lastSessionResetAt = sessionReset
+        self.lastWeeklyResetAt = weeklyReset
+        // The popover's view is only rebuilt while it is shown; otherwise
+        // the latest data is replayed into it when it opens.
+        if self.app.popover?.isShown == true {
+            self.usageView?.update(
+                sections: sections,
+                sessionForecast: sessionForecast,
+                weeklyForecast: weeklyForecast,
+                sessionResetAt: sessionReset,
+                weeklyResetAt: weeklyReset,
+                history: self.history
+            )
+            self.usageView?.setStatusFresh(true)
+            self.viewNeedsRefresh = false
+        } else {
+            self.viewNeedsRefresh = true
+        }
+        self.app.updateBadgeFromModel()
+        self.app.updateMenuBarTooltip()
     }
 
     /// Extract the headline weekly percentage (the unscoped "Weekly" / "Weekly usage"
@@ -1307,13 +3572,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     /// NSLog("%@", ...) convention so the QA pipeline can detect path/outcome
     /// transitions from stderr alone.
     func logFetchOutcome(path: String, outcome: String, detail: String) {
+        // Logged when the outcome changes, and at most every 30 min while it
+        // stays the same (a heartbeat), not on every fetch.
+        let key = "\(path)|\(outcome)|\(detail)"
+        let now = Date()
+        guard key != lastFetchLogKey || now.timeIntervalSince(lastFetchLogAt) >= 1800 else { return }
+        lastFetchLogKey = key
+        lastFetchLogAt = now
         NSLog("%@", "[ClaudeMeter] fetch path=\(path) outcome=\(outcome) \(detail)")
     }
 
     // MARK: - Reset Estimation (DOM fallback)
 
-    static let firstSeenPrefix = "resetEstimate.firstSeen."
-    static let firstSeenPctPrefix = "resetEstimate.firstSeenPct."
+    // Key families; the account ID follows the family, the meter label is last.
+    static let firstSeenFamily = "resetEstimate.firstSeen"
+    static let firstSeenPctFamily = "resetEstimate.firstSeenPct"
 
     /// Fills missing UsageMeter.resetAt values with estimates. JSON path already
     /// populates resetAt directly; DOM path either parses from meter.detail or
@@ -1346,8 +3619,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
                 let isWeekly = section.title.lowercased().contains("weekly") || key.contains("weekly")
                 guard isSession || isWeekly else { return meter }
 
-                let firstSeenKey = Self.firstSeenPrefix + key
-                let firstSeenPctKey = Self.firstSeenPctPrefix + key
+                let firstSeenKey = AccountKeys.key(Self.firstSeenFamily, self.id, key)
+                let firstSeenPctKey = AccountKeys.key(Self.firstSeenPctFamily, self.id, key)
                 let stored = defaults.double(forKey: firstSeenKey)
                 let storedPct = defaults.integer(forKey: firstSeenPctKey)
                 let windowSeconds: TimeInterval = isWeekly ? 7 * 24 * 3600 : 5 * 3600
@@ -1369,99 +3642,99 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
         }
     }
 
-    // MARK: - Peak Window
-
-    /// True when "now" lies inside the configured peak-hour window (Mon-Fri
-    /// 5-11 AM Pacific by default). DST handled automatically by TimeZone.
-    static func isInPeakWindow(now: Date = Date()) -> Bool {
-        guard let tz = TimeZone(identifier: peakWindow.timeZone) else { return false }
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = tz
-        let hour = cal.component(.hour, from: now)
-        let weekday = cal.component(.weekday, from: now)
-        if peakWindow.weekdaysOnly && !(2...6).contains(weekday) { return false }
-        return hour >= peakWindow.startHour && hour < peakWindow.endHour
-    }
-
-    /// Time remaining until the peak window closes today. Returns nil when not
-    /// currently in the peak window.
-    static func peakWindowRemaining(now: Date = Date()) -> TimeInterval? {
-        guard isInPeakWindow(now: now), let tz = TimeZone(identifier: peakWindow.timeZone) else {
-            return nil
-        }
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = tz
-        var comps = cal.dateComponents([.year, .month, .day], from: now)
-        comps.hour = peakWindow.endHour
-        comps.minute = 0
-        comps.second = 0
-        guard let endDate = cal.date(from: comps) else { return nil }
-        return max(0, endDate.timeIntervalSince(now))
-    }
-
     // MARK: - JSON Fetch Path
 
-    /// JSON-primary fetch. Copies cookies from the WKWebView data store into a
-    /// per-call URLSession, discovers the org UUID lazily, and decodes the
-    /// undocumented /api/organizations/{uuid}/usage response.
+    /// JSON-primary fetch. Builds the Cookie header from this account's
+    /// WebKit store, uses the account's shared API session, discovers the org
+    /// UUID lazily, and decodes the undocumented
+    /// /api/organizations/{uuid}/usage response.
     func fetchViaJSON(completion: @escaping (Result<[UsageSection], FetchError>) -> Void) {
         if jsonFetchInFlight {
-            completion(.failure(.transport(NSError(domain: "ClaudeMeter", code: -1, userInfo: [NSLocalizedDescriptionKey: "fetch already in flight"]))))
-            return
+            if let started = jsonFetchStartedAt, Date().timeIntervalSince(started) > Self.jsonFetchStaleAfter {
+                // A lost callback must not block every later fetch; its late
+                // answer, if any, is ignored (generation check below).
+                NSLog("%@", "[ClaudeMeter] account \(id): fetch in flight for \(Int(Date().timeIntervalSince(started)))s, treating it as lost")
+                jsonFetchInFlight = false
+            } else {
+                completion(.failure(.transport(NSError(domain: "ClaudeMeter", code: -1, userInfo: [NSLocalizedDescriptionKey: "fetch already in flight"]))))
+                return
+            }
         }
         jsonFetchInFlight = true
+        jsonFetchStartedAt = Date()
+        jsonFetchGeneration += 1
+        let generation = jsonFetchGeneration
+        let finish: (Result<[UsageSection], FetchError>) -> Void = { [weak self] result in
+            guard let self = self, generation == self.jsonFetchGeneration else { return }
+            self.jsonFetchInFlight = false
+            self.jsonFetchStartedAt = nil
+            completion(result)
+        }
 
         copyCookiesToSession { [weak self] session in
             guard let self = self else { return }
+            self.lastOrgListTransportError = nil
             self.discoverOrgUUID(session: session) { [weak self] uuid in
                 guard let self = self else { return }
                 guard let uuid = uuid else {
-                    self.jsonFetchInFlight = false
-                    completion(.failure(.noOrg))
+                    // Org discovery could not connect: same as an offline
+                    // usage request (keeps the last data, no circuit count).
+                    if let e = self.lastOrgListTransportError {
+                        finish(.failure(.transport(e)))
+                    } else {
+                        finish(.failure(.noOrg))
+                    }
                     return
                 }
 
-                let urlStr = "https://claude.ai" + String(format: Self.apiUsagePath, uuid)
+                let urlStr = "https://claude.ai" + String(format: AppDelegate.apiUsagePath, uuid)
                 guard let url = URL(string: urlStr) else {
-                    self.jsonFetchInFlight = false
-                    completion(.failure(.noOrg))
+                    finish(.failure(.noOrg))
                     return
                 }
 
                 var req = URLRequest(url: url)
                 req.setValue("application/json", forHTTPHeaderField: "Accept")
-                req.setValue(Self.safariUA, forHTTPHeaderField: "User-Agent")
+                req.setValue(AppDelegate.safariUA, forHTTPHeaderField: "User-Agent")
+                self.applyCookieHeader(to: &req)
 
                 session.dataTask(with: req) { [weak self] data, response, error in
                     guard let self = self else { return }
                     DispatchQueue.main.async {
-                        self.jsonFetchInFlight = false
+                        guard generation == self.jsonFetchGeneration else { return }
+                        self.storeResponseCookies(response)
                         if let error = error {
-                            completion(.failure(.transport(error)))
+                            finish(.failure(.transport(error)))
                             return
                         }
                         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                         if status == 401 || status == 403 || status == 404 {
-                            // Cached UUID may be stale; clear so next attempt rediscovers.
-                            self.cachedOrgUUID = nil
-                            UserDefaults.standard.removeObject(forKey: Self.cachedOrgUUIDKey)
-                            completion(.failure(.http(status)))
+                            if self.record.orgPinned {
+                                // Never silently swap a user-pinned org for another
+                                // one: keep the UUID; sign out only if the API agrees.
+                                self.confirmSignedOut(reason: "usage API HTTP \(status) for pinned org", throttled: true)
+                            } else {
+                                // Cached UUID may be stale; clear so next attempt rediscovers.
+                                self.cachedOrgUUID = nil
+                                self.persistRecord()
+                            }
+                            finish(.failure(.http(status)))
                             return
                         }
                         if status < 200 || status >= 300 {
-                            completion(.failure(.http(status)))
+                            finish(.failure(.http(status)))
                             return
                         }
                         guard let data = data else {
-                            completion(.failure(.http(status)))
+                            finish(.failure(.http(status)))
                             return
                         }
                         do {
                             let decoded = try JSONDecoder().decode(UsageAPIResponse.self, from: data)
                             let sections = self.normalizeJSONResponse(decoded)
-                            completion(.success(sections))
+                            finish(.success(sections))
                         } catch {
-                            completion(.failure(.decode(error)))
+                            finish(.failure(.decode(error)))
                         }
                     }
                 }.resume()
@@ -1473,53 +3746,78 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     /// Picks the org whose capabilities include claude_pro/claude_max when present,
     /// else the first org in the list.
     func discoverOrgUUID(session: URLSession, completion: @escaping (String?) -> Void) {
+        // A user-pinned org (chosen at sign-in) is never re-picked.
+        if record.orgPinned {
+            completion(cachedOrgUUID)
+            return
+        }
         // Re-fetch when uuid is cached but plan tier isn't, so the chip
         // populates after upgrading to a build that captures it.
         if let cached = cachedOrgUUID, !cached.isEmpty, cachedPlanTier != nil {
             completion(cached)
             return
         }
-        var req = URLRequest(url: Self.apiOrgsURL)
+        requestOrgList(session: session, context: "discoverOrgUUID") { [weak self] _, list in
+            guard let self = self else { return }
+            let orgs = list ?? []
+            let preferred = orgs.first { ($0.capabilities ?? []).contains { c in
+                c == "claude_pro" || c == "claude_max"
+            } }
+            let chosen = preferred ?? orgs.first
+            if let chosen = chosen {
+                self.cachedOrgUUID = chosen.uuid
+                if let name = chosen.name, !name.isEmpty {
+                    self.record.orgName = name
+                }
+                if let tier = chosen.rate_limit_tier, !tier.isEmpty {
+                    self.cachedPlanTier = tier
+                    NSLog("%@", "[ClaudeMeter] plan tier resolved: \(tier)")
+                }
+                self.record.planVariant = AppDelegate.planVariant(for: chosen)
+                AppDelegate.logUnmappedTier(chosen, context: "discoverOrgUUID")
+                self.persistRecord()
+                self.usageView?.planTierDisplayName = self.planDisplayName
+            }
+            completion(chosen?.uuid)
+        }
+    }
+
+    /// GET /api/organizations with this account's cookies. Calls back on the
+    /// main queue with the HTTP status (0 on a transport error) and the
+    /// decoded orgs (nil unless 2xx with a readable list). Logs counts only.
+    func requestOrgList(session: URLSession, context: String, quiet: Bool = false,
+                        completion: @escaping (Int, [OrgListResponse.Org]?) -> Void) {
+        var req = URLRequest(url: AppDelegate.apiOrgsURL)
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.setValue(Self.safariUA, forHTTPHeaderField: "User-Agent")
+        req.setValue(AppDelegate.safariUA, forHTTPHeaderField: "User-Agent")
+        applyCookieHeader(to: &req)
 
         session.dataTask(with: req) { [weak self] data, response, err in
-            guard let self = self else { return }
             DispatchQueue.main.async {
+                self?.storeResponseCookies(response)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if let err = err {
-                    NSLog("%@", "[ClaudeMeter] discoverOrgUUID transport error: \(err.localizedDescription)")
-                    completion(nil); return
+                    if !quiet { NSLog("%@", "[ClaudeMeter] \(context) transport error: \(err.localizedDescription)") }
+                    if AccountController.isOfflineError(err) { self?.lastOrgListTransportError = err }
+                    completion(0, nil); return
                 }
                 guard status >= 200, status < 300, let data = data else {
-                    NSLog("%@", "[ClaudeMeter] discoverOrgUUID HTTP \(status), bytes=\(data?.count ?? 0)")
-                    completion(nil); return
+                    if !quiet { NSLog("%@", "[ClaudeMeter] \(context) HTTP \(status), bytes=\(data?.count ?? 0)") }
+                    completion(status, nil); return
                 }
-                var orgs: [OrgListResponse.Org] = []
+                let orgs: [OrgListResponse.Org]
                 if let arr = try? JSONDecoder().decode([OrgListResponse.Org].self, from: data) {
                     orgs = arr
                 } else if let env = try? JSONDecoder().decode(OrgListResponse.self, from: data) {
                     orgs = env.organizations ?? []
                 } else {
-                    let preview = String(data: data.prefix(200), encoding: .utf8) ?? "<binary>"
-                    NSLog("%@", "[ClaudeMeter] discoverOrgUUID decode failed; first 200 bytes: \(preview)")
+                    // Unknown shape: report no list (inconclusive), never an
+                    // empty one that would read as "org no longer listed".
+                    NSLog("%@", "[ClaudeMeter] \(context) decode failed (\(data.count) bytes)")
+                    completion(status, nil); return
                 }
-                NSLog("%@", "[ClaudeMeter] discoverOrgUUID got \(orgs.count) orgs")
-                let preferred = orgs.first { ($0.capabilities ?? []).contains { c in
-                    c == "claude_pro" || c == "claude_max"
-                } }
-                let chosen = preferred ?? orgs.first
-                if let chosen = chosen {
-                    self.cachedOrgUUID = chosen.uuid
-                    UserDefaults.standard.set(chosen.uuid, forKey: Self.cachedOrgUUIDKey)
-                    if let tier = chosen.rate_limit_tier, !tier.isEmpty {
-                        self.cachedPlanTier = tier
-                        UserDefaults.standard.set(tier, forKey: Self.cachedPlanTierKey)
-                        NSLog("%@", "[ClaudeMeter] plan tier resolved: \(tier)")
-                    }
-                    self.usageView?.planTierDisplayName = Self.planTierDisplayName(slug: self.cachedPlanTier)
-                }
-                completion(chosen?.uuid)
+                if !quiet { NSLog("%@", "[ClaudeMeter] \(context) got \(orgs.count) orgs") }
+                completion(status, orgs)
             }
         }.resume()
     }
@@ -1528,30 +3826,67 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     /// endpoint may be circuit-broken or shape-mismatched, but plan tier still
     /// works because /api/organizations is a different endpoint.
     func refreshPlanTierIfNeeded() {
+        // Refresh the tier and Team/Enterprise kind of the current org from
+        // the org list once per launch when a pinned org's tier is missing,
+        // or any account's "raven" tier has no kind yet. Only the current
+        // org's fields are updated: the selection rule is untouched and a
+        // pinned org is never re-picked.
+        let tier = (record.planTier ?? "").lowercased()
+        let ravenWithoutKind = tier.contains("raven") && record.planVariant == nil
+        if record.orgPinned || (ravenWithoutKind && record.orgUUID != nil) {
+            guard !tierKindRefreshedThisLaunch, (record.orgPinned && tier.isEmpty) || ravenWithoutKind,
+                  let pinned = record.orgUUID else { return }
+            tierKindRefreshedThisLaunch = true
+            copyCookiesToSession(logCount: false) { [weak self] session in
+                guard let self = self else { return }
+                self.requestOrgList(session: session, context: "tierRefresh", quiet: true) { [weak self] _, orgs in
+                    guard let self = self, let org = orgs?.first(where: { $0.uuid == pinned }) else { return }
+                    AppDelegate.logUnmappedTier(org, context: "tierRefresh")
+                    self.updateRecord { r in
+                        if let t = org.rate_limit_tier, !t.isEmpty { r.planTier = t }
+                        r.planVariant = AppDelegate.planVariant(for: org)
+                    }
+                    self.usageView?.planTierDisplayName = self.planDisplayName
+                }
+            }
+            return
+        }
         copyCookiesToSession { [weak self] session in
             guard let self = self else { return }
             self.discoverOrgUUID(session: session) { _ in }
         }
     }
 
-    /// Snapshots all WKWebView cookies into a URLSession so the JSON request
-    /// rides the same authenticated session as the page itself.
-    func copyCookiesToSession(completion: @escaping (URLSession) -> Void) {
-        let store = webView.configuration.websiteDataStore.httpCookieStore
-        store.getAllCookies { cookies in
-            // ephemeral config already has its own in-memory HTTPCookieStorage.
-            // The previous sharedCookieStorage(forGroupContainerIdentifier:)
-            // path required an app-group entitlement we don't have, which is
-            // why cookies weren't actually being attached to outbound requests.
-            let config = URLSessionConfiguration.ephemeral
-            if let jar = config.httpCookieStorage {
-                for c in cookies { jar.setCookie(c) }
+    /// Refreshes the Cookie header from this account's WebKit store (the
+    /// same session the page and the sign-in window use) and hands back the
+    /// account's shared API session (never invalidated by callers).
+    func copyCookiesToSession(logCount: Bool = true, completion: @escaping (URLSession) -> Void) {
+        // WebKit only exposes a store's persisted cookies once its network
+        // session has done some work; with the page parked nothing else wakes
+        // it. fetchDataRecords does, without starting a WebContent process.
+        guard cookieStoreWarm else {
+            dataStore.fetchDataRecords(ofTypes: [WKWebsiteDataTypeCookies]) { [weak self] _ in
+                guard let self = self, !self.isTornDown else { return }
+                self.cookieStoreWarm = true
+                self.copyCookiesToSession(logCount: logCount, completion: completion)
             }
-            config.httpShouldSetCookies = true
-            config.httpCookieAcceptPolicy = .always
-            NSLog("%@", "[ClaudeMeter] copyCookiesToSession: attached \(cookies.count) cookies")
-            let session = URLSession(configuration: config)
-            DispatchQueue.main.async { completion(session) }
+            return
+        }
+        dataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+            DispatchQueue.main.async {
+                guard let self = self, !self.isTornDown else { return }
+                let matching = cookies.filter { Self.cookie($0, matches: AppDelegate.apiOrgsURL) }
+                // None at all: warm the store again before the next request
+                // (WebKit may have restarted its network process).
+                if matching.isEmpty { self.cookieStoreWarm = false }
+                self.cookieHeader = HTTPCookie.requestHeaderFields(with: matching)["Cookie"]
+                // Logged only when the count changes (not on every fetch).
+                if logCount && matching.count != self.lastLoggedCookieCount {
+                    self.lastLoggedCookieCount = matching.count
+                    NSLog("%@", "[ClaudeMeter] copyCookiesToSession: attached \(matching.count) cookies")
+                }
+                completion(self.apiSession)
+            }
         }
     }
 
@@ -1663,6 +3998,371 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDe
     }
 }
 
+// MARK: - Accounts (model, key namespacing, persistence, migration)
+
+/// Where an account appears in the two-slot menu-bar badge.
+enum BadgeSlot: String, Codable {
+    case left, right, hidden
+}
+
+/// Persisted, non-secret description of one metered claude.ai account.
+/// Cookies and tokens never live here: WebKit's website data store (the
+/// default store for the primary account, an identifier-keyed store for any
+/// other) is the only session persistence.
+struct AccountRecord: Codable, Equatable {
+    /// Fixed ID of the first account, the one Claude Desktop's cookie import
+    /// feeds and that lives in WKWebsiteDataStore.default().
+    static let primaryID = "primary"
+
+    let id: String
+    var displayName: String
+    /// 1 to 3 characters shown in the badge once two or more accounts exist.
+    var badgeLabel: String
+    var badgeSlot: BadgeSlot
+    var email: String?
+    var orgUUID: String?
+    var orgName: String?
+    var planTier: String?
+    /// True once the user picked this org. A pinned org is never silently
+    /// replaced: an auth failure keeps the UUID and the account reads as
+    /// signed out instead.
+    var orgPinned: Bool
+    /// Identifier for WKWebsiteDataStore(forIdentifier:); nil means the
+    /// default store (primary account only).
+    var storeIdentifier: String?
+    /// AccountColor raw value as stored. Kept verbatim (an unknown key from
+    /// another build round-trips); AppDelegate.accountColor(for:) falls back
+    /// to the default when it is missing or unknown.
+    var colorKey: String? = nil
+    /// Team/Enterprise kind for "raven" plan tiers (see planVariant(for:)).
+    var planVariant: String? = nil
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case id, displayName, badgeLabel, badgeSlot, email, orgUUID, orgName, planTier, orgPinned, storeIdentifier, colorKey, planVariant
+    }
+
+    var isPrimary: Bool { id == Self.primaryID }
+
+    /// Account IDs are "primary" or a UUID string. Neither contains a dot, so
+    /// the ID is always exactly one segment of a namespaced key.
+    static func isValidID(_ id: String) -> Bool {
+        id == primaryID || UUID(uuidString: id) != nil
+    }
+
+    /// Badge labels: at most 3 characters, with no whitespace, "|", "%" or
+    /// "'" (they would blur the badge's "P 47% | W 12%" form and its QA
+    /// parsing). Returns nil if nothing usable is left.
+    static func sanitizeBadgeLabel(_ text: String) -> String? {
+        let banned: Set<Character> = ["|", "%", "'"]
+        let kept = text.filter { !$0.isWhitespace && !banned.contains($0) }
+        guard !kept.isEmpty else { return nil }
+        return String(kept.prefix(3))
+    }
+
+    static func defaultBadgeLabel(for name: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return sanitizeBadgeLabel(trimmed.uppercased()).map { String($0.prefix(1)) } ?? "?"
+    }
+
+    static func makePrimary(orgUUID: String? = nil, planTier: String? = nil) -> AccountRecord {
+        let name = "Personal"
+        return AccountRecord(id: primaryID, displayName: name,
+                             badgeLabel: defaultBadgeLabel(for: name), badgeSlot: .left,
+                             email: nil, orgUUID: orgUUID, orgName: nil, planTier: planTier,
+                             orgPinned: false, storeIdentifier: nil, colorKey: AccountColor.blue.rawValue)
+    }
+}
+
+extension AccountRecord {
+    /// Tolerant decoding. Only `id` is required (and must be valid); every
+    /// other field falls back to a default, and an unknown badgeSlot reads as
+    /// hidden, so a record written by an older or newer build never fails the
+    /// list. Declared in an extension to keep the memberwise initializer.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let id = try c.decode(String.self, forKey: .id)
+        guard AccountRecord.isValidID(id) else {
+            throw DecodingError.dataCorruptedError(forKey: .id, in: c, debugDescription: "invalid account id")
+        }
+        let isPrimary = id == AccountRecord.primaryID
+        func string(_ key: CodingKeys) -> String? {
+            guard let value = try? c.decodeIfPresent(String.self, forKey: key), !value.isEmpty else { return nil }
+            return value
+        }
+        let name = string(.displayName) ?? (isPrimary ? "Personal" : "Account")
+        let slot: BadgeSlot
+        if let raw = string(.badgeSlot) {
+            slot = BadgeSlot(rawValue: raw) ?? .hidden
+        } else {
+            slot = isPrimary ? .left : .hidden
+        }
+        self.init(id: id,
+                  displayName: name,
+                  badgeLabel: string(.badgeLabel).flatMap(AccountRecord.sanitizeBadgeLabel)
+                      ?? AccountRecord.defaultBadgeLabel(for: name),
+                  badgeSlot: slot,
+                  email: string(.email),
+                  orgUUID: string(.orgUUID),
+                  orgName: string(.orgName),
+                  planTier: string(.planTier),
+                  orgPinned: (try? c.decodeIfPresent(Bool.self, forKey: .orgPinned)) ?? false,
+                  storeIdentifier: string(.storeIdentifier),
+                  colorKey: string(.colorKey),
+                  planVariant: string(.planVariant))
+    }
+}
+
+/// Builds per-account UserDefaults keys. The account ID sits right after the
+/// key family and before any trailing component:
+///   lastFetchPath.<id>
+///   resetEstimate.firstSeen.<id>.<meter label>
+///   notif.fired.<id>.<scope>.<threshold>.<cycle>
+/// so ThresholdNotifier.pruneStaleKeys still reads the cycle timestamp as the
+/// last dot-separated component.
+enum AccountKeys {
+    static func key(_ family: String, _ accountID: String, _ rest: String? = nil) -> String {
+        guard let rest = rest, !rest.isEmpty else { return "\(family).\(accountID)" }
+        return "\(family).\(accountID).\(rest)"
+    }
+}
+
+/// Loads and saves the account list and runs the one-time migration of
+/// v2.7.1's global per-account state. The list is a JSON string in
+/// UserDefaults: {"schema": 1, "accounts": [ ...records... ]}.
+enum AccountStore {
+    static let listKey = "accounts.list"
+    static let unreadableKey = "accounts.list.unreadable"
+    static let listSchemaVersion = 1
+    static let migrationVersionKey = "accounts.migrationVersion"
+    static let currentMigrationVersion = 1
+
+    /// What is stored, as read. Raw dictionaries are kept so a save
+    /// round-trips fields this build does not know, plus any record it could
+    /// not decode, instead of dropping them.
+    private struct Stored {
+        var records: [AccountRecord] = []
+        var rawByID: [String: [String: Any]] = [:]
+        var undecodable: [Any] = []
+        var schema = AccountStore.listSchemaVersion
+        /// False when a value exists but is not a readable list. Saving is
+        /// then refused, so a list we failed to read is never overwritten.
+        var writable = true
+    }
+
+    private static func read() -> Stored {
+        var out = Stored()
+        guard let json = UserDefaults.standard.string(forKey: listKey) else { return out }
+        let parsed = json.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) }
+        let elements: [Any]?
+        if let envelope = parsed as? [String: Any] {
+            elements = envelope["accounts"] as? [Any]
+            out.schema = max(listSchemaVersion, envelope["schema"] as? Int ?? listSchemaVersion)
+        } else {
+            elements = parsed as? [Any]   // bare array, written before the schema envelope
+        }
+        guard let items = elements else {
+            preserveUnreadable(json, reason: "not a readable account list")
+            out.writable = false
+            return out
+        }
+        for item in items {
+            guard let dict = item as? [String: Any],
+                  let data = try? JSONSerialization.data(withJSONObject: dict),
+                  let record = try? JSONDecoder().decode(AccountRecord.self, from: data),
+                  out.rawByID[record.id] == nil else {
+                out.undecodable.append(item)
+                continue
+            }
+            out.records.append(record)
+            out.rawByID[record.id] = dict
+        }
+        if !out.undecodable.isEmpty {
+            preserveUnreadable(json, reason: "\(out.undecodable.count) record(s) could not be decoded and are kept as-is")
+        }
+        return out
+    }
+
+    /// Keeps the first unreadable value seen (non-secret) under unreadableKey.
+    private static func preserveUnreadable(_ json: String, reason: String) {
+        guard UserDefaults.standard.object(forKey: unreadableKey) == nil else { return }
+        UserDefaults.standard.set(json, forKey: unreadableKey)
+        NSLog("%@", "[ClaudeMeter] accounts: \(reason); raw value kept in \(unreadableKey)")
+    }
+
+    static func load() -> [AccountRecord] {
+        read().records
+    }
+
+    /// True when the saved list (if any) parsed and every record decoded.
+    static var isListFullyReadable: Bool {
+        let stored = read()
+        return stored.writable && stored.undecodable.isEmpty
+    }
+
+    static func save(_ records: [AccountRecord]) {
+        let stored = read()
+        guard stored.writable else {
+            NSLog("%@", "[ClaudeMeter] accounts: not saving, the stored list is unreadable (see \(unreadableKey))")
+            return
+        }
+        let knownKeys = Set(AccountRecord.CodingKeys.allCases.map { $0.rawValue })
+        var items: [Any] = []
+        for record in records {
+            guard let data = try? JSONEncoder().encode(record),
+                  let known = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+            // Start from what was stored so unknown (newer) fields survive,
+            // then apply every field this build knows, dropping known fields
+            // that are now nil.
+            var merged = stored.rawByID[record.id] ?? [:]
+            for key in knownKeys { merged.removeValue(forKey: key) }
+            for (key, value) in known { merged[key] = value }
+            items.append(merged)
+        }
+        items.append(contentsOf: stored.undecodable)
+        let envelope: [String: Any] = ["schema": stored.schema, "accounts": items]
+        guard let data = try? JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys]),
+              let json = String(data: data, encoding: .utf8) else { return }
+        UserDefaults.standard.set(json, forKey: listKey)
+    }
+
+    /// Inserts or replaces one record by ID, keeping every other record.
+    static func upsert(_ record: AccountRecord) {
+        var records = load()
+        if let i = records.firstIndex(where: { $0.id == record.id }) {
+            records[i] = record
+        } else {
+            records.insert(record, at: record.isPrimary ? 0 : records.count)
+        }
+        save(records)
+    }
+
+    /// Deletes one record from the saved list (other records untouched).
+    static func remove(id: String) {
+        save(load().filter { $0.id != id })
+    }
+
+    /// Every per-account key family. Keys are "<family>.<id>" or
+    /// "<family>.<id>.<rest>".
+    static var perAccountKeyFamilies: [String] {
+        [AppDelegate.lastFetchPathKey, AppDelegate.lastBadgePercentageKey,
+         AccountController.firstSeenFamily, AccountController.firstSeenPctFamily,
+         ThresholdNotifier.cycleStartFamily, ThresholdNotifier.firedFamily,
+         ThresholdNotifier.lastPctFamily, ThresholdNotifier.snoozedFamily]
+    }
+
+    /// Removes every namespaced key of one secondary account, matching the ID
+    /// as an exact key segment (never a bare prefix). Returns the count.
+    @discardableResult
+    static func removeKeys(forAccount id: String) -> Int {
+        guard AccountRecord.isValidID(id), id != AccountRecord.primaryID else { return 0 }
+        let defaults = UserDefaults.standard
+        var removed = 0
+        for key in defaults.dictionaryRepresentation().keys {
+            for family in perAccountKeyFamilies where key == "\(family).\(id)" || key.hasPrefix("\(family).\(id).") {
+                defaults.removeObject(forKey: key)
+                removed += 1
+                break
+            }
+        }
+        return removed
+    }
+
+    /// The primary account's record, created and saved if missing.
+    static func primaryRecord() -> AccountRecord {
+        if let existing = load().first(where: { $0.isPrimary }) { return existing }
+        let record = AccountRecord.makePrimary()
+        upsert(record)
+        return record
+    }
+
+    /// One-time upgrade from v2.7.1. Copies the global per-account values and
+    /// history.json into the primary account's namespace, then records the
+    /// migration version. Copy-only: every legacy key and history.json stay in
+    /// place for one release as a rollback path, and a destination that
+    /// already exists is never overwritten, so re-running is harmless. If the
+    /// history copy fails the version is not recorded, so the next launch
+    /// retries (UsageHistory also reads history.json for the primary account
+    /// until history-primary.json exists).
+    static func migrateIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard defaults.integer(forKey: migrationVersionKey) < currentMigrationVersion else { return }
+        let pid = AccountRecord.primaryID
+        var copied = 0
+
+        func copy(_ from: String, to: String) {
+            guard let value = defaults.object(forKey: from), defaults.object(forKey: to) == nil else { return }
+            defaults.set(value, forKey: to)
+            copied += 1
+        }
+
+        // Fixed keys.
+        copy(AppDelegate.lastFetchPathKey, to: AccountKeys.key(AppDelegate.lastFetchPathKey, pid))
+        copy(AppDelegate.lastBadgePercentageKey, to: AccountKeys.key(AppDelegate.lastBadgePercentageKey, pid))
+        for scope in ["session", "weekly"] {
+            copy("\(ThresholdNotifier.cycleStartFamily).\(scope)",
+                 to: AccountKeys.key(ThresholdNotifier.cycleStartFamily, pid, scope))
+        }
+
+        // Families with a trailing component. Notification keys qualify only
+        // when the component after the family is a scope, which excludes keys
+        // that are already namespaced. A reset-estimate key is skipped when its
+        // next segment is an account ID ("primary" or a UUID), so no account's
+        // keys are ever nested under primary.
+        let legacyKeys = Array(defaults.dictionaryRepresentation().keys)
+        let notifFamilies = [ThresholdNotifier.firedFamily, ThresholdNotifier.lastPctFamily,
+                             ThresholdNotifier.snoozedFamily]
+        let resetFamilies = [AccountController.firstSeenFamily, AccountController.firstSeenPctFamily]
+        for key in legacyKeys {
+            for family in notifFamilies where key.hasPrefix(family + ".") {
+                let rest = String(key.dropFirst(family.count + 1))
+                if rest.hasPrefix("session.") || rest.hasPrefix("weekly.") {
+                    copy(key, to: AccountKeys.key(family, pid, rest))
+                }
+            }
+            for family in resetFamilies where key.hasPrefix(family + ".") {
+                let rest = String(key.dropFirst(family.count + 1))
+                let segments = rest.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+                let namespaced = segments.count == 2 && AccountRecord.isValidID(String(segments[0]))
+                if !rest.isEmpty && !namespaced {
+                    copy(key, to: AccountKeys.key(family, pid, rest))
+                }
+            }
+        }
+
+        // Account record: org and tier from the v2.7.1 globals.
+        var record = load().first(where: { $0.isPrimary }) ?? AccountRecord.makePrimary()
+        if record.orgUUID == nil { record.orgUUID = defaults.string(forKey: AppDelegate.cachedOrgUUIDKey) }
+        if record.planTier == nil { record.planTier = defaults.string(forKey: AppDelegate.cachedPlanTierKey) }
+        upsert(record)
+
+        // History file.
+        var historyOK = true
+        let historyResult: String
+        let fm = FileManager.default
+        let legacy = UsageHistory.legacyFileURL
+        let target = UsageHistory.fileURL(accountID: pid)
+        if fm.fileExists(atPath: target.path) {
+            historyResult = "kept existing"
+        } else if fm.fileExists(atPath: legacy.path) {
+            do {
+                try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fm.copyItem(at: legacy, to: target)
+                historyResult = "copied"
+            } catch {
+                historyOK = false
+                historyResult = "copy failed (\(error.localizedDescription)); will retry next launch"
+            }
+        } else {
+            historyResult = "none to copy"
+        }
+
+        if historyOK {
+            defaults.set(currentMigrationVersion, forKey: migrationVersionKey)
+        }
+        NSLog("%@", "[ClaudeMeter] accounts migration v\(currentMigrationVersion): copied \(copied) keys into '\(pid)', history: \(historyResult)")
+    }
+}
+
 // MARK: - Usage Data Model
 
 struct UsageMeter: Equatable {
@@ -1725,8 +4425,26 @@ struct UsageAPIResponse: Decodable {
 struct OrgListResponse: Decodable {
     struct Org: Decodable {
         let uuid: String
+        let name: String?
         let capabilities: [String]?
         let rate_limit_tier: String?
+        /// Team/Enterprise kind for "raven" orgs, when the API sends it.
+        let raven_type: String?
+
+        enum CodingKeys: String, CodingKey {
+            case uuid, name, capabilities, rate_limit_tier, raven_type
+        }
+
+        /// Same as the synthesized decoder, except that raven_type of any
+        /// unexpected type reads as nil instead of failing the org list.
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            uuid = try c.decode(String.self, forKey: .uuid)
+            name = try c.decodeIfPresent(String.self, forKey: .name)
+            capabilities = try c.decodeIfPresent([String].self, forKey: .capabilities)
+            rate_limit_tier = try c.decodeIfPresent(String.self, forKey: .rate_limit_tier)
+            raven_type = (try? c.decodeIfPresent(String.self, forKey: .raven_type)) ?? nil
+        }
     }
     let organizations: [Org]?
 }
@@ -1737,6 +4455,31 @@ enum FetchError: Error {
     case http(Int)
     case decode(Error)
     case transport(Error)
+}
+
+// MARK: - App Paths
+
+/// Application Support folder for this build. The shipping app
+/// (com.local.ClaudeMeter) and unbundled binaries keep the historical
+/// "ClaudeMeter" folder, so real-app paths never change. Any other bundle ID
+/// (for example the QA bundle, com.local.ClaudeMeter.qa) gets a folder named
+/// after its bundle ID, so test runs never read, migrate or overwrite the
+/// installed app's history files.
+enum AppPaths {
+    static let shippingBundleID = "com.local.ClaudeMeter"
+
+    static var supportDirectory: URL {
+        let fm = FileManager.default
+        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        let folder: String
+        if let id = Bundle.main.bundleIdentifier, !id.isEmpty, id != shippingBundleID {
+            folder = id
+        } else {
+            folder = "ClaudeMeter"
+        }
+        return base.appendingPathComponent(folder, isDirectory: true)
+    }
 }
 
 // MARK: - Usage History (ring buffer + disk persistence)
@@ -1754,19 +4497,39 @@ struct UsageHistory {
 
     private(set) var samples: [Sample] = []
     private var lastPersist: Date = .distantPast
+    /// Where this history persists; nil means in-memory only.
+    private(set) var fileURL: URL?
     private static let retentionSeconds: TimeInterval = 24 * 3600
-    private static let persistThrottle: TimeInterval = 30
+    /// History is rewritten at most every 5 minutes, or sooner when a value
+    /// moved by 2 points or more since the last write, and on quit / sleep.
+    private static let persistThrottle: TimeInterval = 300
+    private var lastPersistedSession: Int?
+    private var lastPersistedWeekly: Int?
 
-    static var fileURL: URL {
-        let fm = FileManager.default
-        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
-        return base.appendingPathComponent("ClaudeMeter/history.json")
+    /// v2.7.1 single-account file. Read only by the one-time migration and
+    /// left in place as a rollback path.
+    static var legacyFileURL: URL {
+        AppPaths.supportDirectory.appendingPathComponent("history.json")
     }
 
-    static func loadFromDisk() -> UsageHistory {
+    /// Per-account file, e.g. history-primary.json.
+    static func fileURL(accountID: String) -> URL {
+        AppPaths.supportDirectory.appendingPathComponent("history-\(accountID).json")
+    }
+
+    static func loadFromDisk(accountID: String) -> UsageHistory {
         var h = UsageHistory()
-        guard let data = try? Data(contentsOf: fileURL),
+        let fileURL = Self.fileURL(accountID: accountID)
+        h.fileURL = fileURL
+        // Until the migration has produced history-primary.json, the primary
+        // account reads v2.7.1's history.json. Writes always go to fileURL.
+        var readURL = fileURL
+        if accountID == AccountRecord.primaryID,
+           !FileManager.default.fileExists(atPath: fileURL.path),
+           FileManager.default.fileExists(atPath: legacyFileURL.path) {
+            readURL = legacyFileURL
+        }
+        guard let data = try? Data(contentsOf: readURL),
               let envelope = try? JSONDecoder().decode(Envelope.self, from: data) else {
             return h
         }
@@ -1785,11 +4548,27 @@ struct UsageHistory {
     }
 
     mutating func persistThrottled(now: Date = Date()) {
-        guard now.timeIntervalSince(lastPersist) >= Self.persistThrottle else { return }
+        guard let url = fileURL else { return }
+        let significant = samples.last.map { latest in
+            abs(latest.s - (lastPersistedSession ?? Int.min / 2)) >= 2
+                || abs(latest.w - (lastPersistedWeekly ?? Int.min / 2)) >= 2
+        } ?? false
+        guard significant || now.timeIntervalSince(lastPersist) >= Self.persistThrottle else { return }
+        write(to: url, now: now)
+    }
+
+    /// Writes now (quit, sleep), if there is anything to write.
+    mutating func persistNow() {
+        guard let url = fileURL, !samples.isEmpty else { return }
+        write(to: url, now: Date())
+    }
+
+    private mutating func write(to url: URL, now: Date) {
+        lastPersistedSession = samples.last?.s
+        lastPersistedWeekly = samples.last?.w
         lastPersist = now
         let envelope = Envelope(version: 1, samples: samples)
         guard let data = try? JSONEncoder().encode(envelope) else { return }
-        let url = Self.fileURL
         let dir = url.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try? data.write(to: url, options: .atomic)
@@ -1810,14 +4589,20 @@ struct UsageHistory {
 // MARK: - Threshold Notifier
 
 /// Fires macOS user notifications when session/weekly usage crosses 50/75/90%.
-/// Idempotent per cycle: each (scope, threshold, cycleKey) tuple fires at most
-/// once. Per-threshold mute toggles and a "Snooze rest of cycle" action let
-/// users opt out without disabling notifications globally.
+/// Idempotent per cycle: each (account, scope, threshold, cycleKey) tuple fires
+/// at most once. Per-threshold mute toggles (global, shared by all accounts)
+/// and a per-account "Snooze rest of cycle" action let users opt out without
+/// disabling notifications globally. One shared instance is the
+/// UNUserNotificationCenter delegate; all cycle, fired, last-percentage and
+/// snooze state is namespaced by account ID (see AccountKeys).
 final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
     static let enabledKey = "notif.enabled"
     static let authRequestedKey = "notif.authRequested"
-    static let cycleStartSessionKey = "notif.cycleStart.session"
-    static let cycleStartWeeklyKey = "notif.cycleStart.weekly"
+    // Per-account key families: "<family>.<accountId>.<rest>".
+    static let cycleStartFamily = "notif.cycleStart"
+    static let firedFamily = "notif.fired"
+    static let lastPctFamily = "notif.lastPct"
+    static let snoozedFamily = "notif.snoozed"
     static let categoryID = "CM_THRESHOLD"
     static let snoozeActionID = "CM_SNOOZE_CYCLE"
 
@@ -1850,7 +4635,9 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         center.setNotificationCategories([category])
     }
 
-    func evaluate(sections: [UsageSection]) {
+    /// `accountLabel` is non-nil only when two or more accounts exist; it is
+    /// then prefixed to notification titles.
+    func evaluate(sections: [UsageSection], accountID: String, accountLabel: String?) {
         guard UserDefaults.standard.bool(forKey: Self.enabledKey) else { return }
 
         let now = Date()
@@ -1860,17 +4647,20 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         let weeklyDetail = detail(in: sections, scope: .weekly)
 
         if let pct = sessionPct {
-            evaluateScope(.session, pct: pct, detail: sessionDetail, sections: sections, now: now)
+            evaluateScope(.session, pct: pct, detail: sessionDetail, sections: sections, now: now,
+                          accountID: accountID, accountLabel: accountLabel)
         }
         if let pct = weeklyPct {
-            evaluateScope(.weekly, pct: pct, detail: weeklyDetail, sections: sections, now: now)
+            evaluateScope(.weekly, pct: pct, detail: weeklyDetail, sections: sections, now: now,
+                          accountID: accountID, accountLabel: accountLabel)
         }
     }
 
-    private func evaluateScope(_ scope: Scope, pct: Int, detail: String, sections: [UsageSection], now: Date) {
-        let cycleKey = self.cycleKey(for: scope, sections: sections, now: now)
-        let lastPctKey = "notif.lastPct.\(scope.rawValue).\(cycleKey)"
-        let snoozedKey = "notif.snoozed.\(scope.rawValue).\(cycleKey)"
+    private func evaluateScope(_ scope: Scope, pct: Int, detail: String, sections: [UsageSection], now: Date,
+                               accountID: String, accountLabel: String?) {
+        let cycleKey = self.cycleKey(for: scope, accountID: accountID, sections: sections, now: now)
+        let lastPctKey = AccountKeys.key(Self.lastPctFamily, accountID, "\(scope.rawValue).\(cycleKey)")
+        let snoozedKey = AccountKeys.key(Self.snoozedFamily, accountID, "\(scope.rawValue).\(cycleKey)")
         let defaults = UserDefaults.standard
         let lastPct = defaults.integer(forKey: lastPctKey)
         let snoozed = defaults.bool(forKey: snoozedKey)
@@ -1878,18 +4668,21 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         if !snoozed {
             for threshold in thresholds {
                 let muteKey = "notif.mute.\(scope.rawValue).\(threshold)"
-                let firedKey = "notif.fired.\(scope.rawValue).\(threshold).\(cycleKey)"
+                let firedKey = AccountKeys.key(Self.firedFamily, accountID, "\(scope.rawValue).\(threshold).\(cycleKey)")
                 let muted = defaults.bool(forKey: muteKey)
                 let alreadyFired = defaults.bool(forKey: firedKey)
                 if lastPct < threshold && pct >= threshold && !muted && !alreadyFired {
                     // Set fired BEFORE dispatching so concurrent evaluates can't double-fire.
                     defaults.set(true, forKey: firedKey)
-                    fire(scope: scope, threshold: threshold, detail: detail, cycleKey: cycleKey)
+                    fire(scope: scope, threshold: threshold, detail: detail, cycleKey: cycleKey,
+                         accountID: accountID, accountLabel: accountLabel)
                 }
             }
         }
 
-        defaults.set(pct, forKey: lastPctKey)
+        if defaults.object(forKey: lastPctKey) as? Int != pct {
+            defaults.set(pct, forKey: lastPctKey)
+        }
     }
 
     /// Manually fires a synthetic notification so the user can verify their
@@ -1900,7 +4693,8 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         let title = "ClaudeMeter test notification"
         let body = "If you can see this, alerts are wired up correctly."
         let dispatch = { [weak self] in
-            self?.dispatchNotification(title: title, body: body, scope: .session, cycleKey: "test")
+            self?.dispatchNotification(title: title, body: body, scope: .session, cycleKey: "test",
+                                       accountID: AccountRecord.primaryID)
         }
         if UserDefaults.standard.bool(forKey: Self.authRequestedKey) {
             dispatch()
@@ -1914,9 +4708,11 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    private func fire(scope: Scope, threshold: Int, detail: String, cycleKey: String) {
+    private func fire(scope: Scope, threshold: Int, detail: String, cycleKey: String,
+                      accountID: String, accountLabel: String?) {
         let scopeName = (scope == .session) ? "session" : "weekly"
-        let title = "Claude \(scopeName) at \(threshold)%"
+        let baseTitle = "Claude \(scopeName) at \(threshold)%"
+        let title = accountLabel.map { "\($0): \(baseTitle)" } ?? baseTitle
         let body: String
         if !detail.isEmpty {
             body = detail
@@ -1925,7 +4721,8 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         }
 
         let dispatch = { [weak self] in
-            self?.dispatchNotification(title: title, body: body, scope: scope, cycleKey: cycleKey)
+            self?.dispatchNotification(title: title, body: body, scope: scope, cycleKey: cycleKey,
+                                       accountID: accountID)
         }
 
         if UserDefaults.standard.bool(forKey: Self.authRequestedKey) {
@@ -1942,13 +4739,14 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    private func dispatchNotification(title: String, body: String, scope: Scope, cycleKey: String) {
+    private func dispatchNotification(title: String, body: String, scope: Scope, cycleKey: String,
+                                      accountID: String) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.categoryIdentifier = Self.categoryID
         content.interruptionLevel = .timeSensitive
-        content.userInfo = ["scope": scope.rawValue, "cycleKey": cycleKey]
+        content.userInfo = ["scope": scope.rawValue, "cycleKey": cycleKey, "accountID": accountID]
 
         let req = UNNotificationRequest(
             identifier: "CM_\(scope.rawValue)_\(cycleKey)_\(UUID().uuidString)",
@@ -1962,12 +4760,23 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    /// Removes delivered notifications that belong to one account.
+    func removeDeliveredNotifications(forAccount accountID: String) {
+        center.getDeliveredNotifications { [weak self] delivered in
+            let ids = delivered.filter {
+                ($0.request.content.userInfo["accountID"] as? String) == accountID
+            }.map { $0.request.identifier }
+            guard !ids.isEmpty else { return }
+            self?.center.removeDeliveredNotifications(withIdentifiers: ids)
+        }
+    }
+
     // MARK: - Cycle key
 
     /// Stable identifier for the current cycle window. Prefer the parsed reset
     /// timestamp (rounded to seconds); fall back to a rolling anchor stored in
-    /// UserDefaults when the detail string isn't parseable.
-    func cycleKey(for scope: Scope, sections: [UsageSection], now: Date) -> String {
+    /// UserDefaults (per account) when the detail string isn't parseable.
+    func cycleKey(for scope: Scope, accountID: String, sections: [UsageSection], now: Date) -> String {
         let detailStr = detail(in: sections, scope: scope)
         if !detailStr.isEmpty, let resets = Date.parseClaudeReset(detailStr, now: now) {
             return String(Int(resets.timeIntervalSince1970))
@@ -1977,10 +4786,10 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         let windowSeconds: TimeInterval
         switch scope {
         case .session:
-            anchorKey = Self.cycleStartSessionKey
+            anchorKey = AccountKeys.key(Self.cycleStartFamily, accountID, "session")
             windowSeconds = 5 * 3600
         case .weekly:
-            anchorKey = Self.cycleStartWeeklyKey
+            anchorKey = AccountKeys.key(Self.cycleStartFamily, accountID, "weekly")
             windowSeconds = 7 * 24 * 3600
         }
         let stored = UserDefaults.standard.double(forKey: anchorKey)
@@ -2042,7 +4851,10 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     /// Drop notif.fired.* / notif.snoozed.* / notif.lastPct.* entries whose
     /// embedded cycle timestamp is more than 14 days old. Without this the
-    /// UserDefaults plist would grow unbounded over months.
+    /// UserDefaults plist would grow unbounded over months. Covers both the
+    /// v2.7.1 keys and the per-account keys: the account ID sits in the middle
+    /// ("notif.fired.<accountId>.session.50.<cycle>"), so the cycle timestamp
+    /// is still the trailing component.
     private func pruneStaleKeys() {
         let cutoff = Date().timeIntervalSince1970 - (14 * 24 * 3600)
         let defaults = UserDefaults.standard
@@ -2072,7 +4884,10 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
         if response.actionIdentifier == Self.snoozeActionID {
             let info = response.notification.request.content.userInfo
             if let scope = info["scope"] as? String, let cycleKey = info["cycleKey"] as? String {
-                let key = "notif.snoozed.\(scope).\(cycleKey)"
+                // Notifications delivered by v2.7.1 carry no accountID; they
+                // can only belong to the primary account.
+                let accountID = info["accountID"] as? String ?? AccountRecord.primaryID
+                let key = AccountKeys.key(Self.snoozedFamily, accountID, "\(scope).\(cycleKey)")
                 UserDefaults.standard.set(true, forKey: key)
             }
         }
@@ -2272,8 +5087,418 @@ extension Date {
 
 // MARK: - Native Usage View
 
-class UsageContentView: NSView {
+// MARK: - UserDefaults helpers
+
+extension UserDefaults {
+    /// Writes only when the value differs: an unchanged set still dirties the
+    /// preferences domain and rewrites the plist.
+    func setIfChanged(_ value: Int, forKey key: String) {
+        if object(forKey: key) as? Int != value { set(value, forKey: key) }
+    }
+    func setIfChanged(_ value: String, forKey key: String) {
+        if string(forKey: key) != value { set(value, forKey: key) }
+    }
+}
+
+// MARK: - Burn-rate bands, account colours, badge styling
+
+/// Burn-rate bands shared by the popover's burn-rate chip and the menu-bar
+/// activity dot, so the two can never disagree.
+enum BurnRateBand: String {
+    case green, gold, amber, crimson
+
+    /// nil when there is no forecast or it is idle / has too little data.
+    static func band(for forecast: UsageForecast?) -> BurnRateBand? {
+        guard let f = forecast else { return nil }
+        switch f.state {
+        case .insufficientData, .idle:
+            return nil
+        case .ok, .willNotExhaust:
+            break
+        }
+        switch f.ratePerHour {
+        case ..<1.0:  return .green
+        case ..<5.0:  return .gold
+        case ..<15.0: return .amber
+        default:      return .crimson
+        }
+    }
+
+    /// Words for VoiceOver.
+    var spokenTrend: String {
+        switch self {
+        case .green: return "rising slowly"
+        case .gold: return "rising"
+        case .amber: return "rising fast"
+        case .crimson: return "rising very fast"
+        }
+    }
+
+    var color: NSColor {
+        switch self {
+        case .green:   return NSColor(red: 0x2b/255.0, green: 0xa8/255.0, blue: 0x82/255.0, alpha: 1)
+        case .gold:    return NSColor(red: 0xc9/255.0, green: 0xa6/255.0, blue: 0x2c/255.0, alpha: 1)
+        case .amber:   return NSColor(red: 0xc0/255.0, green: 0x5e/255.0, blue: 0x1a/255.0, alpha: 1)
+        case .crimson: return NSColor(red: 0xc0/255.0, green: 0x3a/255.0, blue: 0x3a/255.0, alpha: 1)
+        }
+    }
+}
+
+/// Per-account colour palette. Stored on AccountRecord as the raw key, so a
+/// key from another build round-trips and simply reads as the default here.
+/// Dynamic colours, readable on light and dark menu bars, and kept away from
+/// the activity dot's green / gold / amber / crimson.
+enum AccountColor: String, CaseIterable {
+    case blue, purple, indigo, teal, cyan, magenta, graphite, brown
+
+    var title: String {
+        switch self {
+        case .blue: return "Blue"
+        case .purple: return "Purple"
+        case .indigo: return "Indigo"
+        case .teal: return "Teal"
+        case .cyan: return "Cyan"
+        case .magenta: return "Magenta"
+        case .graphite: return "Graphite"
+        case .brown: return "Brown"
+        }
+    }
+
+    var color: NSColor {
+        switch self {
+        case .blue: return .systemBlue
+        case .purple: return .systemPurple
+        case .indigo: return .systemIndigo
+        case .teal: return .systemTeal
+        case .cyan: return .systemCyan
+        case .magenta:
+            return NSColor(name: "ClaudeMeterMagenta") { appearance in
+                appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                    ? NSColor(red: 0xff/255.0, green: 0x6a/255.0, blue: 0xd5/255.0, alpha: 1)
+                    : NSColor(red: 0xb0/255.0, green: 0x1e/255.0, blue: 0x9a/255.0, alpha: 1)
+            }
+        case .graphite: return .systemGray
+        case .brown: return .systemBrown
+        }
+    }
+
+    /// A small round swatch for menus; drawn at render time, so dynamic
+    /// colours follow the menu's appearance.
+    var swatch: NSImage {
+        let image = NSImage(size: NSSize(width: 12, height: 12), flipped: false) { rect in
+            self.color.setFill()
+            NSBezierPath(ovalIn: rect.insetBy(dx: 1.5, dy: 1.5)).fill()
+            return true
+        }
+        image.accessibilityDescription = title
+        return image
+    }
+}
+
+/// Extra styling for the menu-bar badge: account labels tinted in their
+/// account colour and an activity dot under each percentage. nil or empty
+/// means the plain title, exactly as before.
+struct BadgeStyle: Equatable {
+    struct Tint: Equatable {
+        let range: NSRange
+        let color: AccountColor
+    }
+    struct Dot: Equatable {
+        let range: NSRange
+        let band: BurnRateBand
+    }
+    var tints: [Tint] = []
+    var dots: [Dot] = []
+    var isEmpty: Bool { tints.isEmpty && dots.isEmpty }
+}
+
+/// A small filled circle (activity dot under a badge percentage, and the
+/// colour dot in multi-account popover headers). Drawn in draw(_:) rather
+/// than as a layer, so snapshots and every appearance render it.
+final class ColorDotView: NSView {
+    var color: NSColor = .clear {
+        didSet { needsDisplay = true }
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        color.setFill()
+        NSBezierPath(ovalIn: bounds).fill()
+    }
+}
+
+// MARK: - Multi-Account Popover
+
+/// NSScrollView that hands scroll-wheel events to the enclosing scroll view
+/// when `passesScrollToParent` is set: a usage view embedded in the
+/// multi-account popover is pinned to its content height, so the outer view
+/// does the scrolling.
+final class PassthroughScrollView: NSScrollView {
+    var passesScrollToParent = false
+    override func scrollWheel(with event: NSEvent) {
+        if passesScrollToParent {
+            nextResponder?.scrollWheel(with: event)
+        } else {
+            super.scrollWheel(with: event)
+        }
+    }
+}
+
+/// Popover content for two or more accounts. One section per account: a
+/// header (name; org or email; plan tier) above that account's own
+/// UsageContentView, or a compact "Signed out" row with a Sign In Again
+/// button instead of stale numbers. Sections stack in one scroll view; each
+/// embedded usage view is pinned to its content height and the total is
+/// reported through onContentSizeChanged, so the popover fits every account.
+final class MultiAccountUsageView: NSView {
+    struct Entry {
+        let accountID: String
+        let title: String
+        let detail: String?
+        let signedOut: Bool
+        let usageView: UsageContentView
+        let color: NSColor
+    }
+
+    var onContentSizeChanged: ((CGFloat) -> Void)?
+    var onSignInAgain: ((String) -> Void)?
+
     private let scrollView = NSScrollView()
+    private let stack = NSStackView()
+    private var emitScheduled = false
+    private var pendingScrollToTop = false
+
+    private final class Section {
+        let accountID: String
+        let titleLabel: NSTextField
+        let detailLabel: NSTextField
+        var headerDot: ColorDotView?
+        let signedOutRow: NSView
+        let usageView: UsageContentView
+        let usageHeight: NSLayoutConstraint
+        var arranged: [NSView] = []
+        init(accountID: String, titleLabel: NSTextField, detailLabel: NSTextField,
+             signedOutRow: NSView, usageView: UsageContentView, usageHeight: NSLayoutConstraint) {
+            self.accountID = accountID
+            self.titleLabel = titleLabel
+            self.detailLabel = detailLabel
+            self.signedOutRow = signedOutRow
+            self.usageView = usageView
+            self.usageHeight = usageHeight
+        }
+    }
+    private var sections: [Section] = []
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(red: 0x1a/255.0, green: 0x1a/255.0, blue: 0x1a/255.0, alpha: 1).cgColor
+
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.drawsBackground = false
+        scrollView.scrollerStyle = .overlay
+        addSubview(scrollView)
+
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 0
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 4, right: 0)
+        scrollView.documentView = stack
+
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            stack.widthAnchor.constraint(equalTo: scrollView.widthAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// Total height of all sections at their content heights.
+    var contentHeight: CGFloat {
+        stack.layoutSubtreeIfNeeded()
+        return stack.fittingSize.height
+    }
+
+    /// Per-section state, read by the QA test hooks.
+    var sectionStates: [(accountID: String, showsUsage: Bool, usageHeight: CGFloat)] {
+        sections.map { ($0.accountID, !$0.usageView.isHidden, $0.usageHeight.constant) }
+    }
+
+    /// Header colour dot per section, read by the QA test hooks.
+    var headerColors: [NSColor?] { sections.map { $0.headerDot?.color } }
+
+    /// Same accounts in the same order: update headers and signed-out rows in
+    /// place. Otherwise rebuild the sections (embedded views are reused).
+    func reload(_ entries: [Entry]) {
+        if entries.map({ $0.accountID }) == sections.map({ $0.accountID }) {
+            for (section, entry) in zip(sections, entries) { apply(entry, to: section) }
+        } else {
+            rebuild(entries)
+        }
+        scheduleEmit()
+    }
+
+    /// Detaches every embedded usage view (before the popover goes back to
+    /// a single account's view).
+    func detachAll() {
+        rebuild([])
+    }
+
+    /// Latched like UsageContentView.scrollToTop: applied on the next tick
+    /// and again after the next size report, so the popover's resize
+    /// animation cannot leave the view scrolled mid-content.
+    func scrollToTop() {
+        pendingScrollToTop = true
+        DispatchQueue.main.async { [weak self] in
+            self?.applyPendingScrollToTop(keepPending: true)
+        }
+        // The latch only covers the open-and-resize moment; expire it so a
+        // later size report cannot jump the view back to the top.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.pendingScrollToTop = false
+        }
+    }
+
+    private func applyPendingScrollToTop(keepPending: Bool = false) {
+        guard pendingScrollToTop, let doc = scrollView.documentView else { return }
+        if !keepPending { pendingScrollToTop = false }
+        doc.scroll(NSPoint(x: 0, y: doc.bounds.height))
+        scrollView.contentView.scrollToVisible(NSRect(x: 0, y: doc.bounds.height - 1, width: 1, height: 1))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
+    private func rebuild(_ entries: [Entry]) {
+        for section in sections {
+            section.usageHeight.isActive = false
+            section.usageView.onContentSizeChanged = nil
+        }
+        stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        sections.removeAll()
+
+        for (i, entry) in entries.enumerated() {
+            var arranged: [NSView] = []
+            if i > 0 {
+                let divider = NSView()
+                divider.wantsLayer = true
+                divider.layer?.backgroundColor = NSColor(white: 0.3, alpha: 1).cgColor
+                divider.translatesAutoresizingMaskIntoConstraints = false
+                divider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+                arranged.append(divider)
+            }
+
+            let title = label(entry.title, size: 13, weight: .semibold, color: .white)
+            let detail = label("", size: 11, weight: .regular, color: NSColor(white: 0.55, alpha: 1))
+            let dot = ColorDotView(frame: NSRect(x: 0, y: 0, width: 8, height: 8))
+            dot.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([dot.widthAnchor.constraint(equalToConstant: 8),
+                                         dot.heightAnchor.constraint(equalToConstant: 8)])
+            let titleRow = NSStackView(views: [dot, title])
+            titleRow.orientation = .horizontal
+            titleRow.alignment = .centerY
+            titleRow.spacing = 6
+            let header = NSStackView(views: [titleRow, detail])
+            header.orientation = .vertical
+            header.alignment = .leading
+            header.spacing = 1
+            header.edgeInsets = NSEdgeInsets(top: 10, left: 16, bottom: 0, right: 28)
+            arranged.append(header)
+
+            let signedOutLabel = label("Signed out", size: 12, weight: .regular, color: NSColor(white: 0.7, alpha: 1))
+            let button = NSButton(title: "Sign In Again\u{2026}", target: self, action: #selector(signInAgainPressed(_:)))
+            button.bezelStyle = .rounded
+            button.controlSize = .small
+            button.identifier = NSUserInterfaceItemIdentifier(entry.accountID)
+            let spacer = NSView()
+            spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            let row = NSStackView(views: [signedOutLabel, spacer, button])
+            row.orientation = .horizontal
+            row.edgeInsets = NSEdgeInsets(top: 6, left: 16, bottom: 10, right: 16)
+            arranged.append(row)
+
+            let usage = entry.usageView
+            usage.removeFromSuperview()
+            usage.isEmbedded = true
+            usage.translatesAutoresizingMaskIntoConstraints = false
+            let height = usage.heightAnchor.constraint(equalToConstant: max(usage.skeletonHeight, 60))
+            height.isActive = true
+            arranged.append(usage)
+
+            for view in arranged {
+                stack.addArrangedSubview(view)
+                view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
+            let section = Section(accountID: entry.accountID, titleLabel: title, detailLabel: detail,
+                                  signedOutRow: row, usageView: usage, usageHeight: height)
+            section.headerDot = dot
+            section.arranged = arranged
+            usage.onContentSizeChanged = { [weak self, weak section] h in
+                guard let self = self, let section = section else { return }
+                if abs(section.usageHeight.constant - h) > 0.5 {
+                    section.usageHeight.constant = h
+                }
+                self.scheduleEmit()
+            }
+            sections.append(section)
+            apply(entry, to: section)
+        }
+    }
+
+    private func apply(_ entry: Entry, to section: Section) {
+        section.headerDot?.color = entry.color
+        if section.titleLabel.stringValue != entry.title { section.titleLabel.stringValue = entry.title }
+        let detail = entry.detail ?? ""
+        if section.detailLabel.stringValue != detail { section.detailLabel.stringValue = detail }
+        section.detailLabel.isHidden = detail.isEmpty
+        section.signedOutRow.isHidden = !entry.signedOut
+        section.usageView.isHidden = entry.signedOut
+    }
+
+    /// Coalesces height reports from all sections into one callback.
+    private func scheduleEmit() {
+        guard !emitScheduled else { return }
+        emitScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.emitScheduled = false
+            let total = self.contentHeight
+            if self.window?.isVisible == true {
+                NSLog("%@", "[ClaudeMeter] popover sizing(multi): sections=\(self.sections.count) total=\(total)")
+            }
+            self.onContentSizeChanged?(total)
+            self.applyPendingScrollToTop()
+        }
+    }
+
+    @objc private func signInAgainPressed(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue else { return }
+        onSignInAgain?(id)
+    }
+
+    private func label(_ text: String, size: CGFloat, weight: NSFont.Weight, color: NSColor) -> NSTextField {
+        let field = NSTextField(labelWithString: text)
+        field.font = NSFont.systemFont(ofSize: size, weight: weight)
+        field.textColor = color
+        field.lineBreakMode = .byTruncatingTail
+        return field
+    }
+}
+
+class UsageContentView: NSView {
+    private let scrollView = PassthroughScrollView()
+    /// True inside the multi-account popover: the view is pinned to its
+    /// content height, scrolling is left to the outer view and the vertical
+    /// scroller is hidden. False (the default) is the single-account popover.
+    var isEmbedded = false {
+        didSet {
+            guard oldValue != isEmbedded else { return }
+            scrollView.passesScrollToParent = isEmbedded
+            scrollView.hasVerticalScroller = !isEmbedded
+        }
+    }
     private let stackView = NSStackView()
     private let statusDot = NSView()
     var onContentSizeChanged: ((CGFloat) -> Void)?
@@ -2617,7 +5842,14 @@ class UsageContentView: NSView {
         // or session limit. Old DOM-scraped pages used "Plan limits"; the
         // current JSON normalizer emits "Session limit" — both qualify.
         let lower = section.title.lowercased()
-        let isPlanSection = lower.contains("plan") || lower.contains("session")
+        var isPlanSection = lower.contains("plan") || lower.contains("session")
+        // Plans without a session window send only weekly sections; carry the
+        // tier on the first section instead of dropping it.
+        let hasPlanSection = lastSections.contains { s in
+            let t = s.title.lowercased()
+            return t.contains("plan") || t.contains("session")
+        }
+        if !hasPlanSection, lastSections.first?.title == section.title { isPlanSection = true }
         if isPlanSection, let tier = planTierDisplayName, !tier.isEmpty {
             return "\(upper) - \(tier.uppercased())"
         }
@@ -2992,16 +6224,11 @@ class UsageContentView: NSView {
     /// matching forecast (per-model windows currently), or when the
     /// forecast is in a noise-floor state (insufficientData / idle).
     private func applyBurnRateChip(label: NSTextField, forecast: UsageForecast?) {
-        guard showBurnRate, let f = forecast else {
+        // BurnRateBand is shared with the menu-bar activity dot: no band
+        // (no forecast, idle, too little data) means no chip.
+        guard showBurnRate, let f = forecast, let band = BurnRateBand.band(for: f) else {
             label.isHidden = true
             return
-        }
-        switch f.state {
-        case .insufficientData, .idle:
-            label.isHidden = true
-            return
-        case .ok, .willNotExhaust:
-            break
         }
         let rate = f.ratePerHour
         // Format: "+4.2%/h", with one decimal under 10 and zero decimals at
@@ -3012,15 +6239,8 @@ class UsageContentView: NSView {
         } else {
             formatted = String(format: "+%.1f%%/h", rate)
         }
-        let color: NSColor
-        switch rate {
-        case ..<1.0:   color = NSColor(red: 0x2b/255.0, green: 0xa8/255.0, blue: 0x82/255.0, alpha: 1) // green
-        case ..<5.0:   color = NSColor(red: 0xc9/255.0, green: 0xa6/255.0, blue: 0x2c/255.0, alpha: 1) // gold
-        case ..<15.0:  color = NSColor(red: 0xc0/255.0, green: 0x5e/255.0, blue: 0x1a/255.0, alpha: 1) // amber
-        default:       color = NSColor(red: 0xc0/255.0, green: 0x3a/255.0, blue: 0x3a/255.0, alpha: 1) // crimson
-        }
         if label.stringValue != formatted { label.stringValue = formatted }
-        label.textColor = color
+        label.textColor = band.color
         label.toolTip = "EWMA burn rate over recent samples"
         label.isHidden = false
     }
@@ -3061,6 +6281,8 @@ class UsageContentView: NSView {
         countdownTicker.stop()
     }
 
+    var isCountdownTickerRunning: Bool { countdownTicker.isRunning }
+
     private func emitContentSize(label: String) {
         stackView.layoutSubtreeIfNeeded()
         let arranged = stackView.arrangedSubviews
@@ -3083,7 +6305,9 @@ class UsageContentView: NSView {
         } else {
             chosen = max(fitting, computedHeight)
         }
-        NSLog("%@", "[ClaudeMeter] popover sizing(\(label)): fittingSize=\(fitting) computed=\(computedHeight) chosen=\(chosen) scrollW=\(scrollView.bounds.width) arranged=\(arranged.count) visible=\(visible.count)")
+        if window?.isVisible == true {
+            NSLog("%@", "[ClaudeMeter] popover sizing(\(label)): fittingSize=\(fitting) computed=\(computedHeight) chosen=\(chosen) scrollW=\(scrollView.bounds.width) arranged=\(arranged.count) visible=\(visible.count)")
+        }
         onContentSizeChanged?(chosen)
     }
 
@@ -3321,6 +6545,12 @@ final class CountdownTicker {
     private var entries: [Entry] = []
     private var flames: [Weak<NSImageView>] = []
     private var timer: Timer?
+
+    var isRunning: Bool { timer != nil }
+
+    deinit {
+        timer?.invalidate()
+    }
 
     private struct Weak<T: AnyObject> { weak var value: T? }
 
