@@ -31,9 +31,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // Saved accounts that cannot run (missing/invalid store identifier).
     var unavailableRecords: [AccountRecord] = []
     // Why background activity is paused ("sleep", "screens", "session",
-    // "lock"); refresh timers and probes stop while any reason is present.
-    var pauseReasons = Set<String>()
+    // "lock") and since when; refresh timers and probes stop while any
+    // reason is present.
+    var pauseReasons: [String: Date] = [:]
     var activityPaused: Bool { !pauseReasons.isEmpty }
+    // While paused: re-checks the reasons against the system every 15 min
+    // and drops any older than `pauseReasonMaxAge` (a missed wake/unlock
+    // notification must not stop refreshes for good).
+    var pauseSafetyTimer: Timer?
+    static let pauseReasonMaxAge: TimeInterval = 4 * 3600
     // Two or more accounts: the stacked popover view, each secondary
     // account's own usage view, and each badge side's last text.
     var multiAccountView: MultiAccountUsageView?
@@ -356,13 +362,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ws.addObserver(forName: pause, object: nil, queue: .main) { [weak self] _ in self?.pauseActivity(reason) }
             ws.addObserver(forName: resume, object: nil, queue: .main) { [weak self] _ in self?.resumeActivity(reason) }
         }
-        let dnc = DistributedNotificationCenter.default()
-        dnc.addObserver(forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in
-            self?.pauseActivity("lock")
-        }
-        dnc.addObserver(forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in
-            self?.resumeActivity("lock")
-        }
+        observeLockNotifications(lock: "com.apple.screenIsLocked", unlock: "com.apple.screenIsUnlocked")
         for name in [Notification.Name.NSProcessInfoPowerStateDidChange, ProcessInfo.thermalStateDidChangeNotification] {
             NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 self?.powerModeChanged()
@@ -370,20 +370,54 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    /// Screen lock and unlock arrive as distributed notifications. An
+    /// accessory app is usually inactive, and Cocoa holds back distributed
+    /// notifications for inactive apps unless they ask for immediate delivery.
+    func observeLockNotifications(lock: String, unlock: String) {
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(self, selector: #selector(screenDidLock(_:)), name: Notification.Name(lock),
+                        object: nil, suspensionBehavior: .deliverImmediately)
+        dnc.addObserver(self, selector: #selector(screenDidUnlock(_:)), name: Notification.Name(unlock),
+                        object: nil, suspensionBehavior: .deliverImmediately)
+    }
+
+    @objc func screenDidLock(_ note: Notification) {
+        DispatchQueue.main.async { self.pauseActivity("lock") }
+    }
+
+    @objc func screenDidUnlock(_ note: Notification) {
+        DispatchQueue.main.async { self.resumeActivity("lock") }
+    }
+
     func pauseActivity(_ reason: String) {
         let wasPaused = activityPaused
-        pauseReasons.insert(reason)
+        if pauseReasons[reason] == nil { pauseReasons[reason] = Date() }
         guard !wasPaused else { return }
         NSLog("%@", "[ClaudeMeter] background activity paused (\(reason))")
         for account in accounts {
             account.stopRefreshTimer()
+            account.cancelInFlightRequests()
             account.history.persistNow()
         }
+        pauseSafetyTimer?.invalidate()
+        pauseSafetyTimer = Timer.scheduledTimer(withTimeInterval: 15 * 60, repeats: true) { [weak self] _ in
+            self?.reconcilePauseReasons()
+        }
+        pauseSafetyTimer?.tolerance = 60
     }
 
     func resumeActivity(_ reason: String) {
-        guard pauseReasons.remove(reason) != nil, !activityPaused else { return }
-        NSLog("%@", "[ClaudeMeter] background activity resumed (\(reason))")
+        dropPauseReasons([reason], why: reason)
+    }
+
+    /// Removes pause reasons; when none is left, background activity resumes.
+    func dropPauseReasons(_ reasons: [String], why: String) {
+        let wasPaused = activityPaused
+        for reason in reasons { pauseReasons.removeValue(forKey: reason) }
+        guard wasPaused, !activityPaused else { return }
+        pauseSafetyTimer?.invalidate()
+        pauseSafetyTimer = nil
+        NSLog("%@", "[ClaudeMeter] background activity resumed (\(why))")
         // Let the network come back first, then one fetch per account
         // (staggered) and the usual timers.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
@@ -395,6 +429,46 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 self.accounts.forEach { $0.startRefreshTimer() }
             }
         }
+    }
+
+    /// The user opened the popover, so the screen is awake, unlocked and
+    /// this session is on the console: drop those pause reasons (the
+    /// popover itself refreshes every account).
+    func userIsPresent() {
+        let present = ["screens", "lock", "session"].filter { pauseReasons[$0] != nil }
+        guard !present.isEmpty else { return }
+        let wasPaused = activityPaused
+        present.forEach { pauseReasons.removeValue(forKey: $0) }
+        if wasPaused && !activityPaused {
+            pauseSafetyTimer?.invalidate()
+            pauseSafetyTimer = nil
+            NSLog("%@", "[ClaudeMeter] background activity resumed (popover opened)")
+        }
+    }
+
+    /// Safety net while paused: drops a reason the system no longer reports
+    /// (screen unlocked, session on the console, display awake) and any
+    /// reason older than `pauseReasonMaxAge`. This timer firing at all
+    /// means the Mac is awake.
+    func reconcilePauseReasons(now: Date = Date()) {
+        var stale = pauseReasons.filter { now.timeIntervalSince($0.value) >= Self.pauseReasonMaxAge }.map { $0.key }
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+        if pauseReasons["lock"] != nil, let session = session,
+           (session["CGSSessionScreenIsLocked"] as? Bool ?? false) == false {
+            stale.append("lock")
+        }
+        if pauseReasons["session"] != nil, let session = session,
+           (session[kCGSessionOnConsoleKey as String] as? Bool ?? false) {
+            stale.append("session")
+        }
+        if pauseReasons["screens"] != nil, CGDisplayIsAsleep(CGMainDisplayID()) == 0 {
+            stale.append("screens")
+        }
+        if pauseReasons["sleep"] != nil { stale.append("sleep") }
+        let drop = Array(Set(stale))
+        guard !drop.isEmpty else { return }
+        NSLog("%@", "[ClaudeMeter] pause reasons cleared by safety check: \(drop.sorted().joined(separator: ", "))")
+        dropPauseReasons(drop, why: "safety check")
     }
 
     func powerModeChanged() {
@@ -476,10 +550,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // MARK: - Popover
 
     func setupPopover() {
-        // One AccountController per metered account. Each owns an off-screen
-        // WKWebView (data scraping only). start() loads the usage page: the
-        // primary account first imports Claude Desktop cookies; secondary
-        // accounts load from their own isolated store, staggered.
+        // One AccountController per metered account. start() fetches through
+        // the usage API first (the primary account after importing Claude
+        // Desktop cookies; secondary accounts from their own isolated store,
+        // staggered). Each account's off-screen usage page is created only
+        // when needed (sign-in, DOM fallback, keep-alive) and parked again.
         accounts = makeAccountControllers()
         normalizeBadgeSlots()
         persistDerivedAccountColors()
@@ -753,6 +828,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if popover.isShown {
             popover.performClose(nil)
         } else {
+            userIsPresent()
             accounts.forEach { $0.stopRefreshTimer() }
             // Views are not rebuilt while the popover is closed; replay the
             // latest data before showing it.
@@ -1135,9 +1211,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // Fallback: direct XPath scrape (independent of structured scrape's
         // labels), only when this account's data comes through the page (DOM
-        // path or JSON circuit open). A JSON-healthy account's page is parked
-        // and is never woken up just for this; its badge waits for the next
-        // fetch. A parked page counts as "no session text found".
+        // path or JSON circuit open). A JSON-healthy account never gets here.
+        // On the DOM path the page is normally loaded; if it is not (still
+        // being created after a park), the result counts as "no session text
+        // found" and the next refresh tries again.
         guard account.needsPageScrape else { return }
         NSLog("[ClaudeMeter] updateBadgeFromModel: no 'current session' meter in model, falling back to XPath")
         let handleXPathResult: (Any?) -> Void = { [weak self] result in
@@ -2053,6 +2130,22 @@ extension AppDelegate {
 
 // MARK: - Account Controller
 
+/// Usage API redirects: followed only to https claude.ai hosts, since each
+/// request carries a hand-set Cookie header. Others are refused (the 3xx
+/// answer is returned as is); only the host is logged.
+final class APIRedirectGuard: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        let host = request.url?.host?.lowercased() ?? ""
+        if request.url?.scheme == "https" && (host == "claude.ai" || host.hasSuffix(".claude.ai")) {
+            completionHandler(request)
+        } else {
+            NSLog("%@", "[ClaudeMeter] API redirect off claude.ai refused (host \(host.isEmpty ? "nil" : host))")
+            completionHandler(nil)
+        }
+    }
+}
+
 /// Per-account metering engine. Owns one claude.ai session end to end: the
 /// off-screen WKWebView and its cookie store, the fallback login window and
 /// OAuth popups, the refresh timer, the JSON circuit breaker and empty-scrape
@@ -2119,13 +2212,18 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         set { record.planTier = newValue }
     }
     var jsonFetchInFlight: Bool = false
+    /// When the fetch in flight started; one older than
+    /// `jsonFetchStaleAfter` is treated as lost (logged and reset).
+    private var jsonFetchStartedAt: Date?
+    private var jsonFetchGeneration = 0
+    static let jsonFetchStaleAfter: TimeInterval = 90
     var jsonConsecutiveFailures: Int = 0
     var jsonCircuitOpen: Bool = false
     var jsonCircuitOpenedAt: Date?
     static let jsonFailureCircuitBreaker = 5
-    // Background WebView is process-suspended when the popover is closed, so a
-    // permanently-open JSON circuit means DOM scrapes return stale page data
-    // until the next ~hourly full reload. Auto-reset gives JSON another shot.
+    // A permanently open circuit would leave the account on the DOM path
+    // (stale page data, page kept loaded). Auto-reset, checked at the start
+    // of every timer tick, gives JSON another shot.
     static let jsonCircuitResetInterval: TimeInterval = 30 * 60
 
     // Fallback login window (email/magic-link in WKWebView)
@@ -2196,7 +2294,22 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     private(set) var fetchAttemptCount = 0
     private(set) var jsonSuccessCount = 0
     private(set) var cookieWriteBackCount = 0
+    /// Times the sign-in window was opened or brought forward (QA).
+    private(set) var loginWindowShowCount = 0
     private var lastGuardTripPath: String?
+    /// DOM path, page off the usage page: reloads are spaced out, starting
+    /// at 15 min and doubling up to 4 h; reset once the page is back on the
+    /// usage page.
+    private var nextGuardReloadAt = Date.distantPast
+    private var guardReloadBackoff = AccountController.guardReloadBaseInterval
+    static let guardReloadBaseInterval: TimeInterval = 15 * 60
+    static let guardReloadMaxInterval: TimeInterval = 4 * 3600
+    /// The primary's sign-in window opens on its own once per signed-out
+    /// spell (v2.7.1 opened it once per page load that reached the sign-in
+    /// page); opening the popover allows it again.
+    private var autoLoginWindowShown = false
+    /// Set by the fetch after a wake: one transport error retries once.
+    private var wakeRetryArmed = false
 
     /// JSON is the active path: not forced to DOM and the circuit is closed.
     var jsonHealthy: Bool {
@@ -2254,6 +2367,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         guard !isTornDown else { return }
         if jsonHealthy || record.orgPinned {
             lastRefreshDate = Date()
+            wakeRetryArmed = reason == "wake"
             scrapeAndDistribute()
         } else {
             loadUsagePage(reason: reason)
@@ -2263,6 +2377,9 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// Popover open: a JSON fetch for healthy accounts (no page reload), the
     /// page's own refresh otherwise.
     func refreshForPopover() {
+        // The user is looking: a signed-out primary may show its sign-in
+        // window again (as v2.7.1 did on every popover open).
+        autoLoginWindowShown = false
         if jsonHealthy || record.orgPinned {
             usageView?.setStatusLoading()
             lastRefreshDate = Date()
@@ -2278,7 +2395,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         let path = "\(url?.host ?? "nil")\(url?.path ?? "")"
         guard path != lastGuardTripPath else { return }
         lastGuardTripPath = path
-        NSLog("%@", "[ClaudeMeter] account \(id): page is not on the usage page (\(path)); reloading it")
+        NSLog("%@", "[ClaudeMeter] account \(id): page is not on the usage page (\(path))")
     }
 
     // MARK: - API session (one per account)
@@ -2296,11 +2413,32 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         config.httpCookieAcceptPolicy = .never
         config.urlCache = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        let session = URLSession(configuration: config)
+        // The Cookie header is set by hand, so a redirect must not carry it
+        // off claude.ai: such redirects are refused.
+        let session = URLSession(configuration: config, delegate: APIRedirectGuard(), delegateQueue: nil)
         apiSessionStorage = session
         return session
     }
+
+    /// Pause (sleep, lock): cancels this account's requests in flight. A
+    /// cancelled fetch keeps the last data and is not counted as a failure.
+    func cancelInFlightRequests() {
+        apiSessionStorage?.getAllTasks { tasks in tasks.forEach { $0.cancel() } }
+    }
+
+    /// Offline-class URL errors (and our own cancel on pause): the last data
+    /// stays, nothing counts toward the JSON circuit. Any other transport
+    /// error counts like an HTTP error.
+    static func isOfflineError(_ error: Error) -> Bool {
+        let e = error as NSError
+        guard e.domain == NSURLErrorDomain else { return false }
+        return [NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost, NSURLErrorTimedOut,
+                NSURLErrorCannotFindHost, NSURLErrorCannotConnectToHost, NSURLErrorDNSLookupFailed,
+                NSURLErrorCancelled].contains(e.code)
+    }
     private var cookieHeader: String?
+    /// Offline-class error of the latest org-list request (org discovery).
+    var lastOrgListTransportError: Error?
     private var cookieStoreWarm = false
     private var lastLoggedCookieCount: Int?
 
@@ -2314,6 +2452,9 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// without page loads. Counts only; values are never logged.
     func storeResponseCookies(_ response: URLResponse?) {
         guard !isTornDown, let http = response as? HTTPURLResponse, let url = http.url else { return }
+        // While this account's sign-in window is open, a 401/403 answer must
+        // not overwrite the cookies the sign-in is setting.
+        if loginWindow != nil && (http.statusCode == 401 || http.statusCode == 403) { return }
         var fields: [String: String] = [:]
         for (key, value) in http.allHeaderFields {
             if let key = key as? String, let value = value as? String { fields[key] = value }
@@ -2322,7 +2463,25 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         guard !cookies.isEmpty else { return }
         cookieWriteBackCount += cookies.count
         let store = dataStore.httpCookieStore   // this account's store only
-        for cookie in cookies { store.setCookie(cookie) }
+        store.getAllCookies { existing in
+            for cookie in cookies { store.setCookie(Self.inExistingDomainForm(cookie, existing: existing)) }
+        }
+    }
+
+    /// A response cookie without a Domain attribute is host-only
+    /// ("claude.ai"), while the browser may hold the same cookie as a domain
+    /// cookie (".claude.ai"). Writing it as is would leave two copies; it
+    /// takes the stored copy's domain form instead.
+    static func inExistingDomainForm(_ cookie: HTTPCookie, existing: [HTTPCookie]) -> HTTPCookie {
+        func bare(_ domain: String) -> String {
+            (domain.hasPrefix(".") ? String(domain.dropFirst()) : domain).lowercased()
+        }
+        guard let twin = existing.first(where: {
+                  $0.name == cookie.name && $0.path == cookie.path && bare($0.domain) == bare(cookie.domain)
+              }),
+              twin.domain != cookie.domain, var props = cookie.properties else { return cookie }
+        props[.domain] = twin.domain
+        return HTTPCookie(properties: props) ?? cookie
     }
 
     /// RFC 6265 matching of a stored cookie against a request URL.
@@ -2381,7 +2540,10 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         guard signedOut != isSignedOut else { return }
         isSignedOut = signedOut
         NSLog("%@", "[ClaudeMeter] account \(id) \(signedOut ? "signed out" : "signed in") (\(reason))")
-        if !signedOut { lastSignInConfirmAt = nil }
+        if !signedOut {
+            lastSignInConfirmAt = nil
+            autoLoginWindowShown = false
+        }
         if signedOut && !isPrimary {
             startSignedOutProbe()
         } else {
@@ -2617,6 +2779,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     // MARK: - Fallback Login Window (email/magic-link)
 
     func showLoginWindow() {
+        loginWindowShowCount += 1
         if let window = loginWindow {
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -2754,6 +2917,11 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                 NSLog("%@", "[ClaudeMeter] login window not opened automatically (suppressAutoLoginWindow)")
                 return
             }
+            // Open it once: never bring an open sign-in window forward from
+            // the background (that stole focus on every reload), and not
+            // again in this signed-out spell after the user closed it.
+            if loginWindow != nil || autoLoginWindowShown { return }
+            autoLoginWindowShown = true
             if !hasAttemptedDesktopImport {
                 hasAttemptedDesktopImport = true
                 importFromClaudeDesktop { [weak self] success in
@@ -2859,19 +3027,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             return
         }
         usageView?.setStatusLoading()
-        let js = """
-        (function() {
-            var btns = document.querySelectorAll('button');
-            for (var b of btns) {
-                if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
-                    b.closest('[class*="text-xs"]')) {
-                    b.click();
-                    return 'clicked';
-                }
-            }
-            return 'not_found';
-        })()
-        """
+        let js = Self.clickRefreshButtonJS
         pageScriptCount += 1
         page.evaluateJavaScript(js) { [weak self] result, _ in
             if (result as? String) == "clicked" {
@@ -2884,6 +3040,21 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             }
         }
     }
+
+    /// Clicks the usage page's own refresh button.
+    static let clickRefreshButtonJS = """
+    (function() {
+        var btns = document.querySelectorAll('button');
+        for (var b of btns) {
+            if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
+                b.closest('[class*="text-xs"]')) {
+                b.click();
+                return 'clicked';
+            }
+        }
+        return 'not_found';
+    })()
+    """
 
     /// Full page reload.
     func gracefulReload() {
@@ -2937,10 +3108,14 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         refreshTimer = nil
     }
 
-    /// Unified refresh: clicks the site's refresh button, then scrapes all data.
-    /// Adapts behavior based on whether the popover is open or closed.
+    /// Unified refresh (timer tick): a JSON fetch for healthy and pinned
+    /// accounts; on the DOM path, clicks the site's refresh button (unless
+    /// the last fetch was JSON), then scrapes. Adapts to the popover state.
     func unifiedRefresh() {
         guard !isTornDown, !app.activityPaused else { return }
+        // Before anything else, so the DOM path (which never fetches JSON)
+        // cannot keep an open circuit from its retry.
+        resetStaleCircuitIfNeeded()
         // A signed-out secondary account stays idle until the user signs in
         // again (no repeated requests with a dead session).
         if isSignedOut && !isPrimary { return }
@@ -2963,15 +3138,30 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             return
         }
         // DOM path (JSON circuit open or forceDOMOnly): the page is needed.
+        // Signed out or signing in: the page sits on a sign-in page and a
+        // reload would only land there again (and, for the primary, raise
+        // the sign-in window). Wait for the sign-in, or for the circuit's
+        // JSON retry above.
+        if isSignedOut || loginWindow != nil { return }
         guard let page = pageView else {
             loadUsagePage(reason: "DOM fallback")
             return
         }
         guard let url = page.url?.absoluteString, url.contains("/settings/usage") else {
             noteGuardTrip(page.url)
-            if !page.isLoading { loadUsagePage(reason: "back to the usage page") }
+            if page.isLoading { return }
+            if let current = page.url?.absoluteString, isPrimary ? isLoginURL(current) : looksSignedOut(current) { return }
+            let now = Date()
+            guard now >= nextGuardReloadAt else { return }
+            nextGuardReloadAt = now.addingTimeInterval(guardReloadBackoff)
+            NSLog("%@", "[ClaudeMeter] account \(id): reloading the usage page (next guard reload no sooner than \(Int(guardReloadBackoff / 60)) min)")
+            guardReloadBackoff = min(guardReloadBackoff * 2, Self.guardReloadMaxInterval)
+            loadUsagePage(reason: "back to the usage page")
             return
         }
+        // Back on the usage page: the guard-reload backoff starts over.
+        guardReloadBackoff = Self.guardReloadBaseInterval
+        nextGuardReloadAt = .distantPast
 
         let popoverOpen = app.popover?.isShown == true
 
@@ -3001,19 +3191,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             return
         }
 
-        let js = """
-        (function() {
-            var btns = document.querySelectorAll('button');
-            for (var b of btns) {
-                if (b.querySelector('svg') && b.closest('[class*="justify-between"]') &&
-                    b.closest('[class*="text-xs"]')) {
-                    b.click();
-                    return 'clicked';
-                }
-            }
-            return 'not_found';
-        })()
-        """
+        let js = Self.clickRefreshButtonJS
         pageScriptCount += 1
         page.evaluateJavaScript(js) { [weak self] result, error in
             if let error = error {
@@ -3109,19 +3287,24 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// when JSON is disabled, errored, or its in-memory circuit breaker has tripped.
     /// Both paths funnel through the same empty-streak gate and badge/model updates,
     /// so callers see a uniform interface regardless of which path succeeded.
+    /// Auto-reset a stale circuit so JSON gets periodic re-attempts. The
+    /// circuit re-opens on its own if 5 fresh failures recur.
+    func resetStaleCircuitIfNeeded() {
+        guard jsonCircuitOpen, let openedAt = jsonCircuitOpenedAt,
+              Date().timeIntervalSince(openedAt) >= Self.jsonCircuitResetInterval else { return }
+        NSLog("%@", "[ClaudeMeter] json circuit auto-reset after \(Int(Self.jsonCircuitResetInterval/60))min cooldown")
+        jsonCircuitOpen = false
+        jsonConsecutiveFailures = 0
+        jsonCircuitOpenedAt = nil
+    }
+
     func scrapeAndDistribute() {
         guard !isTornDown else { return }
         fetchAttemptCount += 1
         let forceDOM = UserDefaults.standard.bool(forKey: AppDelegate.forceDOMOnlyKey)
-        // Auto-reset a stale circuit so JSON gets periodic re-attempts. The
-        // circuit re-opens on its own if 5 fresh failures recur.
-        if jsonCircuitOpen, let openedAt = jsonCircuitOpenedAt,
-           Date().timeIntervalSince(openedAt) >= Self.jsonCircuitResetInterval {
-            NSLog("%@", "[ClaudeMeter] json circuit auto-reset after \(Int(Self.jsonCircuitResetInterval/60))min cooldown")
-            jsonCircuitOpen = false
-            jsonConsecutiveFailures = 0
-            jsonCircuitOpenedAt = nil
-        }
+        resetStaleCircuitIfNeeded()
+        let wakeFetch = wakeRetryArmed
+        wakeRetryArmed = false
         // A pinned org is metered through the JSON path only: the DOM page
         // could be showing a different org, so it never stands in.
         let pinned = record.orgPinned
@@ -3151,7 +3334,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                         self.jsonCircuitOpenedAt = Date()
                         NSLog("%@", "[ClaudeMeter] json circuit breaker tripped after \(self.jsonConsecutiveFailures) consecutive empty/error responses, falling back to DOM-only (will retry in \(Int(Self.jsonCircuitResetInterval/60))min)")
                     }
-                    self.scrapeViaDOM()
+                    self.scrapeViaDOM(refreshFirst: true)
                 } else {
                     self.jsonConsecutiveFailures = 0
                     self.jsonSuccessCount += 1
@@ -3162,6 +3345,23 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             case .failure(let err):
                 // A fetch already running: this request just merges into it.
                 if case .transport(let e) = err, (e as NSError).domain == "ClaudeMeter", (e as NSError).code == -1 {
+                    return
+                }
+                // Offline-class errors (no network, timeouts, DNS, our own
+                // cancel on pause): keep the last data (the empty-streak gate
+                // decides), no page load and no circuit count. A fetch right
+                // after a wake retries once, 15 s later.
+                if case .transport(let e) = err, Self.isOfflineError(e) {
+                    if (e as NSError).code == NSURLErrorCancelled { return }
+                    self.logFetchOutcome(path: "json", outcome: "error", detail: "transport error, keeping last data")
+                    self.distributeFetchResult([], path: "json")
+                    if wakeFetch {
+                        NSLog("%@", "[ClaudeMeter] account \(self.id): fetch after wake failed to connect; retrying once in 15 s")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                            guard let self = self, !self.isTornDown, !self.app.activityPaused else { return }
+                            self.refreshNow(reason: "wake retry")
+                        }
+                    }
                     return
                 }
                 if pinned {
@@ -3178,13 +3378,6 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                     self.distributeFetchResult([], path: "json")
                     return
                 }
-                // Network unreachable / timeouts: keep the last data (the
-                // empty-streak gate decides), no page load and no circuit count.
-                if case .transport = err {
-                    self.logFetchOutcome(path: "json", outcome: "error", detail: "transport error, keeping last data")
-                    self.distributeFetchResult([], path: "json")
-                    return
-                }
                 self.jsonConsecutiveFailures += 1
                 self.logFetchOutcome(path: "json", outcome: "error", detail: "\(err) failures=\(self.jsonConsecutiveFailures)")
                 if self.jsonConsecutiveFailures >= Self.jsonFailureCircuitBreaker && !self.jsonCircuitOpen {
@@ -3192,7 +3385,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                     self.jsonCircuitOpenedAt = Date()
                     NSLog("%@", "[ClaudeMeter] json circuit breaker tripped after \(self.jsonConsecutiveFailures) consecutive failures, falling back to DOM-only (will retry in \(Int(Self.jsonCircuitResetInterval/60))min)")
                 }
-                self.scrapeViaDOM()
+                self.scrapeViaDOM(refreshFirst: true)
             }
         }
     }
@@ -3200,10 +3393,20 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// DOM scrape path: runs the JS scraper in WKWebView and funnels results
     /// through the shared distribution gate. Kept as a working fallback because
     /// the JSON endpoint is undocumented and may rotate.
-    private func scrapeViaDOM() {
+    private func scrapeViaDOM(refreshFirst: Bool = false) {
         // No page yet (parked): load it; its didFinish scrapes again.
         guard let page = pageView, !page.isLoading else {
             if pageView == nil { loadUsagePage(reason: "JSON unavailable, DOM fallback") }
+            return
+        }
+        // JSON just failed: as v2.7.1 did before a DOM scrape, click the
+        // page's own refresh button first, unless the page was just loaded.
+        if refreshFirst, Date().timeIntervalSince(lastPageLoadAt) > 10,
+           let url = page.url?.absoluteString, url.contains("/settings/usage") {
+            pageScriptCount += 1
+            page.evaluateJavaScript(Self.clickRefreshButtonJS) { [weak self] _, _ in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.scrapeViaDOM() }
+            }
             return
         }
         pageScriptCount += 1
@@ -3441,30 +3644,52 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
 
     // MARK: - JSON Fetch Path
 
-    /// JSON-primary fetch. Copies cookies from the WKWebView data store into a
-    /// per-call URLSession, discovers the org UUID lazily, and decodes the
-    /// undocumented /api/organizations/{uuid}/usage response.
+    /// JSON-primary fetch. Builds the Cookie header from this account's
+    /// WebKit store, uses the account's shared API session, discovers the org
+    /// UUID lazily, and decodes the undocumented
+    /// /api/organizations/{uuid}/usage response.
     func fetchViaJSON(completion: @escaping (Result<[UsageSection], FetchError>) -> Void) {
         if jsonFetchInFlight {
-            completion(.failure(.transport(NSError(domain: "ClaudeMeter", code: -1, userInfo: [NSLocalizedDescriptionKey: "fetch already in flight"]))))
-            return
+            if let started = jsonFetchStartedAt, Date().timeIntervalSince(started) > Self.jsonFetchStaleAfter {
+                // A lost callback must not block every later fetch; its late
+                // answer, if any, is ignored (generation check below).
+                NSLog("%@", "[ClaudeMeter] account \(id): fetch in flight for \(Int(Date().timeIntervalSince(started)))s, treating it as lost")
+                jsonFetchInFlight = false
+            } else {
+                completion(.failure(.transport(NSError(domain: "ClaudeMeter", code: -1, userInfo: [NSLocalizedDescriptionKey: "fetch already in flight"]))))
+                return
+            }
         }
         jsonFetchInFlight = true
+        jsonFetchStartedAt = Date()
+        jsonFetchGeneration += 1
+        let generation = jsonFetchGeneration
+        let finish: (Result<[UsageSection], FetchError>) -> Void = { [weak self] result in
+            guard let self = self, generation == self.jsonFetchGeneration else { return }
+            self.jsonFetchInFlight = false
+            self.jsonFetchStartedAt = nil
+            completion(result)
+        }
 
         copyCookiesToSession { [weak self] session in
             guard let self = self else { return }
+            self.lastOrgListTransportError = nil
             self.discoverOrgUUID(session: session) { [weak self] uuid in
                 guard let self = self else { return }
                 guard let uuid = uuid else {
-                    self.jsonFetchInFlight = false
-                    completion(.failure(.noOrg))
+                    // Org discovery could not connect: same as an offline
+                    // usage request (keeps the last data, no circuit count).
+                    if let e = self.lastOrgListTransportError {
+                        finish(.failure(.transport(e)))
+                    } else {
+                        finish(.failure(.noOrg))
+                    }
                     return
                 }
 
                 let urlStr = "https://claude.ai" + String(format: AppDelegate.apiUsagePath, uuid)
                 guard let url = URL(string: urlStr) else {
-                    self.jsonFetchInFlight = false
-                    completion(.failure(.noOrg))
+                    finish(.failure(.noOrg))
                     return
                 }
 
@@ -3476,10 +3701,10 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                 session.dataTask(with: req) { [weak self] data, response, error in
                     guard let self = self else { return }
                     DispatchQueue.main.async {
-                        self.jsonFetchInFlight = false
+                        guard generation == self.jsonFetchGeneration else { return }
                         self.storeResponseCookies(response)
                         if let error = error {
-                            completion(.failure(.transport(error)))
+                            finish(.failure(.transport(error)))
                             return
                         }
                         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -3493,23 +3718,23 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                                 self.cachedOrgUUID = nil
                                 self.persistRecord()
                             }
-                            completion(.failure(.http(status)))
+                            finish(.failure(.http(status)))
                             return
                         }
                         if status < 200 || status >= 300 {
-                            completion(.failure(.http(status)))
+                            finish(.failure(.http(status)))
                             return
                         }
                         guard let data = data else {
-                            completion(.failure(.http(status)))
+                            finish(.failure(.http(status)))
                             return
                         }
                         do {
                             let decoded = try JSONDecoder().decode(UsageAPIResponse.self, from: data)
                             let sections = self.normalizeJSONResponse(decoded)
-                            completion(.success(sections))
+                            finish(.success(sections))
                         } catch {
-                            completion(.failure(.decode(error)))
+                            finish(.failure(.decode(error)))
                         }
                     }
                 }.resume()
@@ -3573,6 +3798,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if let err = err {
                     if !quiet { NSLog("%@", "[ClaudeMeter] \(context) transport error: \(err.localizedDescription)") }
+                    if AccountController.isOfflineError(err) { self?.lastOrgListTransportError = err }
                     completion(0, nil); return
                 }
                 guard status >= 200, status < 300, let data = data else {
@@ -3631,10 +3857,9 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         }
     }
 
-    /// Snapshots all WKWebView cookies into a URLSession so the JSON request
-    /// rides the same authenticated session as the page itself.
-    /// Refreshes the Cookie header from this account's store and hands back
-    /// the account's shared API session (never invalidated by callers).
+    /// Refreshes the Cookie header from this account's WebKit store (the
+    /// same session the page and the sign-in window use) and hands back the
+    /// account's shared API session (never invalidated by callers).
     func copyCookiesToSession(logCount: Bool = true, completion: @escaping (URLSession) -> Void) {
         // WebKit only exposes a store's persisted cookies once its network
         // session has done some work; with the page parked nothing else wakes

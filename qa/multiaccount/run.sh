@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Multi-account flow test (not part of qa.sh: about 2 minutes; briefly opens
-# login windows and the popover). Builds ClaudeMeter.swift + testhooks.swift
-# with -D CLAUDEMETER_TESTHOOKS into an isolated bundle
-# (com.local.ClaudeMeter.qa.multi: own prefs domain, own Application Support
-# folder, own WebKit stores) and runs two scenarios through the real
-# AppDelegate / AccountController code paths, checking the log:
+# Multi-account flow test (not part of qa.sh: about 20 minutes; briefly opens
+# login windows and the popover; run it on an idle machine). Builds
+# ClaudeMeter.swift + testhooks.swift with -D CLAUDEMETER_TESTHOOKS into an
+# isolated bundle (com.local.ClaudeMeter.qa.multi: own prefs domain, own
+# Application Support folder, own WebKit stores) and runs these scenarios
+# through the real AppDelegate / AccountController code paths, checking the
+# log:
 #   A. accounts: three seeded accounts (primary + two secondaries on empty
 #      isolated stores), signed-out detection without windows, Accounts menu,
 #      staggered timers, rename, add, cancelled add, requested login window,
@@ -12,11 +13,23 @@
 #   B. badge and popover: one account "47%", two accounts "P 47% | W --" and
 #      "P 47% | W 12%", slot reassignment, both-hidden fallback, labels, a
 #      signed-out side, three accounts stacked in the popover, back to one.
+#   C/C2. activity dot and account colours (and a relaunch keeps them).
+#   D. a plan with no session window (weekly only).
+#   E. background behaviour on the L0/L3 QA bundle's own session: timer
+#      fetches with the popover closed, parked page, sleep/wake, display
+#      sleep, screen lock/unlock, popover open clears presence pauses,
+#      pause safety check.
+#   F. DOM fallback on that session: circuit open loads the page and runs
+#      page scripts, guard reloads rate-limited, the circuit's auto-reset
+#      brings JSON back and the page parks.
+#   G. signed-out primary with auto sign-in window: opened once, never
+#      re-activated, no per-tick reloads, not reopened after close.
 #
-# Like L0/L3 it launches with -skipDesktopImport YES -suppressAutoLoginWindow
-# YES: no Claude Desktop import, so no Keychain access at all (no prompts);
-# the primary account has no session here and shows signed out. Never
-# touches the installed app's domain or folder.
+# Like L0/L3 it launches with -skipDesktopImport YES (and, except in G,
+# -suppressAutoLoginWindow YES): no Claude Desktop import, so no Keychain
+# access at all (no prompts); outside E and F the primary account has no
+# session and shows signed out. E and F log counters and cookie counts only.
+# Never touches the installed app's domain or folder.
 #
 # Usage: qa/multiaccount/run.sh [--keep]   (--keep leaves the test domain/folders)
 
@@ -70,17 +83,21 @@ cleanup() {
         "HTTPStorages/$BUNDLE_ID" "HTTPStorages/$BUNDLE_ID.binarycookies" "Preferences/$BUNDLE_ID.plist" ) 2>/dev/null
 }
 
-# run_app <log> <actions>: launch, wait for QA-DONE (max 150s), stop.
+# run_app <log> <actions>: launch, wait for QA-DONE (max RUN_SECS, default
+# 150 s), stop. RUN_EXE / RUN_EXTRA: other bundle, extra arguments;
+# RUN_AUTO_LOGIN=1: the primary may open its sign-in window by itself.
 run_app() {
     local logfile="$1" actions="$2"
     local exe="${RUN_EXE:-$APP/Contents/MacOS/$NAME}"
     # No Claude Desktop import (no Keychain prompt) and no auto-opened login
     # window: the primary account here has no session and shows signed out.
-    "$exe" -declinedMoveToApplications YES -skipDesktopImport YES -suppressAutoLoginWindow YES \
+    local suppress="-suppressAutoLoginWindow YES"
+    [ -n "${RUN_AUTO_LOGIN:-}" ] && suppress=""
+    "$exe" -declinedMoveToApplications YES -skipDesktopImport YES $suppress \
         ${RUN_EXTRA:-} -qa.shotDir "$SHOTDIR" -qa.actions "$actions" >/dev/null 2>"$logfile" &
     local pid=$!
     local shots=0
-    for _ in $(seq 1 300); do
+    for _ in $(seq 1 $(( ${RUN_SECS:-150} * 2 ))); do
         grep -q "QA-DONE" "$logfile" 2>/dev/null && break
         kill -0 "$pid" 2>/dev/null || break
         # Capture the real menu bar for each "QA-SHOT name x y w h" request.
@@ -309,12 +326,15 @@ E_APP="$OUT.e.app"
 rm -rf "$E_APP"; mkdir -p "$E_APP/Contents/MacOS"
 cp "$OUT" "$E_APP/Contents/MacOS/$NAME"
 sed "s/$BUNDLE_ID/com.local.ClaudeMeter.qa/" "$APP/Contents/Info.plist" > "$E_APP/Contents/Info.plist"
-E="wait:6,counters,wait:80,counters,dump,sleep,wait:2,dump,counters,wait:40,counters,wake,wait:10,counters,dump,done"
+E="wait:6,counters,wait:80,counters,dump,sleep,wait:2,dump,counters,wait:40,counters,wake,wait:10,counters,dump"   # counters 1-5
+E="$E,screensSleep,wait:2,counters,wait:35,counters,screensWake,wait:10,counters"                                 # counters 6-8
+E="$E,postLock,counters,wait:35,counters,postUnlock,wait:10,counters"                                             # counters 9-11
+E="$E,postLock,openPopover,pauseInfo,closePopover,screensSleep,agePause:screens:5,reconcile,wait:1,pauseInfo,done"
 LOG="$LOGDIR/claudemeter.qa.multi.E.log"
-RUN_EXE="$E_APP/Contents/MacOS/$NAME" RUN_EXTRA="-showMenuBarBadge YES -badgeRefreshInterval 30" run_app "$LOG" "$E"
+RUN_SECS=320 RUN_EXE="$E_APP/Contents/MacOS/$NAME" RUN_EXTRA="-showMenuBarBadge YES -badgeRefreshInterval 30" run_app "$LOG" "$E"
 log "log: $LOG"
 cnt() { nth counters "$1" | grep "QA-COUNTERS 0 "; }
-for i in 1 2 3 4 5; do log "  counters $i: $(cnt $i | sed 's/^QA-COUNTERS 0 //')"; done
+for i in 1 2 3 4 5 6 7 8 9 10 11; do log "  counters $i: $(cnt $i | sed 's/^QA-COUNTERS 0 //')"; done
 J1=$(cnt 1 | num json); J2=$(cnt 2 | num json)
 check "E finished" 'grep -q QA-DONE "$LOG"'
 check "E: primary has a session in the QA bundle (JSON fetch at launch)" '[ "${J1:-0}" -ge 1 ]'
@@ -324,8 +344,53 @@ check "sleep: timers stopped" 'dump 2 | grep "QA-ACCOUNT 0 " | grep -q "timerNex
 check "no fetch while asleep" '[ "$(cnt 3 | num attempts)" = "$(cnt 4 | num attempts)" ]'
 check "wake: exactly one fetch, timers back" '[ $(( $(cnt 5 | num attempts) - $(cnt 4 | num attempts) )) = 1 ] && cnt 5 | grep -q "timer=true paused=false"'
 check "E: paused/resumed logged" 'L | grep -q "background activity paused (sleep)" && L | grep -q "background activity resumed (sleep)"'
+at() { cnt "$1" | num attempts; }
+check "display sleep: timers stopped, no fetch while the displays sleep" 'cnt 6 | grep -q "timer=false paused=true" && [ "$(at 6)" = "$(at 7)" ]'
+check "display wake: exactly one fetch, timers back" '[ $(( $(at 8) - $(at 7) )) = 1 ] && cnt 8 | grep -q "timer=true paused=false"'
+check "screen lock delivered while distributed notifications are suspended: paused" 'nth postLock 1 | grep -q "QA-LOCKPOST postLock paused=true reasons=\[\"lock\"\]"'
+check "no fetch while locked" '[ "$(at 9)" = "$(at 10)" ] && cnt 10 | grep -q "paused=true"'
+check "unlock: resumed with exactly one fetch" 'nth postUnlock 1 | grep -q "QA-LOCKPOST postUnlock paused=false" && [ $(( $(at 11) - $(at 10) )) = 1 ]'
+check "popover open clears the lock pause (user is present)" 'nth pauseInfo 1 | grep -q "QA-PAUSE paused=false" && L | grep -q "background activity resumed (popover opened)"'
+check "safety check clears a stale pause reason" 'nth pauseInfo 2 | grep -q "QA-PAUSE paused=false" && L | grep -q "pause reasons cleared by safety check: screens"'
 check "E: no secret-looking values logged" '! grep -qiE "sessionKey=|Bearer |@[a-z0-9.-]+\.[a-z]{2,}" "$LOG"'
+
+# ------------------------------------------------------------ scenario F
+# Same QA bundle and session: the DOM fallback and the way back to JSON.
+log "scenario F: DOM fallback (circuit open), guard reloads, auto-reset back to JSON"
+F="wait:6,counters,circuit:0:open,wait:70,counters,dump,wait:65,counters,circuit:0:expire,wait:40,counters,done"
+LOG="$LOGDIR/claudemeter.qa.multi.F.log"
+RUN_SECS=240 RUN_EXE="$E_APP/Contents/MacOS/$NAME" RUN_EXTRA="-showMenuBarBadge YES -badgeRefreshInterval 30" run_app "$LOG" "$F"
+log "log: $LOG"
+for i in 1 2 3 4; do log "  counters $i: $(cnt $i | sed 's/^QA-COUNTERS 0 //')"; done
+L | grep "page is not on the usage page" | sed 's/^/[MA]   guard trip: /' >&2 || true
+L | grep -q "falling back to XPath" && log "  XPath fallback ran on the DOM path" || log "  XPath fallback did not run here (no DOM sections without a session meter); scenario D covers it"
+pl() { cnt "$1" | num pageLoads; }; ps_() { cnt "$1" | num pageScripts; }; js() { cnt "$1" | num json; }
+check "F finished" 'grep -q QA-DONE "$LOG"'
+check "circuit open: page loaded and page scripts ran (DOM path)" 'cnt 2 | grep -q "circuit=open" && [ $(( $(pl 2) - $(pl 1) )) -ge 1 ] && [ $(( $(ps_ 2) - $(ps_ 1) )) -ge 1 ]'
+check "guard reloads rate-limited (at most one in the window)" '[ "$(L | grep -c "reloading the usage page")" -le 1 ] && [ $(( $(pl 3) - $(pl 2) )) -le 1 ]'
+check "circuit auto-reset reached from the timer" 'L | grep -q "json circuit auto-reset"'
+check "JSON back after the reset, page parked again" 'cnt 4 | grep -q "circuit=closed" && [ $(( $(js 4) - $(js 3) )) -ge 1 ] && cnt 4 | grep -q "parked=true" && L | grep -q "usage page parked"'
+check "F: no secret-looking values logged" '! grep -qiE "sessionKey=|Bearer |@[a-z0-9.-]+\.[a-z]{2,}" "$LOG"'
 rm -rf "$E_APP"
+
+# ------------------------------------------------------------ scenario G
+log "scenario G: signed-out primary, sign-in window opened once, no reload loop"
+cleanup
+defaults write "$BUNDLE_ID" showMenuBarBadge -bool YES
+G="wait:20,counters,circuit:0:open,wait:95,counters,closeLogin:0,wait:40,counters,circuit:0:expire,wait:40,counters,done"
+LOG="$LOGDIR/claudemeter.qa.multi.G.log"
+RUN_SECS=260 RUN_AUTO_LOGIN=1 RUN_EXTRA="-badgeRefreshInterval 30" run_app "$LOG" "$G"
+log "log: $LOG"
+for i in 1 2 3 4; do log "  counters $i: $(cnt $i | sed 's/^QA-COUNTERS 0 //')"; done
+L | grep "page is not on the usage page" | sed 's/^/[MA]   guard trip: /' >&2 || true
+ls_() { cnt "$1" | num loginShows; }
+check "G finished" 'grep -q QA-DONE "$LOG"'
+check "signed-out primary: sign-in window opened by itself once" 'cnt 1 | grep -q "loginShows=1 loginWindow=true signedOut=true"'
+check "circuit open while signed out: no page reloads, window not re-activated" '[ "$(pl 2)" = "$(pl 1)" ] && [ "$(ls_ 2)" = 1 ]'
+check "closed sign-in window is not reopened by the background" '[ "$(ls_ 3)" = 1 ] && cnt 3 | grep -q "loginWindow=false" && [ $(( $(pl 3) - $(pl 2) )) -le 1 ]'
+check "circuit auto-reset reached while signed out, still no window" 'L | grep -q "json circuit auto-reset" && cnt 4 | grep -q "circuit=closed" && [ "$(ls_ 4)" = 1 ]'
+check "no guard-trip reloads on the sign-in page" '! L | grep -q "reloading the usage page"'
+check "G: no secret-looking values logged" '! grep -qiE "sessionKey=|Bearer |@[a-z0-9.-]+\.[a-z]{2,}" "$LOG"' 
 
 if [ "$KEEP" = 0 ]; then
     cleanup

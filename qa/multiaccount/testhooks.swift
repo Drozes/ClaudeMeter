@@ -43,6 +43,18 @@
 //   counters                per account: fetch attempts, JSON successes, page
 //                           loads, page scripts, cookie write-backs, parked
 //   cookies:<index>         cookie count in that account's own store
+//   circuit:<index>:open    open that account's JSON circuit now (DOM path)
+//   circuit:<index>:expire  age the open circuit past its cooldown, so the
+//                           next timer tick resets it
+//   screensSleep / screensWake  post NSWorkspace screensDidSleep / DidWake
+//   postLock / postUnlock   post the QA alias of com.apple.screenIsLocked /
+//                           Unlocked as a distributed notification while
+//                           this app's distributed notifications are
+//                           suspended (as for an inactive app), without
+//                           deliverImmediately (as the system posts it)
+//   pauseInfo               log the pause reasons
+//   agePause:<reason>:<h>   backdate a pause reason by <h> hours
+//   reconcile               run the paused-state safety check now
 //   done                    log QA-DONE and quit
 
 import Cocoa
@@ -53,11 +65,17 @@ extension AppDelegate {
         let raw = UserDefaults.standard.string(forKey: "qa.actions") ?? ""
         let actions = raw.split(separator: ",").map { String($0) }
         NSLog("%@", "QA-HOOKS actions=\(actions.count)")
+        // Same observer path as the real lock notifications, under QA-only
+        // names (posting the real ones would reach every app).
+        observeLockNotifications(lock: Self.qaLockName, unlock: Self.qaUnlockName)
         // Let launch-time work (imports, first loads, migration) settle first.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             self?.qaRun(actions[...])
         }
     }
+
+    static let qaLockName = "com.local.ClaudeMeter.qa.screenIsLocked"
+    static let qaUnlockName = "com.local.ClaudeMeter.qa.screenIsUnlocked"
 
     private func qaRun(_ actions: ArraySlice<String>) {
         guard let action = actions.first else { return }
@@ -256,7 +274,7 @@ extension AppDelegate {
             NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
         case "counters":
             for (i, a) in accounts.enumerated() {
-                NSLog("%@", "QA-COUNTERS \(i) attempts=\(a.fetchAttemptCount) json=\(a.jsonSuccessCount) pageLoads=\(a.pageLoadCount) pageScripts=\(a.pageScriptCount) cookieWriteBacks=\(a.cookieWriteBackCount) parked=\(a.pageView == nil) timer=\(a.refreshTimer != nil) paused=\(activityPaused)")
+                NSLog("%@", "QA-COUNTERS \(i) attempts=\(a.fetchAttemptCount) json=\(a.jsonSuccessCount) pageLoads=\(a.pageLoadCount) pageScripts=\(a.pageScriptCount) cookieWriteBacks=\(a.cookieWriteBackCount) parked=\(a.pageView == nil) timer=\(a.refreshTimer != nil) paused=\(activityPaused) circuit=\(a.jsonCircuitOpen ? "open" : "closed") loginShows=\(a.loginWindowShowCount) loginWindow=\(a.loginWindow != nil) signedOut=\(a.isSignedOut)")
             }
         case "cookies":
             if let a = qaAccount(parts) {
@@ -266,6 +284,40 @@ extension AppDelegate {
                 }
                 delay = 1.0
             }
+        case "circuit":
+            if let a = qaAccount(parts), parts.count > 2 {
+                if parts[2] == "open" {
+                    a.jsonCircuitOpen = true
+                    a.jsonCircuitOpenedAt = Date()
+                    a.jsonConsecutiveFailures = AccountController.jsonFailureCircuitBreaker
+                } else if parts[2] == "expire" {
+                    a.jsonCircuitOpenedAt = Date().addingTimeInterval(-AccountController.jsonCircuitResetInterval - 1)
+                }
+                NSLog("%@", "QA-CIRCUIT \(parts[1]) \(a.jsonCircuitOpen ? "open" : "closed")")
+            }
+        case "screensSleep":
+            NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.screensDidSleepNotification, object: nil)
+        case "screensWake":
+            NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.screensDidWakeNotification, object: nil)
+        case "postLock", "postUnlock":
+            let dnc = DistributedNotificationCenter.default()
+            dnc.suspended = true
+            dnc.postNotificationName(Notification.Name(parts[0] == "postLock" ? Self.qaLockName : Self.qaUnlockName),
+                                     object: nil, userInfo: nil, deliverImmediately: false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                NSLog("%@", "QA-LOCKPOST \(parts[0]) paused=\(self.activityPaused) reasons=\(self.pauseReasons.keys.sorted())")
+                dnc.suspended = false
+            }
+            delay = 2.5
+        case "pauseInfo":
+            NSLog("%@", "QA-PAUSE paused=\(activityPaused) reasons=\(pauseReasons.keys.sorted())")
+        case "agePause":
+            if parts.count > 2, let h = Double(parts[2]), pauseReasons[parts[1]] != nil {
+                pauseReasons[parts[1]] = Date().addingTimeInterval(-h * 3600)
+            }
+            NSLog("%@", "QA-PAUSE paused=\(activityPaused) reasons=\(pauseReasons.keys.sorted())")
+        case "reconcile":
+            reconcilePauseReasons()
         case "done":
             NSLog("%@", "QA-DONE")
             NSApp.terminate(nil)
