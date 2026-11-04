@@ -118,16 +118,16 @@ Each account has a badge position (Left, Right or Hidden; a position holds one a
 
 The app is a single Swift file (`ClaudeMeter.swift`) with no dependencies beyond system frameworks.
 
-1. **Cookie import** — Reads Claude Desktop's Chromium cookie database (`~/Library/Application Support/Claude/Cookies`), decrypts cookies via the macOS Keychain, and injects them into a WKWebView
-2. **Usage page** — Loads `claude.ai/settings/usage` in the WKWebView
-3. **CSS injection** — Hides all site chrome (sidebar, nav, headers, overlays), leaving only the usage meters
-4. **Soft reload** — On re-open, clicks the site's own refresh button via JavaScript instead of doing a full page load
-5. **Auto-polling** — While the popover is open, a timer triggers silent refreshes at the configured interval to keep data current
-6. **Badge scraping** — Extracts the session usage percentage from the page DOM via XPath and displays it in the menu bar, with background polling to keep it current
+1. **Cookie import**: reads Claude Desktop's Chromium cookie database (`~/Library/Application Support/Claude/Cookies`), decrypts the cookies via the macOS Keychain, and stores them in the first account's WebKit store.
+2. **Usage data**: each account fetches its numbers from claude.ai's usage API with its own cookies, read from its own WebKit store. Cookies that claude.ai sends back are written into that same store, so the session stays fresh without loading the page. One connection per account is reused between refreshes.
+3. **Usage page, only when needed**: the hidden `claude.ai/settings/usage` page is loaded only to sign in, when the usage API fails (the page's DOM is then scraped as a fallback), and at most once every 6 hours per account as a safety net. Otherwise it is unloaded, which frees the memory of its web content process.
+4. **Popover**: opening the popover fetches fresh numbers for every account; while it stays open, a timer refreshes at the configured interval.
+5. **Badge**: the badge refreshes on its own timer with the popover closed. The percentage comes from the usage API; the XPath scrape of the page runs only for an account on the page fallback.
+6. **Power**: refreshes pause while the Mac or its displays sleep, the screen is locked or another user is switched in, and each account fetches once on wake. In Low Power Mode, or when the Mac is running hot, the badge interval is doubled. The interval options in the menu do not change.
 
 ## Privacy
 
-- Sign-in cookies live only in WebKit's own website data stores: the default store for the first account and one isolated store per added account. ClaudeMeter never writes cookies or tokens to its preferences, its files or its logs; logs carry cookie counts, never values.
+- Sign-in cookies live only in WebKit's own website data stores: the default store for the first account and one isolated store per added account. Cookies that claude.ai returns to an account's usage requests are written back into that account's own store, never into another account's. ClaudeMeter never writes cookies or tokens to its preferences, its files or its logs; logs carry cookie counts, never values.
 - The only Keychain item ClaudeMeter reads is Claude Desktop's "Claude Safe Storage" key, to import the first account's session. To read Claude Desktop's (encrypted) cookie database, the import briefly copies it to a temporary file and deletes that copy as soon as it is read. ClaudeMeter never reads, writes or deletes any Claude Code credentials (`Claude Code-credentials*`) and never touches Claude Code's configuration.
 - Saved per-account settings are non-secret and live in ClaudeMeter's preferences: the account's display name, email (if known), organization ID and name, plan tier, colour, and badge label and position. No cookies or tokens are stored there. Usage history is kept in `~/Library/Application Support/ClaudeMeter/history-<account>.json` (24 hours). The v2.7.1 `history.json` is left in place after the upgrade (copied, not moved) as a rollback path.
 

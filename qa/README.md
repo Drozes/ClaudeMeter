@@ -173,12 +173,13 @@ Install as a launchd agent via [drift/com.claudemeter.qa.drift.plist](drift/com.
 
 ## Multi-account flow test ([multiaccount/run.sh](multiaccount/run.sh))
 
-Not part of `qa.sh` (about 2 minutes; it briefly opens login windows and the
-popover). Builds `ClaudeMeter.swift` together with
+Not part of `qa.sh` (about 15 minutes; it briefly opens login windows and the
+popover; run it on an idle machine, since its timing checks assume a normal
+load). Builds `ClaudeMeter.swift` together with
 [multiaccount/testhooks.swift](multiaccount/testhooks.swift) using
 `-D CLAUDEMETER_TESTHOOKS` (release builds never include the hooks), into an
 isolated bundle `com.local.ClaudeMeter.qa.multi` with its own prefs domain,
-Application Support folder and WebKit stores, and runs two scenarios through
+Application Support folder and WebKit stores, and runs these scenarios through
 the real code paths:
 
 - **A, accounts:** three seeded accounts (the real primary plus two
@@ -193,11 +194,26 @@ the real code paths:
   hidden (falls back to the primary account), a custom label, a signed-out
   side (`--`), three accounts stacked in the popover with the popover sized
   to their sum, and back to one account.
+- **C, activity dot and colours**, and **D, weekly-only plans**: the burn-rate
+  dot, account colours, and the badge, tooltip and dot for a plan that
+  reports only a weekly window (with the two-fetch hysteresis), all on
+  synthetic data.
+- **E, background behaviour** (needs the L0/L3 QA bundle's own session): runs
+  the hooks build as `com.local.ClaudeMeter.qa` with `-skipDesktopImport YES`
+  and the badge at 30 s, popover closed. It checks that the primary account
+  fetches on its timer, that its hidden page stays parked (no page loads, no
+  page scripts), and that a simulated sleep stops the timers with no fetch
+  while asleep and exactly one fetch on wake. It logs counters only; that
+  bundle is not cleaned up.
 
-It cleans up the test domain and folders afterwards (`--keep` leaves them).
-Like L0/L3 it skips the Claude Desktop import (no Keychain access); the
-primary account here has no session and is shown signed out, and the badge
-and popover checks feed it synthetic data.
+Scenario A also checks that cookie write-back stays in each account's own
+store (the hook logs cookie counts, never names or values).
+
+It cleans up the test domain and folders afterwards (not the QA bundle that
+E uses; `--keep` leaves them). Like L0/L3 it skips the Claude Desktop import
+(no Keychain access). In scenarios A to D the primary account has no session
+and is shown signed out, and the badge and popover checks feed it synthetic
+data.
 
 The L3 smoke regex and the L4 OCR accept all three badge forms: `47%`,
 `W 47%` and `P 47% | W 12%` (a side may read `--`).
