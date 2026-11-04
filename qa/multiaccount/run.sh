@@ -73,10 +73,11 @@ cleanup() {
 # run_app <log> <actions>: launch, wait for QA-DONE (max 150s), stop.
 run_app() {
     local logfile="$1" actions="$2"
+    local exe="${RUN_EXE:-$APP/Contents/MacOS/$NAME}"
     # No Claude Desktop import (no Keychain prompt) and no auto-opened login
     # window: the primary account here has no session and shows signed out.
-    "$APP/Contents/MacOS/$NAME" -declinedMoveToApplications YES -skipDesktopImport YES -suppressAutoLoginWindow YES \
-        -qa.shotDir "$SHOTDIR" -qa.actions "$actions" >/dev/null 2>"$logfile" &
+    "$exe" -declinedMoveToApplications YES -skipDesktopImport YES -suppressAutoLoginWindow YES \
+        ${RUN_EXTRA:-} -qa.shotDir "$SHOTDIR" -qa.actions "$actions" >/dev/null 2>"$logfile" &
     local pid=$!
     local shots=0
     for _ in $(seq 1 300); do
@@ -117,7 +118,7 @@ defaults write "$BUNDLE_ID" accounts.list -string "{\"schema\":1,\"accounts\":[
  {\"id\":\"$U2\",\"displayName\":\"Side\",\"badgeLabel\":\"S\",\"badgeSlot\":\"hidden\",\"orgPinned\":false,\"storeIdentifier\":\"$S2\"},
  {\"id\":\"$U3\",\"displayName\":\"Broken\",\"badgeLabel\":\"B\",\"badgeSlot\":\"hidden\",\"orgPinned\":false}]}"
 
-A="dump,waitSignedOut:1:60,waitSignedOut:2:60,wait:1,dump,seedKeys:1,seedKeys:2,keys:1,keys:2,rename:2:Consulting,addSynthetic:Fourth,wait:6,dump"
+A="dump,waitSignedOut:1:60,waitSignedOut:2:60,wait:1,dump,seedKeys:1,seedKeys:2,keys:1,keys:2,rename:2:Consulting,addSynthetic:Fourth,cookies:1,cookies:2,cookies:3,wait:6,dump"
 A="$A,addThenCancel:Temp,wait:3,dump,signIn:1,wait:3,dump,closeLogin:1,wait:3"
 A="$A,remove:2,wait:6,keys:1,dump,makeOrphanStore,wait:4,sweep,wait:6,done"
 LOG="$LOGDIR/claudemeter.qa.multi.A.log"
@@ -154,6 +155,10 @@ DISK_STORES=$(ls "$HOME/Library/WebKit/$BUNDLE_ID/WebsiteDataStore" 2>/dev/null 
 log "saved store ids: $SAVED_STORES"
 log "on-disk stores:  $DISK_STORES"
 check "on-disk WebKit stores match saved accounts (removed and orphan deleted)" '[ -n "$SAVED_STORES" ] && [ "$SAVED_STORES" = "$DISK_STORES" ]'
+ck() { L | grep "QA-COOKIES $1 " | tail -1; }
+num() { sed -nE "s/.*$1=([0-9]+).*/\1/p"; }
+check "cookie write-back only into the account's own store (new account's store empty)" \
+      '[ "$(ck 3 | num store)" = 0 ] && [ "$(ck 3 | num writeBacks)" = 0 ] && for i in 1 2; do w=$(ck $i | num writeBacks); st=$(ck $i | num store); [ -n "$w" ] && { [ "$w" = 0 ] || [ "$st" -gt 0 ]; } || exit 1; done'
 check "A: no secret-looking values logged" '! grep -qiE "sessionKey=|Bearer |@[a-z0-9.-]+\.[a-z]{2,}" "$LOG"'
 
 # ------------------------------------------------------------ scenario B
@@ -295,6 +300,32 @@ check "DOM weekly-only: XPath scrape first, then the weekly value" '[ "$(badge 7
 check "two accounts: weekly-only side shows weekly %" '[ "$(badge 8)" = "P 96% | W 12%" ] && nth badge 8 | grep -q "QA-TOOLTIP .Personal: weekly 96% · no session limit on this plan"'
 check "popover render of a weekly-only account written" '[ -s "$SHOTDIR/weekly-only-popover.png" ]'
 check "D: no secret-looking values logged" '! grep -qiE "sessionKey=|Bearer |@[a-z0-9.-]+\.[a-z]{2,}" "$LOG"'
+
+# ------------------------------------------------------------ scenario E
+# Uses the L0/L3 QA bundle (com.local.ClaudeMeter.qa), whose own WebKit store
+# holds a real claude.ai session (see qa/README.md, L3). Not cleaned up.
+log "scenario E: timer fetches with the popover closed, parked page, sleep and wake"
+E_APP="$OUT.e.app"
+rm -rf "$E_APP"; mkdir -p "$E_APP/Contents/MacOS"
+cp "$OUT" "$E_APP/Contents/MacOS/$NAME"
+sed "s/$BUNDLE_ID/com.local.ClaudeMeter.qa/" "$APP/Contents/Info.plist" > "$E_APP/Contents/Info.plist"
+E="wait:6,counters,wait:80,counters,dump,sleep,wait:2,dump,counters,wait:40,counters,wake,wait:10,counters,dump,done"
+LOG="$LOGDIR/claudemeter.qa.multi.E.log"
+RUN_EXE="$E_APP/Contents/MacOS/$NAME" RUN_EXTRA="-showMenuBarBadge YES -badgeRefreshInterval 30" run_app "$LOG" "$E"
+log "log: $LOG"
+cnt() { nth counters "$1" | grep "QA-COUNTERS 0 "; }
+for i in 1 2 3 4 5; do log "  counters $i: $(cnt $i | sed 's/^QA-COUNTERS 0 //')"; done
+J1=$(cnt 1 | num json); J2=$(cnt 2 | num json)
+check "E finished" 'grep -q QA-DONE "$LOG"'
+check "E: primary has a session in the QA bundle (JSON fetch at launch)" '[ "${J1:-0}" -ge 1 ]'
+check "primary fetches on its timer with the popover closed (>= 2 in 80 s)" '[ $(( ${J2:-0} - ${J1:-0} )) -ge 2 ]'
+check "parked: no page loaded, no page scripts, page parked" 'cnt 2 | grep -q "pageLoads=0 pageScripts=0 .* parked=true"'
+check "sleep: timers stopped" 'dump 2 | grep "QA-ACCOUNT 0 " | grep -q "timerNextFire=nones" && cnt 3 | grep -q "timer=false paused=true"'
+check "no fetch while asleep" '[ "$(cnt 3 | num attempts)" = "$(cnt 4 | num attempts)" ]'
+check "wake: exactly one fetch, timers back" '[ $(( $(cnt 5 | num attempts) - $(cnt 4 | num attempts) )) = 1 ] && cnt 5 | grep -q "timer=true paused=false"'
+check "E: paused/resumed logged" 'L | grep -q "background activity paused (sleep)" && L | grep -q "background activity resumed (sleep)"'
+check "E: no secret-looking values logged" '! grep -qiE "sessionKey=|Bearer |@[a-z0-9.-]+\.[a-z]{2,}" "$LOG"'
+rm -rf "$E_APP"
 
 if [ "$KEEP" = 0 ]; then
     cleanup

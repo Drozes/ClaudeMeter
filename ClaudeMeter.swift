@@ -30,6 +30,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var accountsMenuItems: [NSMenuItem] = []
     // Saved accounts that cannot run (missing/invalid store identifier).
     var unavailableRecords: [AccountRecord] = []
+    // Why background activity is paused ("sleep", "screens", "session",
+    // "lock"); refresh timers and probes stop while any reason is present.
+    var pauseReasons = Set<String>()
+    var activityPaused: Bool { !pauseReasons.isEmpty }
     // Two or more accounts: the stacked popover view, each secondary
     // account's own usage view, and each badge side's last text.
     var multiAccountView: MultiAccountUsageView?
@@ -326,6 +330,80 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // MARK: - App Lifecycle
 
+    func applicationWillTerminate(_ notification: Notification) {
+        // History writes are throttled; save the latest samples on quit.
+        accounts.forEach { $0.history.persistNow() }
+    }
+
+    /// Low Power Mode or a serious / critical thermal state: the closed-state
+    /// refresh interval is doubled.
+    var reducedPowerMode: Bool {
+        let info = ProcessInfo.processInfo
+        return info.isLowPowerModeEnabled || info.thermalState == .serious || info.thermalState == .critical
+    }
+
+    /// Pauses refresh timers and probes while the Mac sleeps, the displays
+    /// sleep, the screen is locked or the session is switched away, and runs
+    /// one staggered fetch per account when everything is awake again.
+    func installPowerObservers() {
+        let ws = NSWorkspace.shared.notificationCenter
+        let pairs: [(Notification.Name, Notification.Name, String)] = [
+            (NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification, "sleep"),
+            (NSWorkspace.screensDidSleepNotification, NSWorkspace.screensDidWakeNotification, "screens"),
+            (NSWorkspace.sessionDidResignActiveNotification, NSWorkspace.sessionDidBecomeActiveNotification, "session"),
+        ]
+        for (pause, resume, reason) in pairs {
+            ws.addObserver(forName: pause, object: nil, queue: .main) { [weak self] _ in self?.pauseActivity(reason) }
+            ws.addObserver(forName: resume, object: nil, queue: .main) { [weak self] _ in self?.resumeActivity(reason) }
+        }
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in
+            self?.pauseActivity("lock")
+        }
+        dnc.addObserver(forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in
+            self?.resumeActivity("lock")
+        }
+        for name in [Notification.Name.NSProcessInfoPowerStateDidChange, ProcessInfo.thermalStateDidChangeNotification] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.powerModeChanged()
+            }
+        }
+    }
+
+    func pauseActivity(_ reason: String) {
+        let wasPaused = activityPaused
+        pauseReasons.insert(reason)
+        guard !wasPaused else { return }
+        NSLog("%@", "[ClaudeMeter] background activity paused (\(reason))")
+        for account in accounts {
+            account.stopRefreshTimer()
+            account.history.persistNow()
+        }
+    }
+
+    func resumeActivity(_ reason: String) {
+        guard pauseReasons.remove(reason) != nil, !activityPaused else { return }
+        NSLog("%@", "[ClaudeMeter] background activity resumed (\(reason))")
+        // Let the network come back first, then one fetch per account
+        // (staggered) and the usual timers.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+            guard let self = self, !self.activityPaused else { return }
+            for account in self.accounts where !(account.isSignedOut && !account.isPrimary) {
+                account.staggered { account.refreshNow(reason: "wake") }
+            }
+            if self.popover?.isShown == true || self.showMenuBarBadge {
+                self.accounts.forEach { $0.startRefreshTimer() }
+            }
+        }
+    }
+
+    func powerModeChanged() {
+        NSLog("%@", "[ClaudeMeter] power mode changed: reduced=\(reducedPowerMode)")
+        for account in accounts where account.refreshTimer != nil {
+            account.startRefreshTimer()
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
@@ -375,9 +453,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // v2.7 — refresh the menu-bar tooltip every minute so the "at HH:MM"
         // peak time stays current between scrapes.
         tooltipRefreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            self?.updateMenuBarTooltip()
+            guard let self = self, !self.activityPaused else { return }
+            self.updateMenuBarTooltip()
         }
         tooltipRefreshTimer?.tolerance = 10
+        installPowerObservers()
 
         // Activity dots follow the status button's size and the screen setup.
         statusItem.button?.postsFrameChangedNotifications = true
@@ -441,7 +521,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let account = accounts.first else { return }
         account.importFromClaudeDesktop { success in
             if success {
-                account.webView.load(URLRequest(url: Self.usageURL))
+                account.loadUsagePage(reason: "Claude Desktop import")
             } else {
                 let alert = NSAlert()
                 alert.messageText = "Could not import session"
@@ -674,6 +754,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             popover.performClose(nil)
         } else {
             accounts.forEach { $0.stopRefreshTimer() }
+            // Views are not rebuilt while the popover is closed; replay the
+            // latest data before showing it.
+            accounts.forEach { $0.renderLatestIfNeeded() }
             if accounts.count >= 2 {
                 // Several accounts: skeleton per account without data yet,
                 // then size the popover to all sections.
@@ -696,7 +779,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             } else {
                 usageView?.setStatusLoading()
             }
-            accounts.forEach { account in account.staggered { account.softReload() } }
+            accounts.forEach { account in account.staggered { account.refreshForPopover() } }
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
             if let multi = multiAccountView, accounts.count >= 2 {
@@ -1026,7 +1109,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             account.badgeShowsWeekly = false
             setBadgeTitle("\(pct)%", reason: "model meter labeled current session",
                           style: singleAccountBadgeStyle(for: account, text: "\(pct)%"))
-            UserDefaults.standard.set(pct, forKey: badgeKey)
+            UserDefaults.standard.setIfChanged(pct, forKey: badgeKey)
             return
         }
 
@@ -1041,7 +1124,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 account.badgeShowsWeekly = true
                 setBadgeTitle(text, reason: "model weekly (no session window)",
                               style: singleAccountBadgeStyle(for: account, text: text))
-                UserDefaults.standard.set(reading.percentage, forKey: badgeKey)
+                UserDefaults.standard.setIfChanged(reading.percentage, forKey: badgeKey)
             } else {
                 account.badgeShowsWeekly = false
                 UserDefaults.standard.removeObject(forKey: badgeKey)
@@ -1050,9 +1133,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
 
-        // Fallback: direct XPath scrape (independent of structured scrape's labels).
+        // Fallback: direct XPath scrape (independent of structured scrape's
+        // labels), only when this account's data comes through the page (DOM
+        // path or JSON circuit open). A JSON-healthy account's page is parked
+        // and is never woken up just for this; its badge waits for the next
+        // fetch. A parked page counts as "no session text found".
+        guard account.needsPageScrape else { return }
         NSLog("[ClaudeMeter] updateBadgeFromModel: no 'current session' meter in model, falling back to XPath")
-        account.webView.evaluateJavaScript(Self.scrapeSessionPercentageJS) { [weak self] result, _ in
+        let handleXPathResult: (Any?) -> Void = { [weak self] result in
             guard let self = self else { return }
             // Re-check guards on the JS callback — popover state may have changed.
             guard self.showMenuBarBadge, self.popover?.isShown != true else { return }
@@ -1060,7 +1148,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 account.badgeShowsWeekly = false
                 self.setBadgeTitle("\(pct)%", reason: "XPath fallback scrape",
                                    style: self.singleAccountBadgeStyle(for: account, text: "\(pct)%"))
-                UserDefaults.standard.set(pct, forKey: badgeKey)
+                UserDefaults.standard.setIfChanged(pct, forKey: badgeKey)
             } else if account.latestSectionsPath == "dom", account.sessionWindowAbsent,
                       let weekly = account.weeklyPercentage(from: account.latestSections) {
                 // DOM sections without a session meter and no session text on
@@ -1068,11 +1156,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 account.badgeShowsWeekly = true
                 self.setBadgeTitle("\(weekly)%", reason: "model weekly (DOM, no session window)",
                                    style: self.singleAccountBadgeStyle(for: account, text: "\(weekly)%"))
-                UserDefaults.standard.set(weekly, forKey: badgeKey)
+                UserDefaults.standard.setIfChanged(weekly, forKey: badgeKey)
             } else if self.statusItem.button?.title.isEmpty == true {
                 self.setBadgeTitle("\u{2014}%", reason: "XPath fallback returned nil")
             }
         }
+        let started = account.runPageScript(Self.scrapeSessionPercentageJS) { result, _ in
+            handleXPathResult(result)
+        }
+        if !started { handleXPathResult(nil) }
     }
 
     /// v2.7 — Menu-bar tooltip with today's peak / 24h avg / streak,
@@ -1668,7 +1760,7 @@ extension AppDelegate {
             if let reading = account.badgeReading() {
                 badgeSideText[id] = "\(reading.percentage)%"
                 account.badgeShowsWeekly = reading.source == .weekly
-                UserDefaults.standard.set(reading.percentage, forKey: account.lastBadgePercentageKey)
+                UserDefaults.standard.setIfChanged(reading.percentage, forKey: account.lastBadgePercentageKey)
                 freshSides += 1
                 if reading.source == .weekly { weeklySides += 1 }
                 continue
@@ -1682,24 +1774,28 @@ extension AppDelegate {
                 continue
             }
             if badgeSideText[id] == nil { badgeSideText[id] = cachedBadgeSideText(for: account) }
-            guard !account.record.orgPinned else { continue }
-            account.webView.evaluateJavaScript(Self.scrapeSessionPercentageJS) { [weak self, weak account] result, _ in
+            guard !account.record.orgPinned, account.needsPageScrape else { continue }
+            let handleXPathResult: (Any?) -> Void = { [weak self, weak account] result in
                 guard let self = self, let account = account, !account.isSignedOut,
                       self.showMenuBarBadge, self.popover?.isShown != true,
                       self.accounts.count >= 2 else { return }
                 if let pct = result as? Int {
                     account.badgeShowsWeekly = false
                     self.badgeSideText[account.id] = "\(pct)%"
-                    UserDefaults.standard.set(pct, forKey: account.lastBadgePercentageKey)
+                    UserDefaults.standard.setIfChanged(pct, forKey: account.lastBadgePercentageKey)
                     self.renderMultiAccountBadge(reason: "XPath fallback scrape")
                 } else if account.latestSectionsPath == "dom", account.sessionWindowAbsent,
                           let weekly = account.weeklyPercentage(from: account.latestSections) {
                     account.badgeShowsWeekly = true
                     self.badgeSideText[account.id] = "\(weekly)%"
-                    UserDefaults.standard.set(weekly, forKey: account.lastBadgePercentageKey)
+                    UserDefaults.standard.setIfChanged(weekly, forKey: account.lastBadgePercentageKey)
                     self.renderMultiAccountBadge(reason: "model weekly (DOM, no session window)")
                 }
             }
+            let started = account.runPageScript(Self.scrapeSessionPercentageJS) { result, _ in
+                handleXPathResult(result)
+            }
+            if !started { handleXPathResult(nil) }
         }
         // freshSides counts sides read from their account's latest fetched
         // sections in this call (not necessarily a fetch that just happened);
@@ -1978,7 +2074,9 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// view controller.
     weak var usageView: UsageContentView?
 
-    let webView: WKWebView
+    /// The hidden claude.ai usage page, created on demand (see "Hidden usage
+    /// page" below). nil while parked.
+    private(set) var pageView: WKWebView?
     /// WebKit data store holding this account's claude.ai session: the
     /// default store for the primary account, an identifier-keyed store
     /// (macOS 14+) for every other account. Login windows and OAuth popups
@@ -2056,6 +2154,11 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     private var signedOutProbeTimer: Timer?
     private var pageRetryUsed = false
     private var lastSignInConfirmAt: Date?
+    private var viewNeedsRefresh = false
+    private var lastDistributedLogKey: String?
+    private var lastDistributedLogAt = Date.distantPast
+    private var lastFetchLogKey: String?
+    private var lastFetchLogAt = Date.distantPast
     private var tierKindRefreshedThisLaunch = false
     static let signedOutProbeInterval: TimeInterval = 15 * 60
     /// Called once when the login window closes: true after a verified
@@ -2073,14 +2176,167 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         self.record = record
         self.dataStore = dataStore
         self.history = UsageHistory.loadFromDisk(accountID: record.id)
-        // WKWebView is kept off-screen for data scraping only
+        super.init()
+    }
+
+    // MARK: - Hidden usage page (parked while the JSON path is healthy)
+
+    /// The page is only needed to detect a sign-in page from the background,
+    /// for the DOM fallback (JSON circuit open, forceDOMOnly) and as a
+    /// periodic session keep-alive. Whenever the JSON path is healthy it is
+    /// destroyed ("parked"), which ends its WebContent process (hundreds of
+    /// MB) and all page work. Cookies live in the data store, not the page.
+    private var lastPageLoadAt = Date()
+    /// At most one keep-alive page load per account in this interval
+    /// (staggered by account), so the claude.ai session stays warm.
+    static let pageKeepAliveInterval: TimeInterval = 6 * 3600
+    // Activity counters (diagnostics; read by the QA test hooks).
+    private(set) var pageLoadCount = 0
+    private(set) var pageScriptCount = 0
+    private(set) var fetchAttemptCount = 0
+    private(set) var jsonSuccessCount = 0
+    private(set) var cookieWriteBackCount = 0
+    private var lastGuardTripPath: String?
+
+    /// JSON is the active path: not forced to DOM and the circuit is closed.
+    var jsonHealthy: Bool {
+        !UserDefaults.standard.bool(forKey: AppDelegate.forceDOMOnlyKey) && !jsonCircuitOpen
+    }
+
+    /// The badge needs the page's XPath scrape only when this account's data
+    /// comes through the page.
+    var needsPageScrape: Bool { !jsonHealthy || latestSectionsPath == "dom" }
+
+    @discardableResult
+    func ensurePageView() -> WKWebView {
+        if let view = pageView { return view }
         let config = WKWebViewConfiguration()
         config.websiteDataStore = dataStore
-        webView = WKWebView(frame: .zero, configuration: config)
-        super.init()
-        webView.navigationDelegate = self
-        webView.uiDelegate = self
-        webView.customUserAgent = AppDelegate.safariUA
+        let view = WKWebView(frame: .zero, configuration: config)
+        view.navigationDelegate = self
+        view.uiDelegate = self
+        view.customUserAgent = AppDelegate.safariUA
+        pageView = view
+        return view
+    }
+
+    func loadUsagePage(reason: String) {
+        guard !isTornDown else { return }
+        pageLoadCount += 1
+        lastPageLoadAt = Date()
+        NSLog("%@", "[ClaudeMeter] account \(id): loading usage page (\(reason))")
+        ensurePageView().load(URLRequest(url: AppDelegate.usageURL))
+    }
+
+    /// Destroys the page once it has finished loading, if the JSON path is
+    /// healthy and no sign-in is in progress.
+    func parkPageIfIdle(reason: String) {
+        guard let view = pageView, !view.isLoading, jsonHealthy, latestSectionsPath != "dom",
+              loginWindow == nil else { return }
+        view.stopLoading()
+        view.navigationDelegate = nil
+        view.uiDelegate = nil
+        pageView = nil
+        NSLog("%@", "[ClaudeMeter] account \(id): usage page parked (\(reason))")
+    }
+
+    /// Runs a script in the page if there is one; false when parked.
+    @discardableResult
+    func runPageScript(_ js: String, completion: @escaping (Any?, Error?) -> Void) -> Bool {
+        guard let page = pageView else { return false }
+        pageScriptCount += 1
+        page.evaluateJavaScript(js, completionHandler: completion)
+        return true
+    }
+
+    /// One refresh now: the JSON API when healthy, else through the page.
+    func refreshNow(reason: String) {
+        guard !isTornDown else { return }
+        if jsonHealthy || record.orgPinned {
+            lastRefreshDate = Date()
+            scrapeAndDistribute()
+        } else {
+            loadUsagePage(reason: reason)
+        }
+    }
+
+    /// Popover open: a JSON fetch for healthy accounts (no page reload), the
+    /// page's own refresh otherwise.
+    func refreshForPopover() {
+        if jsonHealthy || record.orgPinned {
+            usageView?.setStatusLoading()
+            lastRefreshDate = Date()
+            scrapeAndDistribute()
+        } else {
+            softReload()
+        }
+    }
+
+    /// Logs (once per distinct path) where the page sat when the DOM path
+    /// found it off the usage page. Path only, never query strings.
+    private func noteGuardTrip(_ url: URL?) {
+        let path = "\(url?.host ?? "nil")\(url?.path ?? "")"
+        guard path != lastGuardTripPath else { return }
+        lastGuardTripPath = path
+        NSLog("%@", "[ClaudeMeter] account \(id): page is not on the usage page (\(path)); reloading it")
+    }
+
+    // MARK: - API session (one per account)
+
+    /// One URLSession per account, created on first use and reused, so TLS
+    /// sessions and connections stay warm. Ephemeral with no cookie storage of
+    /// its own: each request carries a Cookie header built from this
+    /// account's WebKit store, so cookies never cross accounts.
+    private var apiSessionStorage: URLSession?
+    var apiSession: URLSession {
+        if let session = apiSessionStorage { return session }
+        let config = URLSessionConfiguration.ephemeral
+        config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
+        config.httpCookieAcceptPolicy = .never
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        let session = URLSession(configuration: config)
+        apiSessionStorage = session
+        return session
+    }
+    private var cookieHeader: String?
+    private var cookieStoreWarm = false
+    private var lastLoggedCookieCount: Int?
+
+    /// Attaches this account's current claude.ai cookies to a request.
+    func applyCookieHeader(to request: inout URLRequest) {
+        if let header = cookieHeader { request.setValue(header, forHTTPHeaderField: "Cookie") }
+    }
+
+    /// Writes cookies set by an API response (session rotation, Cloudflare)
+    /// back into this account's own WebKit store, so the session stays fresh
+    /// without page loads. Counts only; values are never logged.
+    func storeResponseCookies(_ response: URLResponse?) {
+        guard !isTornDown, let http = response as? HTTPURLResponse, let url = http.url else { return }
+        var fields: [String: String] = [:]
+        for (key, value) in http.allHeaderFields {
+            if let key = key as? String, let value = value as? String { fields[key] = value }
+        }
+        let cookies = HTTPCookie.cookies(withResponseHeaderFields: fields, for: url)
+        guard !cookies.isEmpty else { return }
+        cookieWriteBackCount += cookies.count
+        let store = dataStore.httpCookieStore   // this account's store only
+        for cookie in cookies { store.setCookie(cookie) }
+    }
+
+    /// RFC 6265 matching of a stored cookie against a request URL.
+    static func cookie(_ cookie: HTTPCookie, matches url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        var domain = cookie.domain.lowercased()
+        let domainCookie = domain.hasPrefix(".")
+        if domainCookie { domain.removeFirst() }
+        let domainOK = host == domain || (domainCookie && host.hasSuffix("." + domain))
+        let path = url.path.isEmpty ? "/" : url.path
+        let pathOK = path.hasPrefix(cookie.path)
+        let notExpired = cookie.expiresDate.map { $0 > Date() } ?? true
+        let secureOK = !cookie.isSecure || url.scheme == "https"
+        return domainOK && pathOK && notExpired && secureOK
     }
 
     // MARK: - Per-account keys
@@ -2161,9 +2417,8 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         guard !signInProbeInFlight, !isTornDown else { return false }
         signInProbeInFlight = true
         copyCookiesToSession(logCount: false) { [weak self] session in
-            guard let self = self else { session.finishTasksAndInvalidate(); return }
+            guard let self = self else { return }
             self.requestOrgList(session: session, context: "signInProbe", quiet: true) { [weak self] status, orgs in
-                session.finishTasksAndInvalidate()
                 guard let self = self, !self.isTornDown else { return }
                 self.signInProbeInFlight = false
                 completion(self.signInVerdict(status: status, orgs: orgs))
@@ -2190,11 +2445,12 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             case .signedIn:
                 NSLog("%@", "[ClaudeMeter] account \(self.id): \(reason), but organizations still answer; treating as transient")
                 // A page that wandered off the usage page: one reload later.
-                if !self.pageRetryUsed, self.webView.url?.absoluteString.contains("/settings/usage") != true {
+                if !self.pageRetryUsed, let page = self.pageView,
+                   page.url?.absoluteString.contains("/settings/usage") != true {
                     self.pageRetryUsed = true
                     DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
                         guard let self = self, !self.isTornDown else { return }
-                        self.webView.load(URLRequest(url: AppDelegate.usageURL))
+                        self.refreshNow(reason: "page retry")
                     }
                 }
             case .unknown:
@@ -2217,11 +2473,11 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     }
 
     func runSignedOutProbe() {
-        guard isSignedOut, !isPrimary, loginWindow == nil else { return }
+        guard isSignedOut, !isPrimary, loginWindow == nil, !app.activityPaused else { return }
         probeSignIn { [weak self] verdict in
             guard let self = self, self.isSignedOut, case .signedIn = verdict else { return }
             self.setSignedOut(false, reason: "background probe: organizations answer again")
-            self.webView.load(URLRequest(url: AppDelegate.usageURL))
+            self.refreshNow(reason: "signed in again")
         }
     }
 
@@ -2244,6 +2500,14 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         }
     }
 
+    /// Replays the latest data into the usage view if it changed while the
+    /// popover was closed.
+    func renderLatestIfNeeded() {
+        guard viewNeedsRefresh else { return }
+        viewNeedsRefresh = false
+        renderLatest()
+    }
+
     /// Pushes the latest data into a usage view created after it arrived.
     func renderLatest() {
         guard let view = usageView, !latestSections.isEmpty else { return }
@@ -2263,15 +2527,16 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// belongs to the primary account only).
     func start() {
         hasAttemptedDesktopImport = true
+        // JSON first: no page load unless the API cannot be used (then the
+        // failure path loads the page, which also detects a sign-in page).
         guard isPrimary else {
             staggered { [weak self] in
-                self?.webView.load(URLRequest(url: AppDelegate.usageURL))
+                self?.refreshNow(reason: "launch")
             }
             return
         }
-        importFromClaudeDesktop { [weak self] success in
-            guard let self = self else { return }
-            self.webView.load(URLRequest(url: AppDelegate.usageURL))
+        importFromClaudeDesktop { [weak self] _ in
+            self?.refreshNow(reason: "launch")
         }
     }
 
@@ -2288,9 +2553,12 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         loginWindow?.close()
         for window in popupWindows { window.close() }
         popupWindows.removeAll()
-        webView.stopLoading()
-        webView.navigationDelegate = nil
-        webView.uiDelegate = nil
+        pageView?.stopLoading()
+        pageView?.navigationDelegate = nil
+        pageView?.uiDelegate = nil
+        pageView = nil
+        apiSessionStorage?.invalidateAndCancel()
+        apiSessionStorage = nil
     }
 
     /// Deletes an isolated account's WebKit data store (cookies, storage).
@@ -2337,7 +2605,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     }
 
     func injectCookies(_ cookies: [HTTPCookie], completion: @escaping () -> Void) {
-        let store = webView.configuration.websiteDataStore.httpCookieStore
+        let store = dataStore.httpCookieStore
         let group = DispatchGroup()
         for cookie in cookies {
             group.enter()
@@ -2402,9 +2670,8 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         guard loginWindow != nil, !loginSucceeded, !loginCheckInFlight, !isTornDown else { return }
         loginCheckInFlight = true
         copyCookiesToSession(logCount: false) { [weak self] session in
-            guard let self = self else { session.finishTasksAndInvalidate(); return }
+            guard let self = self else { return }
             self.requestOrgList(session: session, context: "loginCheck", quiet: true) { [weak self] status, orgs in
-                session.finishTasksAndInvalidate()
                 guard let self = self else { return }
                 self.loginCheckInFlight = false
                 // Log state changes only (this runs every 4s).
@@ -2475,13 +2742,13 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         // (an SSO identity provider) is a hint only; the API confirms before
         // the account is marked signed out. They never open a window on
         // their own; the menu offers "Sign In Again to <name>" instead.
-        if webView === self.webView && !isPrimary && looksSignedOut(url) {
+        if webView === self.pageView && !isPrimary && looksSignedOut(url) {
             confirmSignedOut(reason: "background page left the usage page for a sign-in page")
             return
         }
 
         // Popover hit a login page → show login window (desktop import already attempted at startup)
-        if webView === self.webView && isLoginURL(url) {
+        if webView === self.pageView && isLoginURL(url) {
             setSignedOut(true, reason: "background page reached a sign-in page")
             if UserDefaults.standard.bool(forKey: AppDelegate.suppressAutoLoginWindowKey) {
                 NSLog("%@", "[ClaudeMeter] login window not opened automatically (suppressAutoLoginWindow)")
@@ -2492,7 +2759,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                 importFromClaudeDesktop { [weak self] success in
                     guard let self = self else { return }
                     if success {
-                        self.webView.load(URLRequest(url: AppDelegate.usageURL))
+                        self.loadUsagePage(reason: "after Claude Desktop import")
                     } else {
                         if self.app.popover.isShown { self.app.popover.performClose(nil) }
                         self.showLoginWindow()
@@ -2511,15 +2778,17 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             return
         }
 
-        if webView === self.webView {
+        if webView === self.pageView {
             pageRetryUsed = false
             lastRefreshDate = Date()
             usageView?.setStatusFresh(true)
-            // Scrape immediately, then again after React renders
+            // One fetch; a JSON-healthy account then parks the page. The DOM
+            // path scrapes again after React renders.
+            let domPath = !(jsonHealthy || record.orgPinned)
             scrapeAndDistribute()
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                 guard let self = self else { return }
-                self.scrapeAndDistribute()
+                if domPath { self.scrapeAndDistribute() }
                 // Ensure refresh timer is running after initial page load
                 if self.refreshTimer == nil && (self.app.popover?.isShown == true || self.app.showMenuBarBadge) {
                     self.startRefreshTimer()
@@ -2576,7 +2845,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             callback?(succeeded)
             // A cancelled add is discarded by the callback; nothing to load.
             if !isTornDown && (succeeded || !isPendingAdd) {
-                webView.load(URLRequest(url: AppDelegate.usageURL))
+                refreshNow(reason: "login window closed")
             }
         }
         popupWindows.removeAll { $0 === window }
@@ -2585,7 +2854,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// Soft reload: if already on the usage page, click the site's own refresh button.
     /// Falls back to a full page reload if needed.
     func softReload() {
-        guard let url = webView.url?.absoluteString, url.contains("/settings/usage") else {
+        guard let page = pageView, let url = page.url?.absoluteString, url.contains("/settings/usage") else {
             gracefulReload()
             return
         }
@@ -2603,7 +2872,8 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             return 'not_found';
         })()
         """
-        webView.evaluateJavaScript(js) { [weak self] result, _ in
+        pageScriptCount += 1
+        page.evaluateJavaScript(js) { [weak self] result, _ in
             if (result as? String) == "clicked" {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                     self?.lastRefreshDate = Date()
@@ -2618,7 +2888,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// Full page reload.
     func gracefulReload() {
         usageView?.setStatusLoading()
-        webView.load(URLRequest(url: AppDelegate.usageURL))
+        loadUsagePage(reason: "reload")
     }
 
     // MARK: - Polling (Unified Adaptive Timer)
@@ -2628,7 +2898,9 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         if app.popover?.isShown == true {
             return app.statusFreshnessInterval   // fast (6s default)
         } else {
-            return app.badgeRefreshInterval       // slow (120s default)
+            // slow (120s default); doubled in Low Power Mode or when the Mac
+            // is thermally constrained
+            return app.badgeRefreshInterval * (app.reducedPowerMode ? 2 : 1)
         }
     }
 
@@ -2637,7 +2909,10 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// full interval as before), so two accounts never refresh together.
     func startRefreshTimer() {
         refreshTimer?.invalidate()
-        guard !isTornDown else { return }
+        refreshTimer = nil
+        // Paused while the Mac sleeps, the screens sleep or the session is
+        // locked / switched away; resumed with one fetch on wake.
+        guard !isTornDown, !app.activityPaused else { return }
         let interval = activeRefreshInterval
         let count = max(app.accounts.count, 1)
         let offset = interval * Double(staggerIndex) / Double(count)
@@ -2649,7 +2924,9 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.unifiedRefresh()
         }
-        refreshTimer?.tolerance = interval * 0.1
+        // Closed-state ticks are background work: a wide tolerance lets the
+        // system coalesce wakeups.
+        refreshTimer?.tolerance = interval * (app.popover?.isShown == true ? 0.1 : 0.25)
         if offset > 0 {
             refreshTimer?.fireDate = Date().addingTimeInterval(offset)
         }
@@ -2663,30 +2940,38 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// Unified refresh: clicks the site's refresh button, then scrapes all data.
     /// Adapts behavior based on whether the popover is open or closed.
     func unifiedRefresh() {
-        guard !isTornDown else { return }
+        guard !isTornDown, !app.activityPaused else { return }
         // A signed-out secondary account stays idle until the user signs in
         // again (no repeated requests with a dead session).
         if isSignedOut && !isPrimary { return }
-        // A pinned org is metered through the JSON API only, so its page
-        // state does not matter.
-        if record.orgPinned {
+        // Healthy JSON path (and pinned orgs, JSON only): no page is needed,
+        // and the fetch runs wherever the hidden page sits. (The usage page
+        // can move itself, e.g. to /new for plans without a session window,
+        // which used to stop the primary account's background refresh.)
+        if record.orgPinned || jsonHealthy {
             let popoverOpen = app.popover?.isShown == true
             if !popoverOpen && !app.showMenuBarBadge { return }
-            // Same periodic full reload as other accounts, to reclaim WebView
-            // memory (the page itself is not used for metering).
-            if !popoverOpen {
-                refreshCycleCount += 1
-                if refreshCycleCount >= 30 {
-                    refreshCycleCount = 0
-                    NSLog("[ClaudeMeter] unifiedRefresh: periodic full reload to reclaim WebView memory")
-                    webView.load(URLRequest(url: AppDelegate.usageURL))
-                }
+            // Keep-alive: a page load at most every 6 h (staggered) keeps
+            // the session warm; its didFinish fetches and parks the page.
+            if pageView == nil,
+               Date().timeIntervalSince(lastPageLoadAt) >= Self.pageKeepAliveInterval + Double(staggerIndex) * 600 {
+                loadUsagePage(reason: "session keep-alive")
+                return
             }
             lastRefreshDate = Date()
             scrapeAndDistribute()
             return
         }
-        guard let url = webView.url?.absoluteString, url.contains("/settings/usage") else { return }
+        // DOM path (JSON circuit open or forceDOMOnly): the page is needed.
+        guard let page = pageView else {
+            loadUsagePage(reason: "DOM fallback")
+            return
+        }
+        guard let url = page.url?.absoluteString, url.contains("/settings/usage") else {
+            noteGuardTrip(page.url)
+            if !page.isLoading { loadUsagePage(reason: "back to the usage page") }
+            return
+        }
 
         let popoverOpen = app.popover?.isShown == true
 
@@ -2700,7 +2985,7 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             if refreshCycleCount >= 30 {
                 refreshCycleCount = 0
                 NSLog("[ClaudeMeter] unifiedRefresh: periodic full reload to reclaim WebView memory")
-                webView.load(URLRequest(url: AppDelegate.usageURL))
+                loadUsagePage(reason: "periodic reload")
                 return
             }
         }
@@ -2729,7 +3014,8 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             return 'not_found';
         })()
         """
-        webView.evaluateJavaScript(js) { [weak self] result, error in
+        pageScriptCount += 1
+        page.evaluateJavaScript(js) { [weak self] result, error in
             if let error = error {
                 NSLog("[ClaudeMeter] unifiedRefresh JS error: \(error.localizedDescription)")
             } else {
@@ -2824,6 +3110,8 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// Both paths funnel through the same empty-streak gate and badge/model updates,
     /// so callers see a uniform interface regardless of which path succeeded.
     func scrapeAndDistribute() {
+        guard !isTornDown else { return }
+        fetchAttemptCount += 1
         let forceDOM = UserDefaults.standard.bool(forKey: AppDelegate.forceDOMOnlyKey)
         // Auto-reset a stale circuit so JSON gets periodic re-attempts. The
         // circuit re-opens on its own if 5 fresh failures recur.
@@ -2866,10 +3154,16 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                     self.scrapeViaDOM()
                 } else {
                     self.jsonConsecutiveFailures = 0
+                    self.jsonSuccessCount += 1
                     self.logFetchOutcome(path: "json", outcome: "success", detail: "n=\(sections.count)")
                     self.distributeFetchResult(sections, path: "json")
+                    self.parkPageIfIdle(reason: "JSON healthy")
                 }
             case .failure(let err):
+                // A fetch already running: this request just merges into it.
+                if case .transport(let e) = err, (e as NSError).domain == "ClaudeMeter", (e as NSError).code == -1 {
+                    return
+                }
                 if pinned {
                     // No DOM fallback and no circuit-breaker count for a pinned
                     // org. Auth errors are confirmed in fetchViaJSON; other
@@ -2881,6 +3175,13 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                     } else {
                         self.logFetchOutcome(path: "json", outcome: "error", detail: "\(err) pinned org, no DOM fallback")
                     }
+                    self.distributeFetchResult([], path: "json")
+                    return
+                }
+                // Network unreachable / timeouts: keep the last data (the
+                // empty-streak gate decides), no page load and no circuit count.
+                if case .transport = err {
+                    self.logFetchOutcome(path: "json", outcome: "error", detail: "transport error, keeping last data")
                     self.distributeFetchResult([], path: "json")
                     return
                 }
@@ -2900,7 +3201,13 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// through the shared distribution gate. Kept as a working fallback because
     /// the JSON endpoint is undocumented and may rotate.
     private func scrapeViaDOM() {
-        webView.evaluateJavaScript(AppDelegate.scrapeUsageJS) { [weak self] result, error in
+        // No page yet (parked): load it; its didFinish scrapes again.
+        guard let page = pageView, !page.isLoading else {
+            if pageView == nil { loadUsagePage(reason: "JSON unavailable, DOM fallback") }
+            return
+        }
+        pageScriptCount += 1
+        page.evaluateJavaScript(AppDelegate.scrapeUsageJS) { [weak self] result, error in
             guard let self = self else { return }
 
             // A nil/non-string result or an empty string means the JS errored
@@ -2950,8 +3257,14 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         self.consecutiveEmptyScrapes = 0
         self.noteFetchedSections(sections, path: path)
         self.setSignedOut(false, reason: "fetch succeeded")
-        UserDefaults.standard.set(path, forKey: self.lastFetchPathKey)
-        NSLog("[ClaudeMeter] distributed \(sections.count) sections via \(path)")
+        UserDefaults.standard.setIfChanged(path, forKey: self.lastFetchPathKey)
+        // Logged on change (count or path) and at most every 30 min otherwise.
+        let distributedKey = "\(sections.count)|\(path)"
+        if distributedKey != lastDistributedLogKey || Date().timeIntervalSince(lastDistributedLogAt) >= 1800 {
+            lastDistributedLogKey = distributedKey
+            lastDistributedLogAt = Date()
+            NSLog("[ClaudeMeter] distributed \(sections.count) sections via \(path)")
+        }
         let sections = self.applyResetEstimates(to: sections)
         self.latestSections = sections
         // Name the account in notification titles only once a second account
@@ -2991,15 +3304,22 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         self.lastWeeklyForecast = weeklyForecast
         self.lastSessionResetAt = sessionReset
         self.lastWeeklyResetAt = weeklyReset
-        self.usageView?.update(
-            sections: sections,
-            sessionForecast: sessionForecast,
-            weeklyForecast: weeklyForecast,
-            sessionResetAt: sessionReset,
-            weeklyResetAt: weeklyReset,
-            history: self.history
-        )
-        self.usageView?.setStatusFresh(true)
+        // The popover's view is only rebuilt while it is shown; otherwise
+        // the latest data is replayed into it when it opens.
+        if self.app.popover?.isShown == true {
+            self.usageView?.update(
+                sections: sections,
+                sessionForecast: sessionForecast,
+                weeklyForecast: weeklyForecast,
+                sessionResetAt: sessionReset,
+                weeklyResetAt: weeklyReset,
+                history: self.history
+            )
+            self.usageView?.setStatusFresh(true)
+            self.viewNeedsRefresh = false
+        } else {
+            self.viewNeedsRefresh = true
+        }
         self.app.updateBadgeFromModel()
         self.app.updateMenuBarTooltip()
     }
@@ -3049,6 +3369,13 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     /// NSLog("%@", ...) convention so the QA pipeline can detect path/outcome
     /// transitions from stderr alone.
     func logFetchOutcome(path: String, outcome: String, detail: String) {
+        // Logged when the outcome changes, and at most every 30 min while it
+        // stays the same (a heartbeat), not on every fetch.
+        let key = "\(path)|\(outcome)|\(detail)"
+        let now = Date()
+        guard key != lastFetchLogKey || now.timeIntervalSince(lastFetchLogAt) >= 1800 else { return }
+        lastFetchLogKey = key
+        lastFetchLogAt = now
         NSLog("%@", "[ClaudeMeter] fetch path=\(path) outcome=\(outcome) \(detail)")
     }
 
@@ -3129,7 +3456,6 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             self.discoverOrgUUID(session: session) { [weak self] uuid in
                 guard let self = self else { return }
                 guard let uuid = uuid else {
-                    session.finishTasksAndInvalidate()
                     self.jsonFetchInFlight = false
                     completion(.failure(.noOrg))
                     return
@@ -3137,7 +3463,6 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
 
                 let urlStr = "https://claude.ai" + String(format: AppDelegate.apiUsagePath, uuid)
                 guard let url = URL(string: urlStr) else {
-                    session.finishTasksAndInvalidate()
                     self.jsonFetchInFlight = false
                     completion(.failure(.noOrg))
                     return
@@ -3146,11 +3471,13 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                 var req = URLRequest(url: url)
                 req.setValue("application/json", forHTTPHeaderField: "Accept")
                 req.setValue(AppDelegate.safariUA, forHTTPHeaderField: "User-Agent")
+                self.applyCookieHeader(to: &req)
 
                 session.dataTask(with: req) { [weak self] data, response, error in
                     guard let self = self else { return }
                     DispatchQueue.main.async {
                         self.jsonFetchInFlight = false
+                        self.storeResponseCookies(response)
                         if let error = error {
                             completion(.failure(.transport(error)))
                             return
@@ -3186,8 +3513,6 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                         }
                     }
                 }.resume()
-                // Last task on this per-call session: let it finish, then free it.
-                session.finishTasksAndInvalidate()
             }
         }
     }
@@ -3240,9 +3565,11 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         var req = URLRequest(url: AppDelegate.apiOrgsURL)
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue(AppDelegate.safariUA, forHTTPHeaderField: "User-Agent")
+        applyCookieHeader(to: &req)
 
-        session.dataTask(with: req) { data, response, err in
+        session.dataTask(with: req) { [weak self] data, response, err in
             DispatchQueue.main.async {
+                self?.storeResponseCookies(response)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if let err = err {
                     if !quiet { NSLog("%@", "[ClaudeMeter] \(context) transport error: \(err.localizedDescription)") }
@@ -3285,9 +3612,8 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
                   let pinned = record.orgUUID else { return }
             tierKindRefreshedThisLaunch = true
             copyCookiesToSession(logCount: false) { [weak self] session in
-                guard let self = self else { session.finishTasksAndInvalidate(); return }
+                guard let self = self else { return }
                 self.requestOrgList(session: session, context: "tierRefresh", quiet: true) { [weak self] _, orgs in
-                    session.finishTasksAndInvalidate()
                     guard let self = self, let org = orgs?.first(where: { $0.uuid == pinned }) else { return }
                     AppDelegate.logUnmappedTier(org, context: "tierRefresh")
                     self.updateRecord { r in
@@ -3300,33 +3626,42 @@ final class AccountController: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             return
         }
         copyCookiesToSession { [weak self] session in
-            guard let self = self else { session.finishTasksAndInvalidate(); return }
-            self.discoverOrgUUID(session: session) { _ in session.finishTasksAndInvalidate() }
+            guard let self = self else { return }
+            self.discoverOrgUUID(session: session) { _ in }
         }
     }
 
     /// Snapshots all WKWebView cookies into a URLSession so the JSON request
     /// rides the same authenticated session as the page itself.
-    /// The caller owns the returned per-call session and must call
-    /// finishTasksAndInvalidate() after creating its last task.
+    /// Refreshes the Cookie header from this account's store and hands back
+    /// the account's shared API session (never invalidated by callers).
     func copyCookiesToSession(logCount: Bool = true, completion: @escaping (URLSession) -> Void) {
-        let store = webView.configuration.websiteDataStore.httpCookieStore
-        store.getAllCookies { cookies in
-            // ephemeral config already has its own in-memory HTTPCookieStorage.
-            // The previous sharedCookieStorage(forGroupContainerIdentifier:)
-            // path required an app-group entitlement we don't have, which is
-            // why cookies weren't actually being attached to outbound requests.
-            let config = URLSessionConfiguration.ephemeral
-            if let jar = config.httpCookieStorage {
-                for c in cookies { jar.setCookie(c) }
+        // WebKit only exposes a store's persisted cookies once its network
+        // session has done some work; with the page parked nothing else wakes
+        // it. fetchDataRecords does, without starting a WebContent process.
+        guard cookieStoreWarm else {
+            dataStore.fetchDataRecords(ofTypes: [WKWebsiteDataTypeCookies]) { [weak self] _ in
+                guard let self = self, !self.isTornDown else { return }
+                self.cookieStoreWarm = true
+                self.copyCookiesToSession(logCount: logCount, completion: completion)
             }
-            config.httpShouldSetCookies = true
-            config.httpCookieAcceptPolicy = .always
-            if logCount {
-                NSLog("%@", "[ClaudeMeter] copyCookiesToSession: attached \(cookies.count) cookies")
+            return
+        }
+        dataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+            DispatchQueue.main.async {
+                guard let self = self, !self.isTornDown else { return }
+                let matching = cookies.filter { Self.cookie($0, matches: AppDelegate.apiOrgsURL) }
+                // None at all: warm the store again before the next request
+                // (WebKit may have restarted its network process).
+                if matching.isEmpty { self.cookieStoreWarm = false }
+                self.cookieHeader = HTTPCookie.requestHeaderFields(with: matching)["Cookie"]
+                // Logged only when the count changes (not on every fetch).
+                if logCount && matching.count != self.lastLoggedCookieCount {
+                    self.lastLoggedCookieCount = matching.count
+                    NSLog("%@", "[ClaudeMeter] copyCookiesToSession: attached \(matching.count) cookies")
+                }
+                completion(self.apiSession)
             }
-            let session = URLSession(configuration: config)
-            DispatchQueue.main.async { completion(session) }
         }
     }
 
@@ -3940,7 +4275,11 @@ struct UsageHistory {
     /// Where this history persists; nil means in-memory only.
     private(set) var fileURL: URL?
     private static let retentionSeconds: TimeInterval = 24 * 3600
-    private static let persistThrottle: TimeInterval = 30
+    /// History is rewritten at most every 5 minutes, or sooner when a value
+    /// moved by 2 points or more since the last write, and on quit / sleep.
+    private static let persistThrottle: TimeInterval = 300
+    private var lastPersistedSession: Int?
+    private var lastPersistedWeekly: Int?
 
     /// v2.7.1 single-account file. Read only by the one-time migration and
     /// left in place as a rollback path.
@@ -3985,7 +4324,23 @@ struct UsageHistory {
 
     mutating func persistThrottled(now: Date = Date()) {
         guard let url = fileURL else { return }
-        guard now.timeIntervalSince(lastPersist) >= Self.persistThrottle else { return }
+        let significant = samples.last.map { latest in
+            abs(latest.s - (lastPersistedSession ?? Int.min / 2)) >= 2
+                || abs(latest.w - (lastPersistedWeekly ?? Int.min / 2)) >= 2
+        } ?? false
+        guard significant || now.timeIntervalSince(lastPersist) >= Self.persistThrottle else { return }
+        write(to: url, now: now)
+    }
+
+    /// Writes now (quit, sleep), if there is anything to write.
+    mutating func persistNow() {
+        guard let url = fileURL, !samples.isEmpty else { return }
+        write(to: url, now: Date())
+    }
+
+    private mutating func write(to url: URL, now: Date) {
+        lastPersistedSession = samples.last?.s
+        lastPersistedWeekly = samples.last?.w
         lastPersist = now
         let envelope = Envelope(version: 1, samples: samples)
         guard let data = try? JSONEncoder().encode(envelope) else { return }
@@ -4100,7 +4455,9 @@ final class ThresholdNotifier: NSObject, UNUserNotificationCenterDelegate {
             }
         }
 
-        defaults.set(pct, forKey: lastPctKey)
+        if defaults.object(forKey: lastPctKey) as? Int != pct {
+            defaults.set(pct, forKey: lastPctKey)
+        }
     }
 
     /// Manually fires a synthetic notification so the user can verify their
@@ -4504,6 +4861,19 @@ extension Date {
 }
 
 // MARK: - Native Usage View
+
+// MARK: - UserDefaults helpers
+
+extension UserDefaults {
+    /// Writes only when the value differs: an unchanged set still dirties the
+    /// preferences domain and rewrites the plist.
+    func setIfChanged(_ value: Int, forKey key: String) {
+        if object(forKey: key) as? Int != value { set(value, forKey: key) }
+    }
+    func setIfChanged(_ value: String, forKey key: String) {
+        if string(forKey: key) != value { set(value, forKey: key) }
+    }
+}
 
 // MARK: - Burn-rate bands, account colours, badge styling
 
@@ -5710,7 +6080,9 @@ class UsageContentView: NSView {
         } else {
             chosen = max(fitting, computedHeight)
         }
-        NSLog("%@", "[ClaudeMeter] popover sizing(\(label)): fittingSize=\(fitting) computed=\(computedHeight) chosen=\(chosen) scrollW=\(scrollView.bounds.width) arranged=\(arranged.count) visible=\(visible.count)")
+        if window?.isVisible == true {
+            NSLog("%@", "[ClaudeMeter] popover sizing(\(label)): fittingSize=\(fitting) computed=\(computedHeight) chosen=\(chosen) scrollW=\(scrollView.bounds.width) arranged=\(arranged.count) visible=\(visible.count)")
+        }
         onContentSizeChanged?(chosen)
     }
 

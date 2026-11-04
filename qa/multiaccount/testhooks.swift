@@ -39,6 +39,10 @@
 //   injectWeekly:<index>:<pct>    feed a weekly-only fetch (no session window)
 //   forecastWeekly:<index>:<rate|idle>  set the weekly forecast
 //   renderPopover:<name>    render account 0's usage view to <name>-popover.png
+//   sleep / wake            post NSWorkspace willSleep / didWake
+//   counters                per account: fetch attempts, JSON successes, page
+//                           loads, page scripts, cookie write-backs, parked
+//   cookies:<index>         cookie count in that account's own store
 //   done                    log QA-DONE and quit
 
 import Cocoa
@@ -245,6 +249,22 @@ extension AppDelegate {
             ]
             for (slug, variant) in cases {
                 NSLog("%@", "QA-TIER \(slug ?? "nil")/\(variant ?? "nil") -> \(AppDelegate.planTierDisplayName(slug: slug, variant: variant) ?? "nil")")
+            }
+        case "sleep":
+            NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.willSleepNotification, object: nil)
+        case "wake":
+            NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
+        case "counters":
+            for (i, a) in accounts.enumerated() {
+                NSLog("%@", "QA-COUNTERS \(i) attempts=\(a.fetchAttemptCount) json=\(a.jsonSuccessCount) pageLoads=\(a.pageLoadCount) pageScripts=\(a.pageScriptCount) cookieWriteBacks=\(a.cookieWriteBackCount) parked=\(a.pageView == nil) timer=\(a.refreshTimer != nil) paused=\(activityPaused)")
+            }
+        case "cookies":
+            if let a = qaAccount(parts) {
+                let index = parts[1]
+                a.dataStore.httpCookieStore.getAllCookies { cookies in
+                    NSLog("%@", "QA-COOKIES \(index) store=\(cookies.count) writeBacks=\(a.cookieWriteBackCount)")
+                }
+                delay = 1.0
             }
         case "done":
             NSLog("%@", "QA-DONE")
