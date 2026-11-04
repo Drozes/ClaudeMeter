@@ -173,7 +173,7 @@ Install as a launchd agent via [drift/com.claudemeter.qa.drift.plist](drift/com.
 
 ## Multi-account flow test ([multiaccount/run.sh](multiaccount/run.sh))
 
-Not part of `qa.sh` (about 15 minutes; it briefly opens login windows and the
+Not part of `qa.sh` (about 20 minutes; it briefly opens login windows and the
 popover; run it on an idle machine, since its timing checks assume a normal
 load). Builds `ClaudeMeter.swift` together with
 [multiaccount/testhooks.swift](multiaccount/testhooks.swift) using
@@ -202,16 +202,29 @@ the real code paths:
   the hooks build as `com.local.ClaudeMeter.qa` with `-skipDesktopImport YES`
   and the badge at 30 s, popover closed. It checks that the primary account
   fetches on its timer, that its hidden page stays parked (no page loads, no
-  page scripts), and that a simulated sleep stops the timers with no fetch
-  while asleep and exactly one fetch on wake. It logs counters only; that
-  bundle is not cleaned up.
+  page scripts), and that a simulated sleep, display sleep and screen lock
+  each stop the timers with no fetch while paused and exactly one fetch
+  afterwards. The lock test posts a QA-only alias of the lock notification
+  while the app's distributed notifications are suspended, as for an
+  inactive app. Opening the popover ends a lock pause, and the paused-state
+  safety check clears a stale reason. It logs counters only; that bundle is
+  not cleaned up.
+- **F, DOM fallback** (same bundle and session): opening the JSON circuit
+  loads the page and runs page scripts, reloads of a page that left the usage
+  page are rate-limited, and the circuit's auto-reset brings JSON back and
+  parks the page again.
+- **G, signed-out primary** (isolated bundle, no session, sign-in window
+  allowed to open by itself): the window opens once, is never brought
+  forward again, the DOM path does not reload the page every tick, a closed
+  window is not reopened by the background, and the circuit's auto-reset
+  still runs.
 
 Scenario A also checks that cookie write-back stays in each account's own
 store (the hook logs cookie counts, never names or values).
 
 It cleans up the test domain and folders afterwards (not the QA bundle that
 E uses; `--keep` leaves them). Like L0/L3 it skips the Claude Desktop import
-(no Keychain access). In scenarios A to D the primary account has no session
+(no Keychain access). Outside E and F the primary account has no session
 and is shown signed out, and the badge and popover checks feed it synthetic
 data.
 

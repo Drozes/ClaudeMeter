@@ -12,7 +12,7 @@ Authenticates automatically by importing your session from the Claude Desktop ap
 - **Auto-refresh** — configurable popover polling interval (6s / 20s / 30s / 60s) keeps data fresh while viewing
 - **Status indicator** — green dot (fresh), yellow dot (believed fresh, verifying), grey dot (stale), with a spinning loader during fetches
 - **Auto-auth** — imports cookies from Claude Desktop on launch, no manual login needed
-- **Soft reload** — re-opening the popover refreshes data in-place without a full page load
+- **Fresh on open**: re-opening the popover fetches fresh numbers for every account without reloading any page
 - **Auto-update** — check for updates from the menu bar with code signature verification
 - **Fallback login** — right-click → "Sign In..." for email/magic-link if Claude Desktop isn't available
 - **Multiple accounts** (v2.8): meter several claude.ai accounts side by side, for example personal and work. Each extra account signs in through ClaudeMeter's own login window into its own isolated session, so no account signs another out. The menu bar badge can show two accounts at once (`P 47% | W 12%`) and the popover stacks one section per account.
@@ -123,7 +123,7 @@ The app is a single Swift file (`ClaudeMeter.swift`) with no dependencies beyond
 3. **Usage page, only when needed**: the hidden `claude.ai/settings/usage` page is loaded only to sign in, when the usage API fails (the page's DOM is then scraped as a fallback), and at most once every 6 hours per account as a safety net. Otherwise it is unloaded, which frees the memory of its web content process.
 4. **Popover**: opening the popover fetches fresh numbers for every account; while it stays open, a timer refreshes at the configured interval.
 5. **Badge**: the badge refreshes on its own timer with the popover closed. The percentage comes from the usage API; the XPath scrape of the page runs only for an account on the page fallback.
-6. **Power**: refreshes pause while the Mac or its displays sleep, the screen is locked or another user is switched in, and each account fetches once on wake. In Low Power Mode, or when the Mac is running hot, the badge interval is doubled. The interval options in the menu do not change.
+6. **Power**: refreshes pause while the Mac or its displays sleep, the screen is locked or another user is switched in, and each account fetches once on wake (opening the popover also ends a display, lock or session pause). In Low Power Mode, or when the Mac is running hot, the badge interval is doubled. The interval options in the menu do not change.
 
 ## Privacy
 
